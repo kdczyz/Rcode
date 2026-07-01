@@ -3,8 +3,8 @@ import dotenv from "dotenv";
 import express from "express";
 import { existsSync, readFileSync } from "node:fs";
 import { describePermissionMode } from "./permissions";
-import { approveToolCall, runAgent } from "./agent";
-import type { PermissionMode } from "./types";
+import { approveToolCallStream, runAgentStream } from "./agent";
+import type { PermissionMode, StreamEvent } from "./types";
 import { getRuntimeConfig } from "./config";
 import type { ThinkingMode } from "./aiProvider";
 
@@ -23,7 +23,6 @@ function parseMode(value: unknown): PermissionMode {
   if (value === "request_approval" || value === "auto_approve" || value === "full_access") {
     return value;
   }
-
   return getRuntimeConfig().defaultPermissionMode;
 }
 
@@ -31,7 +30,6 @@ function parseThinkingMode(value: unknown): ThinkingMode {
   if (value === "fast" || value === "balanced" || value === "deep") {
     return value;
   }
-
   return "balanced";
 }
 
@@ -41,6 +39,10 @@ function parseModel(value: unknown): string | undefined {
 
 function parseProjectPath(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function writeSse(response: express.Response, event: StreamEvent) {
+  response.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
 app.get("/api/health", (_request, response) => {
@@ -72,7 +74,6 @@ app.get("/api/models", (_request, response) => {
     response.status(404).json({ error: "Model catalog has not been generated yet." });
     return;
   }
-
   response.type("json").send(readFileSync(catalogPath, "utf8"));
 });
 
@@ -83,15 +84,18 @@ app.post("/api/agent/run", async (request, response) => {
     return;
   }
 
-  const abortController = new AbortController();
-  response.on("close", () => {
-    if (!response.writableEnded) {
-      abortController.abort();
-    }
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no"
   });
 
-  response.json(
-    await runAgent({
+  const abortController = new AbortController();
+  response.on("close", () => abortController.abort());
+
+  try {
+    for await (const event of runAgentStream({
       prompt,
       conversationId: typeof request.body.conversationId === "string" ? request.body.conversationId : undefined,
       mode: parseMode(request.body.mode),
@@ -99,8 +103,15 @@ app.post("/api/agent/run", async (request, response) => {
       thinkingMode: parseThinkingMode(request.body.thinkingMode),
       projectPath: parseProjectPath(request.body.projectPath),
       signal: abortController.signal
-    })
-  );
+    })) {
+      writeSse(response, event);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    writeSse(response, { type: "error", conversationId: "", message });
+  }
+
+  response.end();
 });
 
 app.post("/api/agent/approve", async (request, response) => {
@@ -110,15 +121,18 @@ app.post("/api/agent/approve", async (request, response) => {
     return;
   }
 
-  const abortController = new AbortController();
-  response.on("close", () => {
-    if (!response.writableEnded) {
-      abortController.abort();
-    }
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no"
   });
 
-  response.json(
-    await approveToolCall({
+  const abortController = new AbortController();
+  response.on("close", () => abortController.abort());
+
+  try {
+    for await (const event of approveToolCallStream({
       approvalId,
       allow: Boolean(request.body.allow),
       mode: parseMode(request.body.mode),
@@ -126,8 +140,15 @@ app.post("/api/agent/approve", async (request, response) => {
       thinkingMode: parseThinkingMode(request.body.thinkingMode),
       projectPath: parseProjectPath(request.body.projectPath),
       signal: abortController.signal
-    })
-  );
+    })) {
+      writeSse(response, event);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    writeSse(response, { type: "error", conversationId: "", message });
+  }
+
+  response.end();
 });
 
 app.listen(port, () => {

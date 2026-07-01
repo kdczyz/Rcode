@@ -1,9 +1,10 @@
 import { readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { getRuntimeConfig } from "./config";
-import type { AgentToolName, ToolCall, ToolResult } from "./types";
+import type { AgentToolName, DiffResult, ToolCall, ToolResult } from "./types";
 
 const execFileAsync = promisify(execFile);
 
@@ -12,11 +13,11 @@ export const toolDefinitions = [
     type: "function",
     function: {
       name: "read_file",
-      description: "Read a UTF-8 text file from the local machine.",
+      description: "Read a file's content from the local filesystem. Always read a file before editing it.",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "Absolute or workspace-relative path." }
+          path: { type: "string", description: "Absolute or project-relative path to the file." }
         },
         required: ["path"]
       }
@@ -26,12 +27,12 @@ export const toolDefinitions = [
     type: "function",
     function: {
       name: "write_file",
-      description: "Write UTF-8 text to a local file.",
+      description: "Write or overwrite a file with its COMPLETE content in a single call. Always provide the full file content, not fragments. This is the ONLY way to create or modify files.",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "Absolute or workspace-relative path." },
-          content: { type: "string", description: "The full file content to write." }
+          path: { type: "string", description: "Absolute or project-relative path to the file." },
+          content: { type: "string", description: "The complete file content to write." }
         },
         required: ["path", "content"]
       }
@@ -41,7 +42,7 @@ export const toolDefinitions = [
     type: "function",
     function: {
       name: "web_fetch",
-      description: "Fetch a web page or API response from the internet.",
+      description: "Fetch content from a URL. Use for documentation, API references, or checking package info.",
       parameters: {
         type: "object",
         properties: {
@@ -55,12 +56,12 @@ export const toolDefinitions = [
     type: "function",
     function: {
       name: "run_shell",
-      description: "Run a local shell command on the user's computer. Use only when computer control is required.",
+      description: "Run a shell command. Use ONLY for: npm install, git operations, running tests, building projects. Do NOT use echo/cat/sed/printf to write files - use write_file instead.",
       parameters: {
         type: "object",
         properties: {
-          command: { type: "string", description: "Command to run through zsh." },
-          cwd: { type: "string", description: "Optional working directory." }
+          command: { type: "string", description: "Command to run through zsh. Use non-interactive flags." },
+          cwd: { type: "string", description: "Optional working directory. Defaults to project root." }
         },
         required: ["command"]
       }
@@ -112,13 +113,25 @@ export async function executeTool(call: ToolCall, projectPath?: string): Promise
     if (call.name === "write_file") {
       const filePath = resolveSafePath(call.arguments.path, workspaceRoot);
       const content = getString(call.arguments.content, "content");
+
+      // 读取旧文件内容用于生成 diff
+      let oldContent: string | null = null;
+      if (existsSync(filePath)) {
+        try {
+          oldContent = await readFile(filePath, "utf8");
+        } catch { /* ignore */ }
+      }
+
       await writeFile(filePath, content, "utf8");
+
+      const diff = computeDiff(filePath, oldContent, content);
 
       return {
         toolCallId: call.id,
         name: call.name,
         ok: true,
-        content: `Wrote ${content.length} characters to ${filePath}`
+        content: `Wrote ${content.length} characters to ${filePath}`,
+        diff
       };
     }
 
@@ -171,4 +184,50 @@ export async function executeTool(call: ToolCall, projectPath?: string): Promise
       content: error instanceof Error ? error.message : "Unknown tool error"
     };
   }
+}
+
+/** 基于 LCS 的简单行级 diff，生成 unified diff 行 */
+function computeDiff(filePath: string, oldContent: string | null, newContent: string): DiffResult {
+  const oldLines = oldContent ? oldContent.split("\n") : [];
+  const newLines = newContent.split("\n");
+
+  // LCS 算法
+  const m = oldLines.length;
+  const n = newLines.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (oldLines[i - 1] === newLines[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+  }
+
+  // 回溯生成 diff
+  const lines: DiffResult["lines"] = [];
+  let addedLines = 0;
+  let removedLines = 0;
+  let i = m;
+  let j = n;
+
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
+      lines.unshift({ type: "same", content: oldLines[i - 1], oldLine: i, newLine: j });
+      i--;
+      j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      lines.unshift({ type: "add", content: newLines[j - 1], newLine: j });
+      addedLines++;
+      j--;
+    } else {
+      lines.unshift({ type: "remove", content: oldLines[i - 1], oldLine: i });
+      removedLines++;
+      i--;
+    }
+  }
+
+  return { filePath, oldContent, newContent, lines, addedLines, removedLines };
 }

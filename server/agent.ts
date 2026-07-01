@@ -1,8 +1,8 @@
 import { nanoid } from "nanoid";
-import { callAi, type ThinkingMode } from "./aiProvider";
+import { callAiStream, type ThinkingMode } from "./aiProvider";
 import { getToolCallRisk, needsApproval } from "./permissions";
 import { executeTool } from "./tools";
-import type { AgentMessage, AgentRunResponse, PendingApproval, PermissionMode, ToolCall, ToolResult } from "./types";
+import type { AgentMessage, PendingApproval, PermissionMode, StreamEvent, ToolCall, ToolResult } from "./types";
 
 interface Conversation {
   id: string;
@@ -59,84 +59,102 @@ function buildApproval(conversationId: string, toolCall: ToolCall, projectPath?:
   };
 }
 
-async function resolveToolCalls(
+async function* continueConversationStream(
   conversation: Conversation,
   mode: PermissionMode,
-  toolCalls: ToolCall[],
-  projectPath?: string
-): Promise<{ pending: PendingApproval[]; results: ToolResult[] }> {
-  const pending: PendingApproval[] = [];
-  const results: ToolResult[] = [];
+  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; signal?: AbortSignal }
+): AsyncGenerator<StreamEvent> {
+  let step = 0;
+  while (true) {
+    step++;
+    console.log(`[Agent] Step ${step}, messages: ${conversation.messages.length}`);
 
-  for (const toolCall of toolCalls) {
-    if (needsApproval(mode, toolCall, projectPath)) {
-      const approval = buildApproval(conversation.id, toolCall, projectPath);
-      pending.push(approval);
-      conversation.pendingApprovals.push(approval);
-    } else {
-      results.push(await executeTool(toolCall, projectPath));
+    let contentBuffer = "";
+    let toolCalls: ToolCall[] = [];
+
+    // 流式调用 AI，逐 token 输出（带 429 重试）
+    let aiRetries = 0;
+    let aiSuccess = false;
+    while (aiRetries < 3 && !aiSuccess) {
+      try {
+        for await (const event of callAiStream(conversation.messages, options)) {
+          if (event.type === "text_delta") {
+            contentBuffer += event.content;
+            yield { type: "text_delta", content: event.content };
+          } else if (event.type === "tool_calls") {
+            toolCalls = event.toolCalls;
+            // 当从文本提取工具调用时，用清理后的内容替换原始内容
+            if (event.cleanContent !== undefined) {
+              contentBuffer = event.cleanContent;
+            }
+          }
+        }
+        aiSuccess = true;
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        if (msg.includes("429") && aiRetries < 2) {
+          aiRetries++;
+          const wait = 2000 * aiRetries;
+          console.log(`[Agent] 429 rate limited, retry ${aiRetries}/3 after ${wait}ms`);
+          yield { type: "text_delta", content: `\n\n⏳ 速率受限，等待 ${wait / 1000} 秒后重试...\n\n` };
+          await new Promise((r) => setTimeout(r, wait));
+          contentBuffer = "";
+          toolCalls = [];
+          continue;
+        }
+        throw error;
+      }
     }
-  }
 
-  return { pending, results };
-}
+    console.log(`[Agent] AI returned: content=${contentBuffer.length}chars, toolCalls=${toolCalls.length}`);
 
-async function continueConversation(
-  conversation: Conversation,
-  mode: PermissionMode,
-  initialToolResults: ToolResult[] = [],
-  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; signal?: AbortSignal } = {}
-): Promise<AgentRunResponse> {
-  const allToolResults = [...initialToolResults];
-
-  for (let step = 0; step < 5; step += 1) {
-    const turn = await callAi(conversation.messages, [], options);
     conversation.messages.push({
       role: "assistant",
-      content: turn.content,
-      toolCalls: turn.toolCalls
+      content: contentBuffer,
+      toolCalls
     });
 
-    if (turn.toolCalls.length === 0) {
-      return {
-        conversationId: conversation.id,
-        status: "completed",
-        answer: turn.content,
-        toolResults: allToolResults
-      };
+    if (toolCalls.length === 0) {
+      yield { type: "completed", conversationId: conversation.id, answer: contentBuffer };
+      return;
     }
 
-    const { pending, results } = await resolveToolCalls(conversation, mode, turn.toolCalls, options.projectPath);
-    allToolResults.push(...results);
+    // 处理工具调用
+    const pending: PendingApproval[] = [];
+    for (const toolCall of toolCalls) {
+      console.log(`[Agent] Executing tool: ${toolCall.name}`, JSON.stringify(toolCall.arguments).slice(0, 200));
+      yield { type: "tool_call", toolCall };
 
-    for (const result of results) {
-      conversation.messages.push({
-        role: "tool",
-        toolCallId: result.toolCallId,
-        content: result.content
-      });
+      if (needsApproval(mode, toolCall, options.projectPath)) {
+        const approval = buildApproval(conversation.id, toolCall, options.projectPath);
+        conversation.pendingApprovals.push(approval);
+        pending.push(approval);
+      } else {
+        const result = await executeTool(toolCall, options.projectPath);
+        console.log(`[Agent] Tool result: ok=${result.ok}, len=${result.content.length}`);
+        yield { type: "tool_result", result };
+
+        conversation.messages.push({
+          role: "tool",
+          toolCallId: result.toolCallId,
+          content: result.content
+        });
+      }
     }
 
     if (pending.length > 0) {
-      return {
+      yield {
+        type: "approval_required",
         conversationId: conversation.id,
-        status: "approval_required",
-        answer: turn.content,
-        pendingApprovals: pending,
-        toolResults: allToolResults
+        answer: contentBuffer,
+        approvals: pending
       };
+      return;
     }
   }
-
-  return {
-    conversationId: conversation.id,
-    status: "error",
-    error: "Agent stopped after too many tool-call turns.",
-    toolResults: allToolResults
-  };
 }
 
-export async function runAgent(input: {
+export async function* runAgentStream(input: {
   prompt: string;
   conversationId?: string;
   mode: PermissionMode;
@@ -144,12 +162,12 @@ export async function runAgent(input: {
   thinkingMode?: ThinkingMode;
   projectPath?: string;
   signal?: AbortSignal;
-}): Promise<AgentRunResponse> {
+}): AsyncGenerator<StreamEvent> {
   const conversation = getConversation(input.conversationId, input.projectPath);
   conversation.messages.push({ role: "user", content: input.prompt });
 
   try {
-    return await continueConversation(conversation, input.mode, [], {
+    yield* continueConversationStream(conversation, input.mode, {
       model: input.model,
       thinkingMode: input.thinkingMode,
       projectPath: input.projectPath,
@@ -159,16 +177,15 @@ export async function runAgent(input: {
     if (isAbortError(error)) {
       throw error;
     }
-
-    return {
+    yield {
+      type: "error",
       conversationId: conversation.id,
-      status: "error",
-      error: error instanceof Error ? error.message : "Unknown agent error"
+      message: error instanceof Error ? error.message : "Unknown agent error"
     };
   }
 }
 
-export async function approveToolCall(input: {
+export async function* approveToolCallStream(input: {
   approvalId: string;
   allow: boolean;
   mode: PermissionMode;
@@ -176,23 +193,18 @@ export async function approveToolCall(input: {
   thinkingMode?: ThinkingMode;
   projectPath?: string;
   signal?: AbortSignal;
-}): Promise<AgentRunResponse> {
+}): AsyncGenerator<StreamEvent> {
   const projectKey = getProjectKey(input.projectPath);
   const projectMap = projectConversations.get(projectKey);
 
   if (!projectMap) {
-    return {
-      conversationId: "",
-      status: "error",
-      error: "Approval request not found — no conversations exist for this project."
-    };
+    yield { type: "error", conversationId: "", message: "Approval request not found — no conversations exist for this project." };
+    return;
   }
 
   for (const conversation of projectMap.values()) {
     const approval = conversation.pendingApprovals.find((item) => item.id === input.approvalId);
-    if (!approval) {
-      continue;
-    }
+    if (!approval) continue;
 
     conversation.pendingApprovals = conversation.pendingApprovals.filter((item) => item.id !== input.approvalId);
 
@@ -211,17 +223,25 @@ export async function approveToolCall(input: {
       content: result.content
     });
 
-    return await continueConversation(conversation, input.mode, [result], {
-      model: input.model,
-      thinkingMode: input.thinkingMode,
-      projectPath: approval.projectPath ?? input.projectPath,
-      signal: input.signal
-    });
+    yield { type: "tool_result", result };
+
+    try {
+      yield* continueConversationStream(conversation, input.mode, {
+        model: input.model,
+        thinkingMode: input.thinkingMode,
+        projectPath: approval.projectPath ?? input.projectPath,
+        signal: input.signal
+      });
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      yield {
+        type: "error",
+        conversationId: conversation.id,
+        message: error instanceof Error ? error.message : "Unknown agent error"
+      };
+    }
+    return;
   }
 
-  return {
-    conversationId: "",
-    status: "error",
-    error: "Approval request not found in the current project scope."
-  };
+  yield { type: "error", conversationId: "", message: "Approval request not found in the current project scope." };
 }

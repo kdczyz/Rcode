@@ -114,6 +114,17 @@ button {
   min-height: 0;
 }
 
+.appLayout.hasDiffPanel {
+  grid-template-columns: 318px minmax(0, 1fr) minmax(360px, 520px);
+}
+
+main {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .sidebar {
   display: flex;
   flex-direction: column;
@@ -411,6 +422,21 @@ button {
   opacity: 0.65;
 }
 
+.sessionRow.running::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #4caf50;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.8); }
+}
+
 .emptySession {
   min-height: 30px;
   padding: 6px 10px;
@@ -569,17 +595,18 @@ h2 {
 }
 
 .messageBubble {
-  border: 1px solid var(--border-soft);
-  border-radius: 16px;
-  padding: 12px 14px;
+  padding: 4px 0;
   color: var(--text);
-  background: var(--surface);
+  background: transparent;
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
 }
 
 .message.user .messageBubble {
+  border: 1px solid var(--border-soft);
+  border-radius: 16px;
+  padding: 12px 14px;
   color: var(--accent-text);
   background: var(--accent);
 }
@@ -974,6 +1001,245 @@ details pre {
   line-height: 1.4;
 }
 
+/* === 流式输出 === */
+.streamingCursor {
+  display: inline-block;
+  margin-left: 2px;
+  color: var(--accent);
+  animation: blink 1s steps(2) infinite;
+}
+
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+strong.streaming {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* === 工具调用折叠（小字一行，点击展开）=== */
+.toolToggle {
+  margin: 2px 0;
+}
+
+.toolToggleSummary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 11px;
+  color: var(--muted);
+  list-style: none;
+  padding: 3px 0;
+}
+
+.toolToggleSummary::-webkit-details-marker {
+  display: none;
+}
+
+.toolToggleArrow {
+  font-size: 9px;
+  font-family: monospace;
+  color: var(--faint);
+  transition: transform 0.15s;
+}
+
+.toolToggle[open] .toolToggleArrow {
+  transform: rotate(90deg);
+}
+
+.toolToggleText {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted);
+  opacity: 0.8;
+}
+
+.toolToggleFail {
+  font-size: 10px;
+  font-weight: 500;
+  color: #f44336;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: color-mix(in srgb, #f44336 10%, transparent);
+}
+
+.toolToggleBody {
+  padding: 6px 0 6px 0;
+}
+
+.toolToggleItem {
+  margin-bottom: 6px;
+}
+
+.toolToggleItem:last-child {
+  margin-bottom: 0;
+}
+
+.toolToggleItemHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+}
+
+/* === 工具卡片子元素样式（被 toolToggleItem 引用）=== */
+.toolCardDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--muted);
+}
+
+.toolCardDot.running {
+  background: var(--warning, #f5a623);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.toolCardDot.ok {
+  background: #4caf50;
+}
+
+.toolCardDot.fail {
+  background: #f44336;
+}
+
+.toolCardName {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  flex-shrink: 0;
+}
+
+.toolCardDesc {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.75;
+}
+
+.toolCardStatus {
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 7px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  letter-spacing: 0.2px;
+}
+
+.toolCardStatus.running {
+  color: var(--warning, #f5a623);
+  background: color-mix(in srgb, var(--warning, #f5a623) 12%, transparent);
+}
+
+.toolCardStatus.ok {
+  color: #4caf50;
+  background: color-mix(in srgb, #4caf50 12%, transparent);
+}
+
+.toolCardStatus.fail {
+  color: #f44336;
+  background: color-mix(in srgb, #f44336 12%, transparent);
+}
+
+.toolCardBody {
+  padding: 8px 10px 10px 10px;
+}
+
+.toolCardSection {
+  margin-bottom: 8px;
+}
+
+.toolCardSection:last-child {
+  margin-bottom: 0;
+}
+
+.toolCardLabel {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--faint);
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.toolCardPre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+  max-height: 200px;
+  overflow: auto;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* === 助手回复（无气泡，纯文本）=== */
+.message.assistant .assistantBubble {
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.7;
+  color: var(--text);
+  padding: 4px 0;
+}
+
+.streamingPlaceholder {
+  min-height: 24px;
+  display: flex;
+  align-items: center;
+}
+
+.finalBadge {
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: 999px;
+  padding: 2px 8px;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.streamingOnly {
+  margin: 2px 0;
+}
+
+.toolRunning {
+  color: var(--warning, #f5a623) !important;
+  font-size: 11px;
+}
+
+.toolOk {
+  color: #4caf50 !important;
+  font-size: 11px;
+}
+
+.toolFail {
+  color: #f44336 !important;
+  font-size: 11px;
+}
+
+.inlineApproval {
+  margin: 8px 0;
+}
+
 @media (max-width: 1120px) {
   .desktopShell:not([data-client="electron"]) {
     padding: 16px;
@@ -1044,4 +1310,253 @@ details pre {
   border: 0;
   border-radius: 0;
   box-shadow: none;
+  background: var(--surface-1);
+}
+
+/* === 变更汇总卡片 === */
+.diffSummary {
+  margin: 12px 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.diffSummaryHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--info, #4a9eff) 6%, transparent);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.diffSummaryTitle {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.diffSummaryStats {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.diffAdded {
+  color: #4caf50;
+}
+
+.diffRemoved {
+  color: #f44336;
+}
+
+.diffSummaryFile {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 12px;
+  border: none;
+  border-bottom: 1px solid var(--border-soft);
+  background: transparent;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text);
+  transition: background 0.1s;
+  text-align: left;
+}
+
+.diffSummaryFile:last-child {
+  border-bottom: none;
+}
+
+.diffSummaryFile:hover {
+  background: color-mix(in srgb, var(--info, #4a9eff) 6%, transparent);
+}
+
+.diffFileIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 700;
+  color: #fff;
+  background: var(--warning, #f5a623);
+  flex-shrink: 0;
+}
+
+.diffFileName {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text);
+  flex-shrink: 0;
+}
+
+.diffFileDir {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 10px;
+  color: var(--muted);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.7;
+}
+
+.diffFileStats {
+  display: flex;
+  gap: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  flex-shrink: 0;
+}
+
+/* === 右侧 Diff 对比面板 === */
+.diffPanel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--border-soft);
+  background: var(--surface-1);
+  overflow: hidden;
+}
+
+.diffPanelHeader {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--surface);
+  flex-shrink: 0;
+}
+
+.diffPanelFileInfo {
+  flex: 1;
+  min-width: 0;
+}
+
+.diffPanelFileName {
+  display: block;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.diffPanelPath {
+  display: block;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 10px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diffPanelStats {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  flex-shrink: 0;
+}
+
+.diffPanelClose {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.diffPanelClose:hover {
+  background: color-mix(in srgb, var(--muted) 10%, transparent);
+  color: var(--text);
+}
+
+.diffPanelContent {
+  flex: 1;
+  overflow: auto;
+  min-height: 0;
+}
+
+/* === Diff 表格 === */
+.diffTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.diffLine {
+  border-bottom: 1px solid color-mix(in srgb, var(--border-soft) 50%, transparent);
+}
+
+.diffLine.add {
+  background: color-mix(in srgb, #4caf50 8%, transparent);
+}
+
+.diffLine.remove {
+  background: color-mix(in srgb, #f44336 8%, transparent);
+}
+
+.diffLineNum {
+  width: 38px;
+  padding: 1px 6px;
+  text-align: right;
+  color: var(--faint);
+  font-size: 10px;
+  user-select: none;
+  vertical-align: top;
+  border-right: 1px solid color-mix(in srgb, var(--border-soft) 40%, transparent);
+}
+
+.diffLineSign {
+  width: 18px;
+  padding: 1px 4px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 700;
+  user-select: none;
+  vertical-align: top;
+}
+
+.diffLine.add .diffLineSign {
+  color: #4caf50;
+}
+
+.diffLine.remove .diffLineSign {
+  color: #f44336;
+}
+
+.diffLineContent {
+  padding: 1px 8px;
+  vertical-align: top;
+}
+
+.diffLineContent pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  color: var(--text);
 }

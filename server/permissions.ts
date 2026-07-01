@@ -34,43 +34,48 @@ export function getToolCallRisk(toolCall: ToolCall): ToolRisk {
 
 export function needsApproval(mode: PermissionMode, toolCall: ToolCall, projectPath?: string): boolean {
   const risk = getToolCallRisk(toolCall);
-  const config = getRuntimeConfig();
 
+  // 完全访问：完全控制，不需要任何审批
   if (mode === "full_access") {
     return false;
   }
 
+  // 自动审批：AI 思考判定风险，高风险操作需要审批，低风险直接通过
+  if (mode === "auto_approve") {
+    return risk === "high";
+  }
+
+  // 请求批准：当前项目内操作自动通过，项目外操作需要手动审批
   if (mode === "request_approval") {
+    // 网络请求始终在项目外，需要审批
     if (toolCall.name === "web_fetch") {
-      return config.permissions.requireApprovalForInternet;
+      return true;
     }
 
-    if (toolCall.name === "write_file") {
-      return config.permissions.requireApprovalForFileWrite || isPathOutsideWorkspace(toolCall.arguments.path, projectPath);
-    }
-
-    if (toolCall.name === "run_shell") {
-      return config.permissions.requireApprovalForShell;
-    }
-
-    if (toolCall.name === "read_file") {
+    // 文件读写：检查目标路径是否在项目内
+    if (toolCall.name === "write_file" || toolCall.name === "read_file") {
       return isPathOutsideWorkspace(toolCall.arguments.path, projectPath);
+    }
+
+    // Shell 命令：无法可靠判断操作范围，需要审批
+    if (toolCall.name === "run_shell") {
+      return true;
     }
 
     return true;
   }
 
-  return risk === "high";
+  return true;
 }
 
 export function describePermissionMode(mode: PermissionMode): string {
   if (mode === "request_approval") {
-    return "编辑外部文件和使用互联网时始终询问";
+    return "当前项目内操作自动通过，项目外操作需手动审批";
   }
 
   if (mode === "auto_approve") {
-    return "仅对检测到的高风险操作请求批准";
+    return "AI 自动判定风险，高风险需审批，低风险直接通过";
   }
 
-  return "可不受限制地访问互联网和本机文件";
+  return "完全控制，不需要任何审批";
 }

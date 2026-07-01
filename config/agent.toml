@@ -5,15 +5,15 @@ description = "本地客户端 agent，可连接 AI 并在审批策略约束下�
 
 [ai]
 provider_config = "config/providers.json"
-active_provider = "nvidia"
+active_provider = "mimo"
 temperature = 0.3
-max_tokens = 2048
+max_tokens = 16384
 
 [permissions]
-default_mode = "request_approval"
-require_approval_for_internet = true
-require_approval_for_file_write = true
-require_approval_for_shell = true
+default_mode = "auto_approve"
+require_approval_for_internet = false
+require_approval_for_file_write = false
+require_approval_for_shell = false
 
 [computer_control]
 enabled = true
@@ -40,7 +40,7 @@ enabled = true
 
 [[tools]]
 name = "write_file"
-risk = "high"
+risk = "medium"
 enabled = true
 
 [[tools]]

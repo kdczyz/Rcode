@@ -15,6 +15,18 @@ export interface ToolResult {
   name: AgentToolName;
   ok: boolean;
   content: string;
+  /** write_file 时包含的 diff 信息 */
+  diff?: DiffResult;
+}
+
+export interface DiffResult {
+  filePath: string;
+  oldContent: string | null;
+  newContent: string;
+  /** 各行的类型: "same" | "add" | "remove" */
+  lines: Array<{ type: "same" | "add" | "remove"; content: string; oldLine?: number; newLine?: number }>;
+  addedLines: number;
+  removedLines: number;
 }
 
 export interface PendingApproval {
@@ -42,3 +54,11 @@ export interface AgentRunResponse {
   toolResults?: ToolResult[];
   error?: string;
 }
+
+export type StreamEvent =
+  | { type: "text_delta"; content: string }
+  | { type: "tool_call"; toolCall: ToolCall }
+  | { type: "tool_result"; result: ToolResult }
+  | { type: "approval_required"; conversationId: string; answer: string; approvals: PendingApproval[] }
+  | { type: "completed"; conversationId: string; answer: string }
+  | { type: "error"; conversationId: string; message: string };
