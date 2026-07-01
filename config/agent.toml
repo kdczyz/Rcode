@@ -1,0 +1,54 @@
+[client]
+name = "Agent Console Desktop"
+mode = "desktop"
+description = "本地客户端 agent，可连接 AI 并在审批策略约束下控制电脑。"
+
+[ai]
+provider_config = "config/providers.json"
+active_provider = "nvidia"
+temperature = 0.3
+max_tokens = 2048
+
+[permissions]
+default_mode = "request_approval"
+require_approval_for_internet = true
+require_approval_for_file_write = true
+require_approval_for_shell = true
+
+[computer_control]
+enabled = true
+shell = true
+open_app = false
+screenshot = false
+dangerous_commands_require_approval = true
+
+[computer_control.command_policy]
+workspace_only = false
+blocked = [
+  "rm -rf /",
+  "sudo rm",
+  "diskutil erase",
+  "mkfs",
+  "shutdown",
+  "reboot"
+]
+
+[[tools]]
+name = "read_file"
+risk = "medium"
+enabled = true
+
+[[tools]]
+name = "write_file"
+risk = "high"
+enabled = true
+
+[[tools]]
+name = "web_fetch"
+risk = "medium"
+enabled = true
+
+[[tools]]
+name = "run_shell"
+risk = "high"
+enabled = true

@@ -1,0 +1,28 @@
+{
+  "activeProvider": "nvidia",
+  "providers": {
+    "nvidia": {
+      "type": "openai-compatible",
+      "displayName": "NVIDIA NIM",
+      "baseUrl": "https://integrate.api.nvidia.com/v1",
+      "apiKeyEnv": "NVIDIA_API_KEY",
+      "chatCompletionsPath": "/chat/completions",
+      "modelsPath": "/models",
+      "defaultModel": "nvidia/nemotron-3-ultra-550b-a55b",
+      "fallbackModels": [
+        "nvidia/nemotron-3-super-120b-a12b",
+        "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        "meta/llama-3.3-70b-instruct",
+        "mistralai/mistral-large-3-675b-instruct-2512",
+        "qwen/qwen3-next-80b-a3b-instruct",
+        "deepseek-ai/deepseek-v4-pro"
+      ],
+      "supports": {
+        "chat": true,
+        "tools": true,
+        "streaming": true,
+        "embeddings": true
+      }
+    }
+  }
+}

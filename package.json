@@ -1,0 +1,42 @@
+{
+  "name": "agent-permission-framework",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "tsx watch server/index.ts",
+    "dev:web": "vite --host 0.0.0.0",
+    "client": "concurrently -k \"npm:dev:server\" \"npm:dev:web\" \"npm:client:electron\"",
+    "client:electron": "wait-on http://localhost:5173 http://localhost:8787/api/health && cross-env ELECTRON_START_URL=http://localhost:5173 electron electron/main.cjs",
+    "build": "tsc && vite build",
+    "build:client": "npm run build && electron electron/main.cjs",
+    "preview": "vite preview --host 0.0.0.0",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.0.4",
+    "concurrently": "^9.2.1",
+    "cors": "^2.8.5",
+    "cross-env": "^10.1.0",
+    "dotenv": "^17.2.3",
+    "electron": "^43.0.0",
+    "express": "^5.1.0",
+    "lucide-react": "^0.468.0",
+    "nanoid": "^5.1.6",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "smol-toml": "^1.7.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.11",
+    "wait-on": "^9.0.10"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.6.0",
+    "@types/react": "^19.1.16",
+    "@types/react-dom": "^19.1.9"
+  }
+}
