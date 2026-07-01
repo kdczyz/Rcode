@@ -1,5 +1,5 @@
 import { toolDefinitions } from "./tools";
-import type { AgentMessage, ToolCall, ToolResult, AgentToolName } from "./types";
+import type { AgentMessage, ToolCall, ToolResult, AgentToolName, ToolRisk } from "./types";
 import { getRuntimeConfig } from "./config";
 import { nanoid } from "nanoid";
 
@@ -42,6 +42,12 @@ interface StreamChunk {
 export interface AiTurn {
   content: string;
   toolCalls: ToolCall[];
+}
+
+export interface ApprovalAuditResult {
+  allow: boolean;
+  risk: ToolRisk;
+  reason: string;
 }
 
 export type ThinkingMode = "fast" | "balanced" | "deep";
@@ -135,28 +141,28 @@ function parseToolCallsFromText(rawContent: string): { cleanContent: string; too
     return "";
   });
 
-  // Pattern 3: NVIDIA-style functions.xxx:N {...}
+  // Pattern 3: text-formatted functions.xxx:N {...}
   // Uses balanced bracket matching to handle nested braces in code content
-  const nvRegex = /functions\.(\w+)(?::\d+)?\s*/gi;
-  const nvMatches: Array<{ name: string; args: Record<string, unknown> | null; start: number; end: number }> = [];
-  let nm: RegExpExecArray | null;
-  while ((nm = nvRegex.exec(cleanContent)) !== null) {
-    const braceIdx = cleanContent.indexOf("{", nm.index + nm[0].length);
+  const functionRegex = /functions\.(\w+)(?::\d+)?\s*/gi;
+  const functionMatches: Array<{ name: string; args: Record<string, unknown> | null; start: number; end: number }> = [];
+  let functionMatch: RegExpExecArray | null;
+  while ((functionMatch = functionRegex.exec(cleanContent)) !== null) {
+    const braceIdx = cleanContent.indexOf("{", functionMatch.index + functionMatch[0].length);
     if (braceIdx === -1) continue;
     const jsonStr = extractFirstJson(cleanContent, braceIdx);
     if (!jsonStr) continue;
     try {
       const parsed = JSON.parse(jsonStr);
-      nvMatches.push({
-        name: nm[1],
+      functionMatches.push({
+        name: functionMatch[1],
         args: parsed,
-        start: nm.index,
+        start: functionMatch.index,
         end: braceIdx + jsonStr.length
       });
     } catch { /* ignore */ }
   }
-  for (let i = nvMatches.length - 1; i >= 0; i--) {
-    const match = nvMatches[i];
+  for (let i = functionMatches.length - 1; i >= 0; i--) {
+    const match = functionMatches[i];
     if (match.args) {
       pushToolCall(match.name, match.args);
       cleanContent = cleanContent.slice(0, match.start) + cleanContent.slice(match.end);
@@ -255,6 +261,83 @@ function parseToolArguments(raw: string): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function parseApprovalAudit(rawContent: string): ApprovalAuditResult | undefined {
+  const jsonStart = rawContent.indexOf("{");
+  if (jsonStart === -1) return undefined;
+  const jsonText = extractFirstJson(rawContent, jsonStart);
+  if (!jsonText) return undefined;
+
+  try {
+    const parsed = JSON.parse(jsonText) as Partial<ApprovalAuditResult>;
+    if (typeof parsed.allow !== "boolean") return undefined;
+    const risk: ToolRisk = parsed.risk === "low" || parsed.risk === "medium" || parsed.risk === "high"
+      ? parsed.risk
+      : parsed.allow
+        ? "low"
+        : "high";
+    return {
+      allow: parsed.allow,
+      risk,
+      reason: typeof parsed.reason === "string" && parsed.reason.trim()
+        ? parsed.reason.trim().slice(0, 240)
+        : parsed.allow
+          ? "模型审核认为该工具调用可以自动执行。"
+          : "模型审核认为该工具调用需要人工审批。"
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export async function auditToolCallApproval(
+  toolCall: ToolCall,
+  options: { model?: string; projectPath?: string; signal?: AbortSignal } = {}
+): Promise<ApprovalAuditResult | undefined> {
+  const config = getConfig(options.model);
+  if (!config.apiKey) return undefined;
+
+  const projectPath = options.projectPath || process.cwd();
+  const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}${config.chatPath}`, {
+    method: "POST",
+    signal: options.signal,
+    headers: { "content-type": "application/json", authorization: `Bearer ${config.apiKey}` },
+    body: JSON.stringify({
+      model: config.model,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "You are a security and permission reviewer for a local coding agent.",
+            "Decide whether a proposed tool call may run automatically under auto-approve mode.",
+            "Return ONLY compact JSON with this shape: {\"allow\": boolean, \"risk\": \"low\"|\"medium\"|\"high\", \"reason\": string}.",
+            "Allow routine reads/writes/build/test commands that are clearly scoped to the current project.",
+            "Do not allow destructive, irreversible, credential/secret access, exfiltration, privilege escalation, system-wide changes, or operations outside the current project.",
+            "If the scope is ambiguous, set allow=false and explain what needs human approval."
+          ].join("\n")
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            currentProjectRoot: projectPath,
+            toolCall
+          })
+        }
+      ],
+      temperature: 0,
+      max_tokens: 300
+    })
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`AI approval audit error ${response.status}: ${body.slice(0, 500)}`);
+  }
+
+  const data = (await response.json()) as ChatResponse;
+  const content = data.choices?.[0]?.message?.content ?? "";
+  return parseApprovalAudit(content);
 }
 
 /** Non-streaming AI call (kept for fallback). */
@@ -402,7 +485,7 @@ export async function* callAiStream(
     });
   }
 
-  // If no structured tool calls, try extracting from text (NVIDIA models)
+  // If no structured tool calls, try extracting from text-formatted tool calls.
   if (toolCalls.length === 0 && contentBuffer) {
     const parsed = parseToolCallsFromText(contentBuffer);
     if (parsed.toolCalls.length > 0) {

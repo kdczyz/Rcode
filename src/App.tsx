@@ -1,19 +1,31 @@
 import {
+  Archive,
   Brain,
   Check,
   ChevronDown,
+  CornerDownRight,
+  FileText,
   Folder,
   FolderOpen,
   FolderPlus,
   HardDrive,
+  ListFilter,
   MessageSquarePlus,
+  MoreHorizontal,
+  PanelLeft,
+  PanelRight,
+  Pencil,
   Plus,
+  SquareChevronLeft,
+  SquareChevronRight,
   Send,
+  SlidersHorizontal,
   Square,
   Terminal,
+  Trash2,
   X
 } from "lucide-react";
-import { KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { KeyboardEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type PermissionMode = "request_approval" | "auto_approve" | "full_access";
 type ThemePreference = "system" | "dark" | "light";
@@ -33,6 +45,7 @@ interface PermissionOption {
 }
 
 interface PermissionCatalog {
+  defaultMode?: PermissionMode;
   modes?: Array<{ id: PermissionMode; description: string }>;
 }
 
@@ -63,6 +76,7 @@ interface ProjectSession {
   title: string;
   createdAt: string;
   updatedAt: string;
+  archivedAt?: string;
   conversationId?: string;
   messages: ChatMessage[];
   pendingApprovals: PendingApproval[];
@@ -87,6 +101,7 @@ interface WorkspaceState {
 interface QueuedPrompt {
   id: string;
   content: string;
+  kind?: "prompt" | "guide";
 }
 
 /** SSE 流事件 */
@@ -112,6 +127,7 @@ interface DiffResult {
 }
 
 const workspaceStorageKey = "agent.workspace.projects.v1";
+const API_BASE = window.location.protocol === "file:" || window.agentDesktop?.isDesktopClient ? "http://localhost:8787" : "";
 const thinkingOptions: Array<{ id: ThinkingMode; label: string }> = [
   { id: "fast", label: "快速" },
   { id: "balanced", label: "标准" },
@@ -119,10 +135,17 @@ const thinkingOptions: Array<{ id: ThinkingMode; label: string }> = [
 ];
 
 const defaultPermissionOptions: PermissionOption[] = [
-  { id: "request_approval", label: "请求批准", description: "编辑外部文件和使用互联网时始终询问" },
-  { id: "auto_approve", label: "替我审批", description: "仅对检测到的风险操作请求批准" },
-  { id: "full_access", label: "完全访问", description: "可不受限制地访问互联网和本机文件" }
+  { id: "request_approval", label: "请求批准", description: "项目内文件操作直接执行，项目外操作请求审批" },
+  { id: "auto_approve", label: "替我审批", description: "由当前模型自动审核工具风险并决定是否执行" },
+  { id: "full_access", label: "完全访问", description: "允许所有工具操作直接执行" }
 ];
+
+const toolActionLabels: Record<string, { running: string; completed: string; noun: string }> = {
+  read_file: { running: "正在读取", completed: "已读取", noun: "个文件" },
+  write_file: { running: "正在编辑", completed: "已编辑", noun: "个文件" },
+  run_shell: { running: "正在运行", completed: "已运行", noun: "条命令" },
+  web_fetch: { running: "正在获取", completed: "已获取", noun: "个网页" }
+};
 
 function createId(prefix: string) {
   return `${prefix}_${crypto.randomUUID()}`;
@@ -188,6 +211,132 @@ function summarizeArguments(args: Record<string, unknown>) {
   return Object.entries(args)
     .map(([key, value]) => `${key}: ${String(value).slice(0, 90)}`)
     .join("\n");
+}
+
+function renderMessageContent(content: string) {
+  return content.split(/(`[^`\n]+`)/g).map((part, index) => {
+    if (part.startsWith("`") && part.endsWith("`")) {
+      return (
+        <code className="inlineCode" key={`${part}-${index}`}>
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+    return part;
+  });
+}
+
+function getToolShortTarget(message: ChatMessage) {
+  const pathArg = message.toolArgs?.path as string | undefined;
+  const commandArg = message.toolArgs?.command as string | undefined;
+  const urlArg = message.toolArgs?.url as string | undefined;
+  const target = pathArg ?? commandArg ?? urlArg ?? "";
+  if (!target) return "";
+  return target.length > 34 ? `...${target.slice(-31)}` : target;
+}
+
+function getFileName(filePath: string) {
+  return filePath.split(/[\\/]/).filter(Boolean).at(-1) ?? filePath;
+}
+
+function getToolDisplayTarget(message: ChatMessage) {
+  const pathArg = message.toolArgs?.path as string | undefined;
+  const commandArg = message.toolArgs?.command as string | undefined;
+  const urlArg = message.toolArgs?.url as string | undefined;
+  if (pathArg) return getFileName(pathArg);
+  const target = commandArg ?? urlArg ?? "";
+  if (!target) return "";
+  return target.length > 42 ? `...${target.slice(-39)}` : target;
+}
+
+function getToolGroupSummary(toolMessages: ChatMessage[]) {
+  const runningCount = toolMessages.filter((m) => m.status === "running").length;
+  const doneCount = toolMessages.filter((m) => m.status === "completed").length;
+  const hasRunning = runningCount > 0;
+  const allDone = doneCount === toolMessages.length;
+  const toolNames = [...new Set(toolMessages.map((m) => m.toolName).filter(Boolean))] as string[];
+  const primaryTool = toolNames.length === 1 ? toolNames[0] : undefined;
+  const labels = primaryTool ? toolActionLabels[primaryTool] : undefined;
+  const diffMessages = toolMessages.filter((message) => message.diff);
+  const addedLines = diffMessages.reduce((sum, message) => sum + (message.diff?.addedLines ?? 0), 0);
+  const removedLines = diffMessages.reduce((sum, message) => sum + (message.diff?.removedLines ?? 0), 0);
+  const focusedMessage =
+    toolMessages.find((m) => m.status === "running") ??
+    diffMessages[0] ??
+    toolMessages.find((m) => m.toolArgs?.path || m.toolArgs?.command || m.toolArgs?.url) ??
+    toolMessages[0];
+  const target = focusedMessage ? getToolDisplayTarget(focusedMessage) : "";
+
+  if (hasRunning) {
+    return {
+      label: labels ? `${labels.running} ${runningCount} ${labels.noun}` : `正在调用工具 ${toolNames.join(", ")}...`,
+      detail: target ? `${labels?.running ?? "正在处理"} ${target}` : undefined,
+      addedLines,
+      removedLines,
+      isRunning: true,
+      primaryTool
+    };
+  }
+
+  if (allDone) {
+    return {
+      label: labels ? `${labels.completed} ${toolMessages.length} ${labels.noun}` : `已完成 ${toolMessages.length} 次工具调用`,
+      detail: target ? `${labels?.completed ?? "已处理"} ${target}` : undefined,
+      addedLines,
+      removedLines,
+      isRunning: false,
+      primaryTool
+    };
+  }
+
+  return {
+    label: `工具调用 ${toolNames.join(", ")} (${doneCount}/${toolMessages.length})`,
+    detail: target ? `正在处理 ${target}` : undefined,
+    addedLines,
+    removedLines,
+    isRunning: false,
+    primaryTool
+  };
+}
+
+function getCompletedViewMessageIds(messages: ChatMessage[]) {
+  const visibleIds = new Set<string>();
+  const hasUserMessages = messages.some((message) => message.role === "user");
+
+  if (!hasUserMessages) {
+    messages.forEach((message) => {
+      if (message.role !== "tool") visibleIds.add(message.id);
+    });
+    return visibleIds;
+  }
+
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (message.role !== "user") continue;
+
+    visibleIds.add(message.id);
+    const nextUserIndex = messages.findIndex((item, nextIndex) => nextIndex > index && item.role === "user");
+    const turnEnd = nextUserIndex === -1 ? messages.length : nextUserIndex;
+    let finalAssistant: ChatMessage | undefined;
+
+    for (let turnIndex = index + 1; turnIndex < turnEnd; turnIndex++) {
+      const candidate = messages[turnIndex];
+      if (
+        candidate.role === "assistant" &&
+        candidate.content.trim() &&
+        !candidate.isStreaming &&
+        candidate.status !== "approval_required"
+      ) {
+        finalAssistant = candidate;
+      }
+    }
+
+    if (finalAssistant) {
+      visibleIds.add(finalAssistant.id);
+    }
+  }
+
+  return visibleIds;
 }
 
 function getFolderName(folderPath: string) {
@@ -264,7 +413,9 @@ export default function App() {
   const workspaceStateRef = useRef(workspaceState);
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
   const queuedPromptsRef = useRef<Map<string, QueuedPrompt[]>>(new Map());
+  const swipeStartRef = useRef<Map<string, { x: number; y: number }>>(new Map());
   const [queueVersion, setQueueVersion] = useState(0);
+  const [swipedSessionId, setSwipedSessionId] = useState<string | undefined>();
   // 追踪用户手动关闭的工具折叠组，避免重渲染时自动展开
   const manualClosedGroupsRef = useRef<Set<string>>(new Set());
   // diff 对比面板
@@ -301,9 +452,28 @@ export default function App() {
   const pendingApprovals = activeSession?.pendingApprovals ?? [];
   const conversationId = activeSession?.conversationId;
   const isActiveSessionRunning = activeSession ? runningSessionIds.has(activeSession.id) : false;
-  const activeQueueLength = useMemo(
-    () => (activeSession ? (queuedPromptsRef.current.get(activeSession.id)?.length ?? 0) : 0),
+  const hasVisibleProcess =
+    isActiveSessionRunning ||
+    pendingApprovals.length > 0 ||
+    messages.some((message) => message.isStreaming || message.status === "approval_required" || message.status === "running");
+  const completedViewMessageIds = useMemo(
+    () => (hasVisibleProcess ? undefined : getCompletedViewMessageIds(messages)),
+    [hasVisibleProcess, messages]
+  );
+  const visibleMessages = useMemo(
+    () =>
+      completedViewMessageIds
+        ? messages.filter((message) => message.role !== "tool" && completedViewMessageIds.has(message.id))
+        : messages,
+    [completedViewMessageIds, messages]
+  );
+  const activeQueuedPrompts = useMemo(
+    () => (activeSession ? (queuedPromptsRef.current.get(activeSession.id) ?? []) : []),
     [activeSession, queueVersion]
+  );
+  const activeQueueLength = useMemo(
+    () => activeQueuedPrompts.length,
+    [activeQueuedPrompts]
   );
 
   useEffect(() => {
@@ -312,7 +482,7 @@ export default function App() {
   }, [workspaceState]);
 
   useEffect(() => {
-    fetch("/api/health")
+    fetch(`${API_BASE}/api/health`)
       .then((r) => r.json())
       .then((data) => {
         setHealth(data);
@@ -322,7 +492,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    fetch("/api/models")
+    fetch(`${API_BASE}/api/models`)
       .then((r) => r.json())
       .then((catalog: ModelCatalog) => {
         const recommended = catalog.recommendedForAgent ?? [];
@@ -333,7 +503,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    fetch("/api/permissions")
+    fetch(`${API_BASE}/api/permissions`)
       .then((r) => r.json())
       .then((catalog: PermissionCatalog) => {
         const defaults = new Map(defaultPermissionOptions.map((item) => [item.id, item]));
@@ -343,6 +513,9 @@ export default function App() {
           description: item.description ?? defaults.get(item.id)?.description ?? ""
         }));
         setPermissionOptions(merged);
+        if (catalog.defaultMode) {
+          setMode(catalog.defaultMode);
+        }
       })
       .catch(() => setPermissionOptions(defaultPermissionOptions));
   }, []);
@@ -370,11 +543,13 @@ export default function App() {
   }
 
   function selectProject(project: AgentProject) {
-    const firstSession = project.sessions[0] ?? createSession();
+    const firstSession = project.sessions.find((session) => !session.archivedAt) ?? createSession();
     setWorkspaceState((cur) => ({
       ...cur,
       projects: cur.projects.map((item) =>
-        item.id === project.id && item.sessions.length === 0 ? { ...item, sessions: [firstSession] } : item
+        item.id === project.id && !item.sessions.some((session) => !session.archivedAt)
+          ? { ...item, sessions: [firstSession, ...item.sessions] }
+          : item
       ),
       activeProjectId: project.id,
       activeSessionId: firstSession.id
@@ -382,6 +557,7 @@ export default function App() {
   }
 
   function selectSession(projectId: string, sessionId: string) {
+    setSwipedSessionId(undefined);
     setWorkspaceState((cur) => ({ ...cur, activeProjectId: projectId, activeSessionId: sessionId }));
   }
 
@@ -424,6 +600,73 @@ export default function App() {
     }));
   }
 
+  function archiveSession(projectId: string, sessionId: string) {
+    setSwipedSessionId(undefined);
+    queuedPromptsRef.current.delete(sessionId);
+    abortControllersRef.current.get(sessionId)?.abort();
+    abortControllersRef.current.delete(sessionId);
+    setRunningSessionIds((cur) => {
+      const next = new Set(cur);
+      next.delete(sessionId);
+      return next;
+    });
+
+    setWorkspaceState((cur) => {
+      const project = cur.projects.find((item) => item.id === projectId);
+      if (!project) return cur;
+
+      const now = new Date().toISOString();
+      const sessions = project.sessions.map((session) =>
+        session.id === sessionId ? { ...session, archivedAt: now, updatedAt: now, pendingApprovals: [] } : session
+      );
+      const visibleSessions = sessions.filter((session) => !session.archivedAt);
+      const fallbackSession = visibleSessions[0] ?? createSession();
+      const nextSessions = visibleSessions.length > 0 ? sessions : [fallbackSession, ...sessions];
+
+      return {
+        ...cur,
+        activeProjectId: cur.activeSessionId === sessionId ? projectId : cur.activeProjectId,
+        activeSessionId: cur.activeSessionId === sessionId ? fallbackSession.id : cur.activeSessionId,
+        projects: cur.projects.map((item) =>
+          item.id === projectId ? { ...item, updatedAt: now, sessions: nextSessions } : item
+        )
+      };
+    });
+  }
+
+  function handleSessionPointerDown(sessionId: string, event: PointerEvent<HTMLButtonElement>) {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    swipeStartRef.current.set(sessionId, { x: event.clientX, y: event.clientY });
+  }
+
+  function releaseSessionPointer(event: PointerEvent<HTMLButtonElement>) {
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }
+
+  function handleSessionPointerMove(sessionId: string, event: PointerEvent<HTMLButtonElement>) {
+    const start = swipeStartRef.current.get(sessionId);
+    if (!start) return;
+    const deltaX = event.clientX - start.x;
+    const deltaY = event.clientY - start.y;
+    if (deltaX < -28 && Math.abs(deltaX) > Math.abs(deltaY) * 1.4) {
+      setSwipedSessionId(sessionId);
+    }
+  }
+
+  function handleSessionPointerUp(projectId: string, sessionId: string, event: PointerEvent<HTMLButtonElement>) {
+    const start = swipeStartRef.current.get(sessionId);
+    swipeStartRef.current.delete(sessionId);
+    releaseSessionPointer(event);
+    if (!start) return;
+    const deltaX = event.clientX - start.x;
+    const deltaY = event.clientY - start.y;
+    if (deltaX < -86 && Math.abs(deltaX) > Math.abs(deltaY) * 1.4) {
+      archiveSession(projectId, sessionId);
+    }
+  }
+
   function getSessionContext(projectId: string, sessionId: string) {
     const project = workspaceStateRef.current.projects.find((item) => item.id === projectId);
     const session = project?.sessions.find((item) => item.id === sessionId);
@@ -438,9 +681,25 @@ export default function App() {
     setQueueVersion((v) => v + 1);
   }
 
-  function enqueuePrompt(projectId: string, sessionId: string, content: string) {
+  function enqueuePrompt(sessionId: string, content: string) {
     const q = queuedPromptsRef.current.get(sessionId) ?? [];
-    queuedPromptsRef.current.set(sessionId, [...q, { id: createId("queue"), content }]);
+    queuedPromptsRef.current.set(sessionId, [...q, { id: createId("queue"), content, kind: "prompt" }]);
+    updateQueueState();
+  }
+
+  function removeQueuedPrompt(sessionId: string, queueId: string) {
+    const next = (queuedPromptsRef.current.get(sessionId) ?? []).filter((item) => item.id !== queueId);
+    if (next.length > 0) queuedPromptsRef.current.set(sessionId, next);
+    else queuedPromptsRef.current.delete(sessionId);
+    updateQueueState();
+  }
+
+  function guideQueuedPrompt(sessionId: string, queueId: string) {
+    const q = queuedPromptsRef.current.get(sessionId) ?? [];
+    const target = q.find((item) => item.id === queueId);
+    if (!target) return;
+    const rest = q.filter((item) => item.id !== queueId);
+    queuedPromptsRef.current.set(sessionId, [{ ...target, kind: "guide" }, ...rest]);
     updateQueueState();
   }
 
@@ -475,7 +734,11 @@ export default function App() {
   async function processQueuedPrompt(projectId: string, sessionId: string) {
     const next = dequeuePrompt(sessionId);
     if (!next) return false;
-    await runAgentForSession(projectId, sessionId, next.content, false);
+    const content =
+      next.kind === "guide"
+        ? `请把下面内容作为对当前会话/当前任务的引导和补充约束，优先参考，但不要机械复述：\n\n${next.content}`
+        : next.content;
+    await runAgentForSession(projectId, sessionId, content, true, next.content);
     return true;
   }
 
@@ -609,11 +872,17 @@ export default function App() {
     }
   }
 
-  async function runAgentForSession(projectId: string, sessionId: string, content: string, addUserMessage = true) {
+  async function runAgentForSession(
+    projectId: string,
+    sessionId: string,
+    content: string,
+    addUserMessage = true,
+    displayContent = content
+  ) {
     const context = getSessionContext(projectId, sessionId);
     if (!context) return;
 
-    if (addUserMessage) appendUserMessage(projectId, sessionId, content);
+    if (addUserMessage) appendUserMessage(projectId, sessionId, displayContent);
 
     const assistantMessageId = createId("message");
     updateSession(projectId, sessionId, (s) => ({
@@ -627,7 +896,7 @@ export default function App() {
     markSessionRunning(sessionId);
 
     try {
-      const result = await fetch("/api/agent/run", {
+      const result = await fetch(`${API_BASE}/api/agent/run`, {
         method: "POST",
         signal: abortController.signal,
         headers: { "content-type": "application/json" },
@@ -672,8 +941,7 @@ export default function App() {
     if (!content || !activeProject || !activeSession) return;
 
     if (isActiveSessionRunning) {
-      enqueuePrompt(activeProject.id, activeSession.id, content);
-      appendUserMessage(activeProject.id, activeSession.id, content);
+      enqueuePrompt(activeSession.id, content);
       setPrompt("");
       return;
     }
@@ -699,7 +967,7 @@ export default function App() {
     markSessionRunning(sessionId);
 
     try {
-      const result = await fetch("/api/agent/approve", {
+      const result = await fetch(`${API_BASE}/api/agent/approve`, {
         method: "POST",
         signal: abortController.signal,
         headers: { "content-type": "application/json" },
@@ -749,6 +1017,45 @@ export default function App() {
   return (
     <main className="desktopShell" data-client={isDesktopClient ? "electron" : "web"} data-theme={resolvedTheme}>
       <section className="clientWindow">
+        {isDesktopClient && (
+          <div className="appTopBar">
+            <div className="topBarSidebarZone">
+              <div className="appTopBarTrafficSpace" />
+              <button className="topBarIconButton" type="button" aria-label="切换侧边栏">
+                <PanelLeft size={16} />
+              </button>
+              <button className="topBarIconButton muted" type="button" aria-label="返回">
+                <SquareChevronLeft size={16} />
+              </button>
+              <button className="topBarIconButton muted" type="button" aria-label="前进">
+                <SquareChevronRight size={16} />
+              </button>
+            </div>
+            <div className="topBarMainZone">
+              <div className="topBarTitle">
+                <MessageSquarePlus size={17} />
+                <span>{activeSession?.title ?? "Agent Console"}</span>
+                <button className="topBarGhostButton" type="button" aria-label="更多">
+                  <MoreHorizontal size={18} />
+                </button>
+              </div>
+              <div className="topBarSpacer" />
+              <button className="topBarModelButton" type="button" title={modelName}>
+                <span>{modelName}</span>
+                <ChevronDown size={15} />
+              </button>
+              <button className="topBarIconButton" type="button" aria-label="视图选项">
+                <ListFilter size={17} />
+              </button>
+              <button className="topBarIconButton" type="button" aria-label="布局选项">
+                <SlidersHorizontal size={17} />
+              </button>
+              <button className="topBarIconButton" type="button" aria-label="右侧面板">
+                <PanelRight size={17} />
+              </button>
+            </div>
+          </div>
+        )}
         <div className={`appLayout ${diffPanel ? "hasDiffPanel" : ""}`}>
           <aside className="sidebar projectSidebar" aria-label="项目与会话">
             <div className="projectSidebarHeader">
@@ -779,6 +1086,7 @@ export default function App() {
             <div className="projectList">
               {workspaceState.projects.map((project) => {
                 const isActiveProject = project.id === activeProject?.id;
+                const visibleSessions = project.sessions.filter((session) => !session.archivedAt);
                 return (
                   <section className="projectGroup" key={project.id}>
                     <button
@@ -794,19 +1102,51 @@ export default function App() {
                     </button>
 
                     <div className="sessionList">
-                      {project.sessions.length === 0 && <div className="emptySession">暂无对话</div>}
-                      {project.sessions.map((session) => (
-                        <button
-                          className={`sessionRow ${
-                            project.id === activeProject?.id && session.id === activeSession?.id ? "active" : ""
-                          } ${runningSessionIds.has(session.id) ? "running" : ""}`}
+                      {visibleSessions.length === 0 && <div className="emptySession">暂无对话</div>}
+                      {visibleSessions.map((session) => (
+                        <div
+                          className={`sessionSwipeRow ${swipedSessionId === session.id ? "swiped" : ""}`}
                           key={session.id}
-                          type="button"
-                          onClick={() => selectSession(project.id, session.id)}
                         >
-                          <span>{session.title}</span>
-                          <time>{getRelativeTime(session.updatedAt)}</time>
-                        </button>
+                          <button
+                            className="sessionArchiveAction"
+                            type="button"
+                            onClick={() => archiveSession(project.id, session.id)}
+                          >
+                            <Archive size={14} />
+                            归档
+                          </button>
+                          <button
+                            className={`sessionRow ${
+                              project.id === activeProject?.id && session.id === activeSession?.id ? "active" : ""
+                            } ${runningSessionIds.has(session.id) ? "running" : ""}`}
+                            type="button"
+                            onClick={() => {
+                              if (swipedSessionId === session.id) {
+                                setSwipedSessionId(undefined);
+                                return;
+                              }
+                              selectSession(project.id, session.id);
+                            }}
+                            onContextMenu={(event) => {
+                              event.preventDefault();
+                              archiveSession(project.id, session.id);
+                            }}
+                            onPointerDown={(event) => handleSessionPointerDown(session.id, event)}
+                            onPointerMove={(event) => handleSessionPointerMove(session.id, event)}
+                            onPointerUp={(event) => handleSessionPointerUp(project.id, session.id, event)}
+                            onPointerCancel={(event) => {
+                              swipeStartRef.current.delete(session.id);
+                              releaseSessionPointer(event);
+                            }}
+                          >
+                            <span className="sessionTitle">
+                              {runningSessionIds.has(session.id) && <span className="sessionRunningDot" aria-hidden="true" />}
+                              <span className="sessionTitleText">{session.title}</span>
+                            </span>
+                            <time>{getRelativeTime(session.updatedAt)}</time>
+                          </button>
+                        </div>
                       ))}
                     </div>
                   </section>
@@ -820,7 +1160,7 @@ export default function App() {
               <div className="leftStack">
                 <section className="chatPanel">
                   <div className="composerHeader chatHeader">
-                    <div>
+                    <div className="chatHeaderTitle">
                       <h2>{activeSession?.title ?? "上下文会话"}</h2>
                       <p>
                         {activeProject?.name ?? "未选择项目"}
@@ -841,7 +1181,7 @@ export default function App() {
                         | { type: "toolGroup"; messages: ChatMessage[] };
                       const renderItems: RenderItem[] = [];
                       let currentToolGroup: ChatMessage[] = [];
-                      for (const message of messages) {
+                      for (const message of visibleMessages) {
                         if (message.role === "tool") {
                           currentToolGroup.push(message);
                         } else {
@@ -860,11 +1200,9 @@ export default function App() {
                         if (item.type === "toolGroup") {
                           const toolMessages = item.messages;
                           const runningCount = toolMessages.filter((m) => m.status === "running").length;
-                          const doneCount = toolMessages.filter((m) => m.status === "completed").length;
                           const failCount = toolMessages.filter((m) => m.status === "completed" && m.toolResult && !m.toolResult.ok).length;
                           const hasRunning = runningCount > 0;
-                          const allDone = doneCount === toolMessages.length;
-                          const toolNames = [...new Set(toolMessages.map((m) => m.toolName))];
+                          const groupSummary = getToolGroupSummary(toolMessages);
                           const groupId = `group-${toolMessages[0].id}`;
                           const isManuallyClosed = manualClosedGroupsRef.current.has(groupId);
                           // 用户手动关闭后不再自动打开；否则运行时自动展开
@@ -872,7 +1210,7 @@ export default function App() {
 
                           return (
                             <details
-                              className="toolToggle"
+                              className={`toolToggle ${groupSummary.isRunning ? "running" : ""}`}
                               key={groupId}
                               open={isOpen}
                               onToggle={(e) => {
@@ -883,32 +1221,48 @@ export default function App() {
                               }}
                             >
                               <summary className="toolToggleSummary">
-                                <span className="toolToggleArrow">&gt;</span>
-                                <span className="toolToggleText">
-                                  {hasRunning
-                                    ? `正在调用工具 ${toolNames.join(", ")}...`
-                                    : allDone
-                                      ? `已调用 ${toolNames.join(", ")}（${toolMessages.length} 次）`
-                                      : `工具调用 ${toolNames.join(", ")} (${doneCount}/${toolMessages.length})`}
+                                {groupSummary.primaryTool === "write_file" ? (
+                                  <Pencil size={17} strokeWidth={2} />
+                                ) : groupSummary.primaryTool === "read_file" ? (
+                                  <FileText size={17} strokeWidth={2} />
+                                ) : (
+                                  <Terminal size={17} strokeWidth={2} />
+                                )}
+                                <span className="toolToggleCopy">
+                                  <span className="toolToggleText">{groupSummary.label}</span>
+                                  {groupSummary.detail && (
+                                    <span className="toolToggleDetail">
+                                      {groupSummary.detail}
+                                      {(groupSummary.addedLines > 0 || groupSummary.removedLines > 0) && (
+                                        <span className="toolDiffInline">
+                                          {groupSummary.addedLines > 0 && <span className="toolDiffAdd">+{groupSummary.addedLines}</span>}
+                                          {groupSummary.removedLines > 0 && <span className="toolDiffRemove">-{groupSummary.removedLines}</span>}
+                                        </span>
+                                      )}
+                                    </span>
+                                  )}
                                 </span>
+                                <span className="toolToggleArrow">&gt;</span>
                                 {failCount > 0 && <span className="toolToggleFail">{failCount} 失败</span>}
                               </summary>
                               <div className="toolToggleBody">
                                 {toolMessages.map((message) => {
                                   const isRunning = message.status === "running";
-                                  const pathArg = message.toolArgs?.path as string;
-                                  const commandArg = message.toolArgs?.command as string;
-                                  const summary = pathArg
-                                    ? pathArg.length > 40 ? `...${pathArg.slice(-37)}` : pathArg
-                                    : commandArg
-                                      ? commandArg.length > 40 ? `...${commandArg.slice(-37)}` : commandArg
-                                      : "";
+                                  const summary = getToolDisplayTarget(message);
+                                  const addedLines = message.diff?.addedLines ?? 0;
+                                  const removedLines = message.diff?.removedLines ?? 0;
                                   return (
-                                    <div className="toolToggleItem" key={message.id}>
+                                    <div className={`toolToggleItem ${isRunning ? "running" : ""}`} key={message.id}>
                                       <div className="toolToggleItemHead">
                                         <span className={`toolCardDot ${isRunning ? "running" : message.toolResult?.ok ? "ok" : "fail"}`} />
                                         <span className="toolCardName">{message.toolName}</span>
                                         {summary && <span className="toolCardDesc">{summary}</span>}
+                                        {(addedLines > 0 || removedLines > 0) && (
+                                          <span className="toolDiffInline compact">
+                                            {addedLines > 0 && <span className="toolDiffAdd">+{addedLines}</span>}
+                                            {removedLines > 0 && <span className="toolDiffRemove">-{removedLines}</span>}
+                                          </span>
+                                        )}
                                         <span className={`toolCardStatus ${isRunning ? "running" : message.toolResult?.ok ? "ok" : "fail"}`}>
                                           {isRunning ? "运行中" : message.toolResult?.ok ? "完成" : "失败"}
                                         </span>
@@ -944,22 +1298,24 @@ export default function App() {
 
                         return (
                           <article className={`message ${message.role} ${isEmpty && message.isStreaming ? "streamingOnly" : ""}`} key={message.id}>
-                            <div className="messageMeta">
-                              <span>{message.role === "user" ? "你" : modelName}</span>
-                              {message.isStreaming && <strong className="streaming">typing</strong>}
-                              {message.status === "error" && <strong className="toolFail">error</strong>}
-                              {message.status === "approval_required" && <strong>approval_required</strong>}
-                              {showFinalBadge && <strong className="finalBadge">最终回复</strong>}
-                            </div>
+                            {message.role !== "user" && (
+                              <div className="messageMeta">
+                                <span>{modelName}</span>
+                                {message.isStreaming && <strong className="streaming">typing</strong>}
+                                {message.status === "error" && <strong className="toolFail">error</strong>}
+                                {message.status === "approval_required" && <strong>approval_required</strong>}
+                                {showFinalBadge && <strong className="finalBadge">最终回复</strong>}
+                              </div>
+                            )}
                             {!isEmpty && (
                               <div className={`messageBubble ${isAssistant ? "assistantBubble" : ""}`}>
-                                {message.content}
+                                {renderMessageContent(message.content)}
                                 {message.isStreaming && <span className="streamingCursor">▊</span>}
                               </div>
                             )}
                             {isEmpty && message.isStreaming && (
                               <div className="messageBubble assistantBubble streamingPlaceholder">
-                                <span className="streamingCursor">▊</span>
+                                <span className="thinkingFlow">正在思考</span>
                               </div>
                             )}
                           </article>
@@ -969,7 +1325,7 @@ export default function App() {
 
                     {pendingApprovals.length > 0 && (
                       <div className="approvalStack inlineApproval">
-                        {pendingApprovals.map((approval) => (
+                        {pendingApprovals.slice(0, 1).map((approval) => (
                           <article className="approvalCard" key={approval.id}>
                             <div>
                               <strong>{approval.reason}</strong>
@@ -1035,12 +1391,47 @@ export default function App() {
                       );
                     })()}
 
-                    <div ref={messagesEndRef} />
-                  </div>
+	                    <div ref={messagesEndRef} />
+	                  </div>
 
-                  <div className="chatComposer">
-                    <textarea
-                      aria-label="聊天输入框"
+	                  {activeQueuedPrompts.length > 0 && activeSession && (
+	                    <div className="queuePanel" aria-label="排队中的后续请求">
+	                      {activeQueuedPrompts.map((item, index) => (
+	                        <div className={`queueItem ${item.kind === "guide" ? "guide" : ""}`} key={item.id}>
+	                          <CornerDownRight size={15} />
+	                          <span className="queueItemText">
+	                            {item.kind === "guide" && <strong>引导</strong>}
+	                            {item.content}
+	                          </span>
+	                          <span className="queueItemMeta">{index === 0 ? "下一个" : `#${index + 1}`}</span>
+	                          <button
+	                            className="queueItemAction"
+	                            type="button"
+	                            onClick={() => guideQueuedPrompt(activeSession.id, item.id)}
+	                            disabled={item.kind === "guide"}
+	                          >
+	                            <CornerDownRight size={14} />
+	                            引导
+	                          </button>
+	                          <button
+	                            className="queueIconAction"
+	                            type="button"
+	                            aria-label="删除排队请求"
+	                            onClick={() => removeQueuedPrompt(activeSession.id, item.id)}
+	                          >
+	                            <Trash2 size={14} />
+	                          </button>
+	                          <button className="queueIconAction" type="button" aria-label="更多">
+	                            <MoreHorizontal size={15} />
+	                          </button>
+	                        </div>
+	                      ))}
+	                    </div>
+	                  )}
+
+	                  <div className="chatComposer">
+	                    <textarea
+	                      aria-label="聊天输入框"
                       value={prompt}
                       onChange={(event) => setPrompt(event.target.value)}
                       onKeyDown={handleComposerKeyDown}

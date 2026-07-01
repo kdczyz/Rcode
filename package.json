@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "main": "electron/main.cjs",
+  "description": "Agent Console Desktop Application",
+  "author": "Agent Console",
   "scripts": {
     "dev": "concurrently \"npm:dev:server\" \"npm:dev:web\"",
     "dev:server": "tsx watch server/index.ts",
@@ -10,9 +13,45 @@
     "client": "concurrently -k \"npm:dev:server\" \"npm:dev:web\" \"npm:client:electron\"",
     "client:electron": "wait-on http://localhost:5173 http://localhost:8787/api/health && cross-env ELECTRON_START_URL=http://localhost:5173 electron electron/main.cjs",
     "build": "tsc && vite build",
-    "build:client": "npm run build && electron electron/main.cjs",
+    "build:server": "tsc -p tsconfig.server.json && node scripts/bundle-server.cjs",
+    "build:app": "npm run build && npm run build:server && electron-builder --mac",
     "preview": "vite preview --host 0.0.0.0",
     "typecheck": "tsc --noEmit"
+  },
+  "build": {
+    "appId": "com.agent-console.desktop",
+    "productName": "Agent Console",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "target": "dmg",
+      "icon": null
+    },
+    "extraResources": [
+      {
+        "from": ".env.example",
+        "to": ".env.example"
+      },
+      {
+        "from": ".env.local",
+        "to": ".env.local"
+      },
+      {
+        "from": "dist-server-bundle",
+        "to": "dist-server-bundle"
+      },
+      {
+        "from": "config",
+        "to": "config"
+      }
+    ]
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.0.4",
@@ -20,7 +59,6 @@
     "cors": "^2.8.5",
     "cross-env": "^10.1.0",
     "dotenv": "^17.2.3",
-    "electron": "^43.0.0",
     "express": "^5.1.0",
     "lucide-react": "^0.468.0",
     "nanoid": "^5.1.6",
@@ -37,6 +75,8 @@
     "@types/express": "^5.0.3",
     "@types/node": "^24.6.0",
     "@types/react": "^19.1.16",
-    "@types/react-dom": "^19.1.9"
+    "@types/react-dom": "^19.1.9",
+    "electron": "^43.0.0",
+    "electron-builder": "^26.15.3"
   }
 }

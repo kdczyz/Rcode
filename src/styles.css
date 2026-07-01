@@ -1,11 +1,23 @@
 :root {
+  --font-ui:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif;
+  --font-mono:
+    "SF Mono", SFMono-Regular, ui-monospace, Menlo, Consolas, "Liberation Mono", monospace;
+  --weight-regular: 430;
+  --weight-medium: 520;
+  --weight-semibold: 610;
+  --weight-bold: 700;
   color: #f4f0e8;
   background: #151514;
-  font-family:
-    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: var(--weight-regular);
+  line-height: 1.5;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 html,
@@ -25,6 +37,7 @@ body {
   min-width: 320px;
   min-height: 100%;
   background: #000;
+  font-weight: var(--weight-regular);
 }
 
 button,
@@ -38,16 +51,21 @@ button {
 
 .desktopShell {
   --page: #000000;
-  --surface: #050505;
-  --surface-2: #0f0f0f;
-  --surface-3: #171717;
-  --text: #ffffff;
-  --muted: #9b9b9b;
-  --faint: #6f6f6f;
-  --border: rgba(255, 255, 255, 0.12);
-  --border-soft: rgba(255, 255, 255, 0.08);
-  --accent: #ffffff;
-  --accent-text: #000000;
+  --surface: #060606;
+  --surface-2: #10100f;
+  --surface-3: #191917;
+  --text: #e9e6dd;
+  --muted: #8f8b84;
+  --faint: #625f58;
+  --border: rgba(233, 230, 221, 0.11);
+  --border-soft: rgba(233, 230, 221, 0.075);
+  --accent: #e9e6dd;
+  --accent-text: #11110f;
+  --selected: #d8d3c7;
+  --selected-hover: #eeeae1;
+  --scroll-thumb: rgba(233, 230, 221, 0.22);
+  --scroll-thumb-hover: rgba(233, 230, 221, 0.34);
+  --scroll-track: rgba(233, 230, 221, 0.035);
   --danger: #ff6b57;
   --warning: #e7b84b;
   --info: #84b8ff;
@@ -62,6 +80,37 @@ button {
   background: var(--page);
 }
 
+.desktopShell * {
+  scrollbar-color: var(--scroll-thumb) transparent;
+  scrollbar-width: thin;
+}
+
+.desktopShell *::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.desktopShell *::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.desktopShell *::-webkit-scrollbar-thumb {
+  min-height: 44px;
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: var(--scroll-thumb);
+  background-clip: padding-box;
+}
+
+.desktopShell *::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+  background-clip: padding-box;
+}
+
+.desktopShell *::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
 .desktopShell[data-theme="light"] {
   --page: #ffffff;
   --surface: #ffffff;
@@ -74,12 +123,19 @@ button {
   --border-soft: rgba(0, 0, 0, 0.08);
   --accent: #000000;
   --accent-text: #ffffff;
+  --selected: #000000;
+  --selected-hover: #1f1f1f;
+  --scroll-thumb: rgba(0, 0, 0, 0.24);
+  --scroll-thumb-hover: rgba(0, 0, 0, 0.36);
+  --scroll-track: rgba(0, 0, 0, 0.04);
   --danger: #bd2d1b;
   --warning: #7a5100;
   --info: #1456b8;
 }
 
 .clientWindow {
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
   width: min(1280px, calc(100vw - 68px));
   height: min(820px, calc(100vh - 32px));
@@ -107,9 +163,148 @@ button {
   -webkit-app-region: no-drag;
 }
 
+.appTopBar {
+  -webkit-app-region: drag;
+  display: flex;
+  align-items: center;
+  gap: 0;
+  height: 48px;
+  flex: 0 0 48px;
+  min-width: 0;
+  border-bottom: 1px solid var(--border-soft);
+  padding: 0;
+  color: var(--muted);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.045), transparent 72%),
+    color-mix(in srgb, var(--surface-2) 82%, #242522);
+}
+
+.desktopShell[data-client="web"] .appTopBar {
+  display: none;
+}
+
+.appTopBarTrafficSpace {
+  width: 86px;
+  height: 100%;
+  flex: 0 0 86px;
+}
+
+.topBarSidebarZone,
+.topBarMainZone {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  height: 100%;
+}
+
+.topBarSidebarZone {
+  width: 318px;
+  flex: 0 0 318px;
+  gap: 12px;
+  border-right: 1px solid var(--border-soft);
+  padding: 0 12px 0 0;
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--text) 4%, transparent), transparent 84%),
+    color-mix(in srgb, var(--surface-2) 88%, #2b2d29);
+}
+
+.topBarMainZone {
+  flex: 1 1 auto;
+  gap: 12px;
+  padding: 0 18px 0 24px;
+}
+
+.topBarDivider {
+  width: 1px;
+  height: 48px;
+  align-self: stretch;
+  margin-left: 2px;
+  background: var(--border-soft);
+}
+
+.topBarTitle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: var(--text);
+  font-size: 14.5px;
+  font-weight: var(--weight-semibold);
+}
+
+.topBarTitle span {
+  overflow: hidden;
+  max-width: min(440px, 42vw);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topBarSpacer {
+  flex: 1 1 auto;
+  min-width: 24px;
+}
+
+.topBarIconButton,
+.topBarGhostButton,
+.topBarModelButton {
+  -webkit-app-region: no-drag;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  color: var(--muted);
+  background: transparent;
+}
+
+.topBarIconButton,
+.topBarGhostButton {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  padding: 0;
+}
+
+.topBarIconButton.muted {
+  color: var(--faint);
+  opacity: 0.78;
+}
+
+.topBarModelButton {
+  gap: 7px;
+  max-width: 190px;
+  height: 32px;
+  border-color: var(--border-soft);
+  border-radius: 11px;
+  padding: 0 11px 0 13px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--text) 5%, transparent), transparent),
+    color-mix(in srgb, var(--surface-3) 76%, transparent);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.055),
+    0 1px 10px rgba(0, 0, 0, 0.12);
+}
+
+.topBarModelButton span {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: var(--weight-medium);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topBarIconButton:hover,
+.topBarGhostButton:hover,
+.topBarModelButton:hover {
+  border-color: var(--border-soft);
+  color: var(--text);
+  background: color-mix(in srgb, var(--surface-3) 86%, var(--text) 3%);
+}
+
 .appLayout {
   display: grid;
   grid-template-columns: 318px minmax(0, 1fr);
+  flex: 1 1 auto;
   height: 100%;
   min-height: 0;
 }
@@ -192,19 +387,19 @@ main {
 .navItem span {
   display: grid;
   gap: 3px;
-  font-weight: 700;
+  font-weight: var(--weight-semibold);
 }
 
 .navItem small {
   color: var(--muted);
   font-size: 11px;
-  font-weight: 500;
+  font-weight: var(--weight-medium);
 }
 
 .navItem.active {
   border-color: var(--border);
   color: var(--accent-text);
-  background: var(--accent);
+  background: var(--selected);
 }
 
 .navItem.active small {
@@ -259,13 +454,13 @@ main {
 
 .projectSidebarHeader span {
   color: var(--muted);
-  font-size: 17px;
-  font-weight: 800;
+  font-size: 14px;
+  font-weight: var(--weight-medium);
 }
 
 .projectSidebarHeader strong {
   color: var(--faint);
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .iconButton {
@@ -302,8 +497,8 @@ main {
   padding: 0 7px;
   color: var(--muted);
   background: var(--surface);
-  font-size: 11px;
-  font-weight: 700;
+  font-size: 10.5px;
+  font-weight: var(--weight-medium);
   white-space: nowrap;
 }
 
@@ -349,7 +544,7 @@ main {
 }
 
 .projectRow strong,
-.sessionRow span {
+.sessionTitleText {
   overflow: hidden;
   color: inherit;
   text-overflow: ellipsis;
@@ -357,14 +552,14 @@ main {
 }
 
 .projectRow strong {
-  font-size: 16px;
-  font-weight: 750;
+  font-size: 13px;
+  font-weight: var(--weight-medium);
 }
 
 .projectRow small {
   overflow: hidden;
   color: var(--faint);
-  font-size: 11px;
+  font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -381,11 +576,57 @@ main {
   padding-left: 34px;
 }
 
+.sessionSwipeRow {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  border-radius: 10px;
+}
+
+.sessionSwipeRow.swiped .sessionRow {
+  transform: translateX(-58px);
+}
+
+.sessionSwipeRow.swiped .sessionArchiveAction {
+  opacity: 1;
+  transform: translateX(0);
+  pointer-events: auto;
+}
+
+.sessionArchiveAction {
+  position: absolute;
+  inset: 3px 2px 3px auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: 50px;
+  border: 1px solid color-mix(in srgb, var(--danger) 24%, transparent);
+  border-radius: 8px;
+  color: color-mix(in srgb, var(--danger) 74%, var(--text));
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface-2));
+  font-size: 10.5px;
+  font-weight: var(--weight-medium);
+  opacity: 0;
+  transform: translateX(10px);
+  transition: opacity 0.16s ease, transform 0.18s ease, border-color 0.16s ease, background 0.16s ease;
+  pointer-events: none;
+}
+
+.sessionArchiveAction:hover {
+  border-color: color-mix(in srgb, var(--danger) 42%, transparent);
+  color: color-mix(in srgb, var(--danger) 86%, var(--text));
+  background: color-mix(in srgb, var(--danger) 18%, var(--surface-2));
+}
+
 .sessionRow {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
+  position: relative;
+  z-index: 1;
+  width: 100%;
   min-height: 34px;
   border: 0;
   border-radius: 10px;
@@ -393,17 +634,38 @@ main {
   color: var(--muted);
   text-align: left;
   background: transparent;
+  transition: transform 0.18s ease, color 0.12s ease, background 0.12s ease;
+  touch-action: pan-y;
+  user-select: none;
 }
 
-.sessionRow span {
-  font-size: 14px;
-  font-weight: 750;
+.sessionTitle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: var(--weight-medium);
+}
+
+.sessionTitleText {
+  min-width: 0;
+}
+
+.sessionRunningDot {
+  width: 5px;
+  height: 5px;
+  flex: 0 0 5px;
+  border-radius: 999px;
+  background: #69d17a;
+  box-shadow: 0 0 0 3px color-mix(in srgb, #69d17a 14%, transparent);
+  animation: pulse 1.4s ease-in-out infinite;
 }
 
 .sessionRow time {
   color: var(--faint);
-  font-size: 12px;
-  font-weight: 700;
+  font-size: 11px;
+  font-weight: var(--weight-semibold);
   white-space: nowrap;
 }
 
@@ -414,22 +676,12 @@ main {
 
 .sessionRow.active {
   color: var(--accent-text);
-  background: var(--accent);
+  background: var(--selected);
 }
 
 .sessionRow.active time {
   color: var(--accent-text);
   opacity: 0.65;
-}
-
-.sessionRow.running::after {
-  content: "";
-  display: inline-block;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #4caf50;
-  animation: pulse 1.2s ease-in-out infinite;
 }
 
 @keyframes pulse {
@@ -442,7 +694,7 @@ main {
   padding: 6px 10px;
   color: var(--faint);
   font-size: 13px;
-  font-weight: 700;
+  font-weight: var(--weight-medium);
 }
 
 .workspace {
@@ -465,14 +717,15 @@ p {
 h1 {
   max-width: 720px;
   color: var(--text);
-  font-size: 32px;
+  font-size: 28px;
   line-height: 1.12;
   overflow-wrap: anywhere;
 }
 
 h2 {
   color: var(--text);
-  font-size: 17px;
+  font-size: 15px;
+  font-weight: var(--weight-semibold);
 }
 
 .agentGrid {
@@ -521,7 +774,36 @@ h2 {
 }
 
 .chatHeader {
-  padding-bottom: 4px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 16px;
+  padding: 2px 0 8px;
+}
+
+.chatHeaderTitle {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding-top: 1px;
+}
+
+.chatHeaderTitle h2,
+.chatHeaderTitle p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chatHeaderTitle h2 {
+  font-size: 16px;
+  line-height: 1.25;
+}
+
+.chatHeaderTitle p {
+  margin-top: 0;
+  font-size: 11.5px;
+  line-height: 1.35;
 }
 
 .newChatButton {
@@ -536,7 +818,7 @@ h2 {
   color: var(--muted);
   background: var(--surface);
   font-size: 12px;
-  font-weight: 800;
+  font-weight: var(--weight-semibold);
   white-space: nowrap;
 }
 
@@ -548,29 +830,34 @@ h2 {
 .messageList {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 18px;
   overflow-x: hidden;
   overflow-y: auto;
   min-height: 0;
   border: 0;
   border-radius: 0;
-  padding: 12px 0;
+  padding: 10px 2px 18px;
   background: transparent;
   overscroll-behavior: contain;
 }
 
 .message {
   display: grid;
-  gap: 6px;
-  max-width: 76%;
+  gap: 7px;
+  max-width: min(760px, 82%);
 }
 
 .message.user {
   align-self: flex-end;
+  max-width: min(560px, 58%);
+  gap: 0;
+  margin: 4px 0 8px auto;
 }
 
 .message.assistant {
   align-self: flex-start;
+  width: min(100%, 980px);
+  max-width: 100%;
 }
 
 .messageMeta {
@@ -579,11 +866,15 @@ h2 {
   gap: 8px;
   color: var(--faint);
   font-size: 11px;
-  font-weight: 700;
+  font-weight: var(--weight-semibold);
+}
+
+.message.assistant .messageMeta {
+  display: none;
 }
 
 .message.user .messageMeta {
-  justify-content: flex-end;
+  display: none;
 }
 
 .messageMeta strong {
@@ -598,17 +889,36 @@ h2 {
   padding: 4px 0;
   color: var(--text);
   background: transparent;
-  line-height: 1.6;
+  line-height: 1.66;
   white-space: pre-wrap;
   word-break: break-word;
 }
 
 .message.user .messageBubble {
-  border: 1px solid var(--border-soft);
-  border-radius: 16px;
-  padding: 12px 14px;
+  border: 0;
+  border-radius: 15px;
+  padding: 9px 12px;
   color: var(--accent-text);
-  background: var(--accent);
+  background: var(--selected-hover);
+  font-size: 12.5px;
+  font-weight: var(--weight-medium);
+  line-height: 1.45;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+}
+
+.inlineCode {
+  display: inline-block;
+  max-width: 100%;
+  border-radius: 9px;
+  padding: 0 9px 1px;
+  color: color-mix(in srgb, var(--text) 92%, var(--muted));
+  background: color-mix(in srgb, var(--text) 13%, transparent);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  font-weight: var(--weight-medium);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  vertical-align: baseline;
 }
 
 .typingBubble {
@@ -628,10 +938,121 @@ h2 {
   flex: 0 0 auto;
   display: grid;
   gap: 10px;
-  border: 1px solid var(--border);
-  border-radius: 16px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
   padding: 12px;
-  background: var(--surface);
+  background: color-mix(in srgb, var(--surface-2) 58%, transparent);
+}
+
+.queuePanel {
+  display: grid;
+  gap: 4px;
+  max-height: 150px;
+  overflow: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  padding: 8px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--text) 4%, transparent), transparent),
+    color-mix(in srgb, var(--surface-2) 72%, transparent);
+}
+
+.queueItem {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto auto auto auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  border-radius: 9px;
+  padding: 5px 6px;
+  color: var(--muted);
+}
+
+.queueItem:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.queueItem.guide {
+  color: color-mix(in srgb, var(--info) 62%, var(--text));
+  background: color-mix(in srgb, var(--info) 7%, transparent);
+}
+
+.queueItemText {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  font-size: 12.5px;
+  font-weight: var(--weight-medium);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queueItemText strong {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: 1px 6px;
+  color: color-mix(in srgb, var(--info) 72%, var(--text));
+  background: color-mix(in srgb, var(--info) 12%, transparent);
+  font-size: 10px;
+  font-weight: var(--weight-semibold);
+}
+
+.queueItemMeta {
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+}
+
+.queueItemAction,
+.queueIconAction {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  color: var(--muted);
+  background: transparent;
+}
+
+.queueItemAction {
+  gap: 5px;
+  min-height: 28px;
+  border-radius: 8px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+}
+
+.queueItemAction:hover:not(:disabled) {
+  border-color: var(--border-soft);
+  color: var(--text);
+  background: var(--surface-3);
+}
+
+.queueItemAction:disabled {
+  opacity: 0.48;
+  cursor: default;
+}
+
+.queueIconAction {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  padding: 0;
+}
+
+.queueIconAction:hover {
+  color: var(--text);
+  background: var(--surface-3);
+}
+
+.queueIconAction:hover:nth-last-child(2) {
+  color: color-mix(in srgb, var(--danger) 82%, var(--text));
 }
 
 .chatComposer textarea {
@@ -644,6 +1065,7 @@ h2 {
   padding: 2px 2px 0;
   color: var(--text);
   background: transparent;
+  font-size: 13.5px;
   line-height: 1.58;
   outline: none;
 }
@@ -658,7 +1080,7 @@ h2 {
   justify-content: space-between;
   gap: 12px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11.5px;
 }
 
 .composerControls {
@@ -742,7 +1164,7 @@ h2 {
 .modelMenu button:hover,
 .modelMenu button.active {
   color: var(--accent-text);
-  background: var(--accent);
+  background: var(--selected);
 }
 
 .thinkingMode,
@@ -757,7 +1179,7 @@ h2 {
   color: inherit;
   background: transparent;
   font: inherit;
-  font-weight: 700;
+  font-weight: var(--weight-semibold);
   outline: none;
 }
 
@@ -775,7 +1197,7 @@ h2 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-weight: 700;
+  font-weight: var(--weight-semibold);
 }
 
 .permissionMenu {
@@ -844,7 +1266,7 @@ h2 {
   color: var(--text);
   background: var(--surface-2);
   font-size: 11px;
-  font-weight: 800;
+  font-weight: var(--weight-semibold);
   white-space: nowrap;
 }
 
@@ -856,7 +1278,7 @@ h2 {
   border: 0;
   border-radius: 10px;
   color: var(--accent-text);
-  background: var(--accent);
+  background: var(--selected);
 }
 
 .sendButton.stopping {
@@ -1017,24 +1439,64 @@ details pre {
 strong.streaming {
   color: var(--accent);
   font-size: 11px;
-  font-weight: 600;
+  font-weight: var(--weight-medium);
 }
 
-/* === 工具调用折叠（小字一行，点击展开）=== */
+/* === 工具调用折叠（低对比状态行，点击展开）=== */
 .toolToggle {
-  margin: 2px 0;
+  width: min(100%, 980px);
+  margin: 6px 0 8px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 
 .toolToggleSummary {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 10px;
+  width: fit-content;
+  max-width: 100%;
   cursor: pointer;
   user-select: none;
-  font-size: 11px;
+  min-height: 26px;
+  border-radius: 8px;
+  padding: 0 3px;
+  font-size: 12px;
   color: var(--muted);
   list-style: none;
-  padding: 3px 0;
+  opacity: 0.86;
+  overflow: hidden;
+}
+
+.toolToggle.running .toolToggleSummary,
+.toolToggleItem.running {
+  background:
+    linear-gradient(110deg, transparent 0%, rgba(255, 255, 255, 0.055) 42%, rgba(255, 255, 255, 0.14) 50%, rgba(255, 255, 255, 0.055) 58%, transparent 100%),
+    color-mix(in srgb, var(--text) 4%, transparent);
+  background-size: 220% 100%, 100% 100%;
+  animation: fluidSweep 2.2s ease-in-out infinite;
+}
+
+.toolToggle.running .toolToggleSummary {
+  padding-right: 10px;
+}
+
+@keyframes fluidSweep {
+  0% { background-position: 120% 0, 0 0; }
+  100% { background-position: -120% 0, 0 0; }
+}
+
+.toolToggleSummary:hover {
+  color: var(--text);
+  opacity: 1;
+}
+
+.toolToggleSummary svg {
+  flex: 0 0 auto;
+  color: currentColor;
+  opacity: 0.82;
 }
 
 .toolToggleSummary::-webkit-details-marker {
@@ -1042,10 +1504,11 @@ strong.streaming {
 }
 
 .toolToggleArrow {
-  font-size: 9px;
-  font-family: monospace;
+  font-size: 12px;
+  font-family: var(--font-mono);
   color: var(--faint);
   transition: transform 0.15s;
+  opacity: 0.65;
 }
 
 .toolToggle[open] .toolToggleArrow {
@@ -1053,27 +1516,73 @@ strong.streaming {
 }
 
 .toolToggleText {
+  overflow: hidden;
+  color: currentColor;
+  font-size: 12px;
+  font-weight: var(--weight-regular);
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.toolToggleCopy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.toolToggleDetail {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  color: color-mix(in srgb, var(--muted) 84%, var(--text));
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.toolDiffInline {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: var(--weight-semibold);
+}
+
+.toolDiffInline.compact {
+  margin-left: auto;
   font-size: 11px;
-  font-weight: 400;
-  color: var(--muted);
-  opacity: 0.8;
+}
+
+.toolDiffAdd {
+  color: #63d982;
+}
+
+.toolDiffRemove {
+  color: #ff6b6b;
 }
 
 .toolToggleFail {
-  font-size: 10px;
-  font-weight: 500;
+  font-size: 12px;
+  font-weight: var(--weight-semibold);
   color: #f44336;
-  padding: 0 5px;
-  border-radius: 3px;
+  padding: 2px 7px;
+  border-radius: 999px;
   background: color-mix(in srgb, #f44336 10%, transparent);
 }
 
 .toolToggleBody {
-  padding: 6px 0 6px 0;
+  margin-left: 27px;
+  padding: 5px 0 8px;
 }
 
 .toolToggleItem {
   margin-bottom: 6px;
+  border-radius: 8px;
+  padding: 2px 8px;
 }
 
 .toolToggleItem:last-child {
@@ -1084,7 +1593,8 @@ strong.streaming {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 0;
+  min-width: 0;
+  padding: 5px 0;
 }
 
 /* === 工具卡片子元素样式（被 toolToggleItem 引用）=== */
@@ -1098,6 +1608,7 @@ strong.streaming {
 
 .toolCardDot.running {
   background: var(--warning, #f5a623);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--warning, #f5a623) 13%, transparent);
   animation: pulse 1.4s ease-in-out infinite;
 }
 
@@ -1110,17 +1621,17 @@ strong.streaming {
 }
 
 .toolCardName {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
-  font-weight: 500;
+  font-weight: var(--weight-medium);
   color: var(--text);
   flex-shrink: 0;
 }
 
 .toolCardDesc {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
-  font-weight: 400;
+  font-weight: var(--weight-regular);
   color: var(--muted);
   flex: 1;
   overflow: hidden;
@@ -1131,7 +1642,7 @@ strong.streaming {
 
 .toolCardStatus {
   font-size: 10px;
-  font-weight: 500;
+  font-weight: var(--weight-medium);
   padding: 1px 7px;
   border-radius: 999px;
   flex-shrink: 0;
@@ -1167,7 +1678,7 @@ strong.streaming {
 
 .toolCardLabel {
   font-size: 10px;
-  font-weight: 600;
+  font-weight: var(--weight-medium);
   color: var(--faint);
   margin-bottom: 4px;
   text-transform: uppercase;
@@ -1178,9 +1689,9 @@ strong.streaming {
   margin: 0;
   white-space: pre-wrap;
   word-break: break-all;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
-  font-weight: 400;
+  font-weight: var(--weight-regular);
   line-height: 1.5;
   color: var(--text);
   max-height: 200px;
@@ -1194,17 +1705,38 @@ strong.streaming {
 
 /* === 助手回复（无气泡，纯文本）=== */
 .message.assistant .assistantBubble {
-  font-size: 14px;
-  font-weight: 500;
-  line-height: 1.7;
+  max-width: 100%;
+  font-size: 15px;
+  font-weight: var(--weight-regular);
+  line-height: 1.75;
   color: var(--text);
-  padding: 4px 0;
+  padding: 2px 0;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
 }
 
 .streamingPlaceholder {
-  min-height: 24px;
+  min-height: 34px;
   display: flex;
   align-items: center;
+}
+
+.thinkingFlow {
+  display: inline-flex;
+  align-items: center;
+  min-width: 92px;
+  min-height: 28px;
+  border-radius: 8px;
+  padding: 0 11px;
+  overflow: hidden;
+  color: var(--muted);
+  background:
+    linear-gradient(110deg, transparent 0%, rgba(255, 255, 255, 0.045) 42%, rgba(255, 255, 255, 0.13) 50%, rgba(255, 255, 255, 0.045) 58%, transparent 100%),
+    color-mix(in srgb, var(--text) 4%, transparent);
+  background-size: 220% 100%, 100% 100%;
+  font-size: 12px;
+  font-weight: var(--weight-medium);
+  animation: fluidSweep 2.2s ease-in-out infinite;
 }
 
 .finalBadge {
@@ -1213,12 +1745,12 @@ strong.streaming {
   padding: 2px 8px;
   color: var(--accent);
   font-size: 10px;
-  font-weight: 600;
+  font-weight: var(--weight-medium);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
 
 .streamingOnly {
-  margin: 2px 0;
+  margin: 0;
 }
 
 .toolRunning {
@@ -1273,7 +1805,70 @@ strong.streaming {
   }
 
   h1 {
-    font-size: 27px;
+    font-size: 24px;
+  }
+
+  .messageList {
+    gap: 14px;
+    padding: 8px 0 14px;
+  }
+
+  .message,
+  .message.assistant,
+  .toolToggle {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .message.user {
+    width: auto;
+    max-width: 88%;
+  }
+
+  .message.assistant .assistantBubble {
+    font-size: 15px;
+    line-height: 1.68;
+  }
+
+  .toolToggleSummary,
+  .toolToggleText {
+    font-size: 13px;
+  }
+
+  .toolToggleSummary {
+    min-height: 26px;
+  }
+
+  .toolToggleBody {
+    margin-left: 0;
+  }
+
+  .composerFooter {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .composerControls,
+  .composerActions {
+    flex-wrap: wrap;
+  }
+
+  .queueItem {
+    grid-template-columns: 18px minmax(0, 1fr) auto;
+  }
+
+  .queueItemAction,
+  .queueIconAction {
+    grid-row: 2;
+  }
+
+  .queueItemAction {
+    grid-column: 2;
+    justify-self: start;
+  }
+
+  .queueIconAction {
+    justify-self: end;
   }
 }
 
@@ -1283,7 +1878,7 @@ strong.streaming {
   }
 
   h1 {
-    font-size: 28px;
+    font-size: 24px;
   }
 
   .chatPanel {
@@ -1333,7 +1928,7 @@ strong.streaming {
 
 .diffSummaryTitle {
   font-size: 12px;
-  font-weight: 600;
+  font-weight: var(--weight-medium);
   color: var(--text);
 }
 
@@ -1341,8 +1936,8 @@ strong.streaming {
   display: flex;
   gap: 8px;
   font-size: 11px;
-  font-weight: 600;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-weight: var(--weight-medium);
+  font-family: var(--font-mono);
 }
 
 .diffAdded {
@@ -1385,22 +1980,22 @@ strong.streaming {
   height: 18px;
   border-radius: 3px;
   font-size: 9px;
-  font-weight: 700;
+  font-weight: var(--weight-semibold);
   color: #fff;
   background: var(--warning, #f5a623);
   flex-shrink: 0;
 }
 
 .diffFileName {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
-  font-weight: 500;
+  font-weight: var(--weight-medium);
   color: var(--text);
   flex-shrink: 0;
 }
 
 .diffFileDir {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 10px;
   color: var(--muted);
   flex: 1;
@@ -1414,8 +2009,8 @@ strong.streaming {
   display: flex;
   gap: 6px;
   font-size: 10px;
-  font-weight: 600;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-weight: var(--weight-medium);
+  font-family: var(--font-mono);
   flex-shrink: 0;
 }
 
@@ -1446,15 +2041,15 @@ strong.streaming {
 
 .diffPanelFileName {
   display: block;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
-  font-weight: 600;
+  font-weight: var(--weight-medium);
   color: var(--text);
 }
 
 .diffPanelPath {
   display: block;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 10px;
   color: var(--muted);
   overflow: hidden;
@@ -1466,8 +2061,8 @@ strong.streaming {
   display: flex;
   gap: 8px;
   font-size: 11px;
-  font-weight: 600;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-weight: var(--weight-medium);
+  font-family: var(--font-mono);
   flex-shrink: 0;
 }
 
@@ -1500,7 +2095,7 @@ strong.streaming {
 .diffTable {
   width: 100%;
   border-collapse: collapse;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.5;
 }
@@ -1533,7 +2128,7 @@ strong.streaming {
   padding: 1px 4px;
   text-align: center;
   font-size: 10px;
-  font-weight: 700;
+  font-weight: var(--weight-semibold);
   user-select: none;
   vertical-align: top;
 }

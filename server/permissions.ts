@@ -28,6 +28,21 @@ function isPathOutsideWorkspace(value: unknown, projectPath?: string): boolean {
   return relativePath.startsWith("..") || path.isAbsolute(relativePath);
 }
 
+function commandReferencesOutsideWorkspace(value: unknown, projectPath?: string): boolean {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return true;
+  }
+
+  const absolutePathMatches = value.matchAll(/(?:^|\s)(\/[^\s'"`;&|()]+)/g);
+  for (const match of absolutePathMatches) {
+    if (isPathOutsideWorkspace(match[1], projectPath)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 export function getToolCallRisk(toolCall: ToolCall): ToolRisk {
   return getToolRisk(toolCall.name);
 }
@@ -40,7 +55,7 @@ export function needsApproval(mode: PermissionMode, toolCall: ToolCall, projectP
     return false;
   }
 
-  // 自动审批：AI 思考判定风险，高风险操作需要审批，低风险直接通过
+  // 自动审批由 server/agent.ts 调用当前模型审核；这里保留静态兜底。
   if (mode === "auto_approve") {
     return risk === "high";
   }
@@ -57,9 +72,12 @@ export function needsApproval(mode: PermissionMode, toolCall: ToolCall, projectP
       return isPathOutsideWorkspace(toolCall.arguments.path, projectPath);
     }
 
-    // Shell 命令：无法可靠判断操作范围，需要审批
+    // Shell 命令：工作目录或显式绝对路径离开项目时需要审批。
     if (toolCall.name === "run_shell") {
-      return true;
+      if (toolCall.arguments.cwd && isPathOutsideWorkspace(toolCall.arguments.cwd, projectPath)) {
+        return true;
+      }
+      return commandReferencesOutsideWorkspace(toolCall.arguments.command, projectPath);
     }
 
     return true;
@@ -70,12 +88,12 @@ export function needsApproval(mode: PermissionMode, toolCall: ToolCall, projectP
 
 export function describePermissionMode(mode: PermissionMode): string {
   if (mode === "request_approval") {
-    return "当前项目内操作自动通过，项目外操作需手动审批";
+    return "项目内文件操作直接执行，项目外操作请求审批";
   }
 
   if (mode === "auto_approve") {
-    return "AI 自动判定风险，高风险需审批，低风险直接通过";
+    return "由当前模型自动审核工具风险并决定是否执行";
   }
 
-  return "完全控制，不需要任何审批";
+  return "允许所有工具操作直接执行";
 }

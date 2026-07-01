@@ -1,7 +1,7 @@
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { describePermissionMode } from "./permissions";
 import { approveToolCallStream, runAgentStream } from "./agent";
 import type { PermissionMode, StreamEvent } from "./types";
@@ -69,12 +69,21 @@ app.get("/api/permissions", (_request, response) => {
 });
 
 app.get("/api/models", (_request, response) => {
-  const catalogPath = "config/nvidia-models.json";
-  if (!existsSync(catalogPath)) {
-    response.status(404).json({ error: "Model catalog has not been generated yet." });
-    return;
-  }
-  response.type("json").send(readFileSync(catalogPath, "utf8"));
+  const runtimeConfig = getRuntimeConfig();
+  const models = [
+    runtimeConfig.provider.defaultModel,
+    ...(runtimeConfig.provider.fallbackModels ?? [])
+  ].filter(Boolean);
+
+  response.json({
+    source: runtimeConfig.providerName,
+    recommendedForAgent: models,
+    models: models.map((id) => ({
+      id,
+      object: "model",
+      owned_by: runtimeConfig.providerName
+    }))
+  });
 });
 
 app.post("/api/agent/run", async (request, response) => {

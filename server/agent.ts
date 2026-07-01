@@ -1,14 +1,15 @@
 import { nanoid } from "nanoid";
-import { callAiStream, type ThinkingMode } from "./aiProvider";
+import { auditToolCallApproval, callAiStream, type ThinkingMode } from "./aiProvider";
 import { getToolCallRisk, needsApproval } from "./permissions";
 import { executeTool } from "./tools";
-import type { AgentMessage, PendingApproval, PermissionMode, StreamEvent, ToolCall, ToolResult } from "./types";
+import type { AgentMessage, PendingApproval, PermissionMode, StreamEvent, ToolCall, ToolResult, ToolRisk } from "./types";
 
 interface Conversation {
   id: string;
   projectPath: string;
   messages: AgentMessage[];
   pendingApprovals: PendingApproval[];
+  toolCallQueue: ToolCall[];
 }
 
 /** 按项目路径隔离会话，同一个项目下的不同会话互不干扰。 */
@@ -41,21 +42,70 @@ function getConversation(conversationId?: string, projectPath?: string): Convers
     id: conversationId ?? nanoid(),
     projectPath: projectKey,
     messages: [],
-    pendingApprovals: []
+    pendingApprovals: [],
+    toolCallQueue: []
   };
   projectMap.set(conversation.id, conversation);
   return conversation;
 }
 
-function buildApproval(conversationId: string, toolCall: ToolCall, projectPath?: string): PendingApproval {
+function buildApproval(
+  conversationId: string,
+  toolCall: ToolCall,
+  projectPath?: string,
+  override?: { risk?: ToolRisk; reason?: string }
+): PendingApproval {
   return {
     id: nanoid(),
     conversationId,
     toolCall,
-    risk: getToolCallRisk(toolCall),
-    reason: `Agent 请求执行 ${toolCall.name}`,
+    risk: override?.risk ?? getToolCallRisk(toolCall),
+    reason: override?.reason ?? `Agent 请求执行 ${toolCall.name}`,
     createdAt: new Date().toISOString(),
     projectPath
+  };
+}
+
+async function evaluateToolApproval(
+  mode: PermissionMode,
+  toolCall: ToolCall,
+  options: { model?: string; projectPath?: string; signal?: AbortSignal }
+): Promise<{ requiresApproval: boolean; risk?: ToolRisk; reason?: string }> {
+  if (mode === "full_access") {
+    return { requiresApproval: false };
+  }
+
+  if (mode === "request_approval") {
+    return { requiresApproval: needsApproval(mode, toolCall, options.projectPath) };
+  }
+
+  try {
+    const audit = await auditToolCallApproval(toolCall, {
+      model: options.model,
+      projectPath: options.projectPath,
+      signal: options.signal
+    });
+
+    if (audit) {
+      return {
+        requiresApproval: !audit.allow,
+        risk: audit.risk,
+        reason: audit.allow ? undefined : `模型自动审核：${audit.reason}`
+      };
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "未知审核错误";
+    return {
+      requiresApproval: true,
+      risk: "high",
+      reason: `模型自动审核失败，需要人工审批：${message}`
+    };
+  }
+
+  return {
+    requiresApproval: getToolCallRisk(toolCall) === "high",
+    risk: getToolCallRisk(toolCall),
+    reason: "模型自动审核不可用，按静态风险策略请求人工审批。"
   };
 }
 
@@ -66,6 +116,11 @@ async function* continueConversationStream(
 ): AsyncGenerator<StreamEvent> {
   let step = 0;
   while (true) {
+    if (conversation.toolCallQueue.length > 0) {
+      const queueCompleted = yield* processToolCallQueueStream(conversation, mode, options, "");
+      if (!queueCompleted) return;
+    }
+
     step++;
     console.log(`[Agent] Step ${step}, messages: ${conversation.messages.length}`);
 
@@ -119,39 +174,54 @@ async function* continueConversationStream(
       return;
     }
 
-    // 处理工具调用
-    const pending: PendingApproval[] = [];
-    for (const toolCall of toolCalls) {
-      console.log(`[Agent] Executing tool: ${toolCall.name}`, JSON.stringify(toolCall.arguments).slice(0, 200));
-      yield { type: "tool_call", toolCall };
+    conversation.toolCallQueue = [...toolCalls];
+    const queueCompleted = yield* processToolCallQueueStream(conversation, mode, options, contentBuffer);
+    if (!queueCompleted) return;
+  }
+}
 
-      if (needsApproval(mode, toolCall, options.projectPath)) {
-        const approval = buildApproval(conversation.id, toolCall, options.projectPath);
-        conversation.pendingApprovals.push(approval);
-        pending.push(approval);
-      } else {
-        const result = await executeTool(toolCall, options.projectPath);
-        console.log(`[Agent] Tool result: ok=${result.ok}, len=${result.content.length}`);
-        yield { type: "tool_result", result };
+async function* processToolCallQueueStream(
+  conversation: Conversation,
+  mode: PermissionMode,
+  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; signal?: AbortSignal },
+  contentBuffer: string
+): AsyncGenerator<StreamEvent, boolean> {
+  while (conversation.toolCallQueue.length > 0) {
+    const toolCall = conversation.toolCallQueue[0];
+    console.log(`[Agent] Executing tool: ${toolCall.name}`, JSON.stringify(toolCall.arguments).slice(0, 200));
+    yield { type: "tool_call", toolCall };
 
-        conversation.messages.push({
-          role: "tool",
-          toolCallId: result.toolCallId,
-          content: result.content
-        });
-      }
-    }
+    const approvalDecision = await evaluateToolApproval(mode, toolCall, {
+      model: options.model,
+      projectPath: options.projectPath,
+      signal: options.signal
+    });
 
-    if (pending.length > 0) {
+    if (approvalDecision.requiresApproval) {
+      const approval = buildApproval(conversation.id, toolCall, options.projectPath, approvalDecision);
+      conversation.pendingApprovals = [approval];
       yield {
         type: "approval_required",
         conversationId: conversation.id,
         answer: contentBuffer,
-        approvals: pending
+        approvals: [approval]
       };
-      return;
+      return false;
     }
+
+    conversation.toolCallQueue.shift();
+    const result = await executeTool(toolCall, options.projectPath);
+    console.log(`[Agent] Tool result: ok=${result.ok}, len=${result.content.length}`);
+    yield { type: "tool_result", result };
+
+    conversation.messages.push({
+      role: "tool",
+      toolCallId: result.toolCallId,
+      content: result.content
+    });
   }
+
+  return true;
 }
 
 export async function* runAgentStream(input: {
@@ -207,6 +277,11 @@ export async function* approveToolCallStream(input: {
     if (!approval) continue;
 
     conversation.pendingApprovals = conversation.pendingApprovals.filter((item) => item.id !== input.approvalId);
+    if (conversation.toolCallQueue[0]?.id === approval.toolCall.id) {
+      conversation.toolCallQueue.shift();
+    } else {
+      conversation.toolCallQueue = conversation.toolCallQueue.filter((toolCall) => toolCall.id !== approval.toolCall.id);
+    }
 
     const result: ToolResult = input.allow
       ? await executeTool(approval.toolCall, approval.projectPath ?? input.projectPath)

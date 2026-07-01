@@ -2,8 +2,51 @@ const { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, shell } = requir
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
+const { fork } = require("node:child_process");
 
+const isDev = !app.isPackaged;
 const startUrl = process.env.ELECTRON_START_URL || `file://${path.join(__dirname, "../dist/index.html")}`;
+
+let serverProcess = null;
+
+function startServer() {
+  if (isDev) {
+    console.log("Dev mode: server should be started separately");
+    return;
+  }
+
+  const serverPath = path.join(process.resourcesPath, "dist-server-bundle/index.cjs");
+
+  console.log("Starting server from:", serverPath);
+
+  // Check if server file exists
+  if (!require("node:fs").existsSync(serverPath)) {
+    console.error("Server file not found:", serverPath);
+    return;
+  }
+
+  serverProcess = fork(serverPath, [], {
+    cwd: process.resourcesPath,
+    env: {
+      ...process.env,
+      PORT: "8787"
+    },
+    silent: false
+  });
+
+  serverProcess.on("message", (msg) => {
+    console.log("Server message:", msg);
+  });
+
+  serverProcess.on("error", (err) => {
+    console.error("Server error:", err);
+  });
+
+  serverProcess.on("exit", (code) => {
+    console.log(`Server process exited with code ${code}`);
+    serverProcess = null;
+  });
+}
 
 function createWindow() {
   nativeTheme.themeSource = "dark";
@@ -15,6 +58,8 @@ function createWindow() {
     minHeight: 680,
     title: "Agent Console Desktop",
     backgroundColor: "#151515",
+    titleBarStyle: "hiddenInset",
+    trafficLightPosition: { x: 18, y: 17 },
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -23,7 +68,14 @@ function createWindow() {
     }
   });
 
-  window.loadURL(startUrl);
+  if (isDev) {
+    window.loadURL(startUrl);
+  } else {
+    // In production, wait a bit for server to start then load
+    setTimeout(() => {
+      window.loadURL(startUrl);
+    }, 3000);
+  }
 
   window.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
@@ -94,6 +146,11 @@ app.whenReady().then(() => {
     ])
   );
 
+  // Start the server in production mode
+  if (!isDev) {
+    startServer();
+  }
+
   createWindow();
 
   app.on("activate", () => {
@@ -106,5 +163,12 @@ app.whenReady().then(() => {
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();
+  }
+});
+
+app.on("before-quit", () => {
+  if (serverProcess) {
+    serverProcess.kill();
+    serverProcess = null;
   }
 });
