@@ -4,6 +4,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { getRuntimeConfig } from "./config";
+import { createPullRequestWithGitHubApi } from "./githubPr";
 import { parseTestResult, formatParsedTestResult } from "./testResultParser";
 import type { AgentToolName, DiffResult, ToolCall, ToolResult } from "./types";
 
@@ -120,7 +121,7 @@ export const toolDefinitions = [
     type: "function",
     function: {
       name: "open_pull_request",
-      description: "Open a GitHub pull request from the current branch using the GitHub CLI. Use only after changes are implemented and validation has been attempted.",
+      description: "Open a GitHub pull request from the current branch. Prefer native GitHub API when GITHUB_TOKEN or GH_TOKEN is available; otherwise fallback to GitHub CLI.",
       parameters: {
         type: "object",
         properties: {
@@ -233,88 +234,42 @@ export async function executeTool(call: ToolCall, projectPath?: string): Promise
       const filePath = resolveSafePath(call.arguments.path, workspaceRoot);
       const content = await readFile(filePath, "utf8");
 
-      return {
-        toolCallId: call.id,
-        name: call.name,
-        ok: true,
-        content: content.slice(0, 12000)
-      };
+      return { toolCallId: call.id, name: call.name, ok: true, content: content.slice(0, 12000) };
     }
 
     if (call.name === "write_file") {
       const filePath = resolveSafePath(call.arguments.path, workspaceRoot);
       const content = getString(call.arguments.content, "content");
-
       let oldContent: string | null = null;
       if (existsSync(filePath)) {
-        try {
-          oldContent = await readFile(filePath, "utf8");
-        } catch { /* ignore */ }
+        try { oldContent = await readFile(filePath, "utf8"); } catch { /* ignore */ }
       }
-
       await writeFile(filePath, content, "utf8");
-
       const diff = computeDiff(filePath, oldContent, content);
-
-      return {
-        toolCallId: call.id,
-        name: call.name,
-        ok: true,
-        content: `Wrote ${content.length} characters to ${filePath}`,
-        diff
-      };
+      return { toolCallId: call.id, name: call.name, ok: true, content: `Wrote ${content.length} characters to ${filePath}`, diff };
     }
 
     if (call.name === "web_fetch") {
       const url = getString(call.arguments.url, "url");
       const response = await fetch(url);
       const text = await response.text();
-
-      return {
-        toolCallId: call.id,
-        name: call.name,
-        ok: response.ok,
-        content: text.slice(0, 12000)
-      };
+      return { toolCallId: call.id, name: call.name, ok: response.ok, content: text.slice(0, 12000) };
     }
 
     if (call.name === "run_shell") {
-      if (!runtimeConfig.computerControl.enabled || !runtimeConfig.computerControl.shell) {
-        throw new Error("Computer control shell is disabled by config/agent.toml");
-      }
-
+      if (!runtimeConfig.computerControl.enabled || !runtimeConfig.computerControl.shell) throw new Error("Computer control shell is disabled by config/agent.toml");
       const command = getString(call.arguments.command, "command");
       const blocked = runtimeConfig.computerControl.blockedCommands.find((item) => command.includes(item));
-      if (blocked) {
-        throw new Error(`Command is blocked by policy: ${blocked}`);
-      }
-
+      if (blocked) throw new Error(`Command is blocked by policy: ${blocked}`);
       const cwd = getWorkingDirectory(call.arguments.cwd, workspaceRoot);
       const result = await runProjectCommand(command, cwd, 30000, 1024 * 1024);
-
-      return {
-        toolCallId: call.id,
-        name: call.name,
-        ok: result.ok,
-        content: truncateToolOutput(`$ ${command}\n\n${result.output}`, 12000)
-      };
+      return { toolCallId: call.id, name: call.name, ok: result.ok, content: truncateToolOutput(`$ ${command}\n\n${result.output}`, 12000) };
     }
 
     if (call.name === "git_status") {
       const cwd = getWorkingDirectory(call.arguments.cwd, workspaceRoot);
-      const result = await runProjectCommand(
-        "git branch --show-current && printf '\\n--- status ---\\n' && git status --short && printf '\\n--- upstream ---\\n' && git status --branch --short",
-        cwd,
-        30000,
-        1024 * 1024
-      );
-
-      return {
-        toolCallId: call.id,
-        name: call.name,
-        ok: result.ok,
-        content: result.output.slice(0, 12000)
-      };
+      const result = await runProjectCommand("git branch --show-current && printf '\\n--- status ---\\n' && git status --short && printf '\\n--- upstream ---\\n' && git status --branch --short", cwd, 30000, 1024 * 1024);
+      return { toolCallId: call.id, name: call.name, ok: result.ok, content: result.output.slice(0, 12000) };
     }
 
     if (call.name === "git_diff") {
@@ -322,95 +277,57 @@ export async function executeTool(call: ToolCall, projectPath?: string): Promise
       const staged = call.arguments.staged === true;
       const maxChars = Math.max(2000, Math.min(getOptionalNumber(call.arguments.maxChars) ?? 20000, 60000));
       const result = await runProjectCommand(staged ? "git diff --staged" : "git diff", cwd, 30000, 4 * 1024 * 1024);
-
-      return {
-        toolCallId: call.id,
-        name: call.name,
-        ok: result.ok,
-        content: truncateToolOutput(result.output || "No diff.", maxChars)
-      };
+      return { toolCallId: call.id, name: call.name, ok: result.ok, content: truncateToolOutput(result.output || "No diff.", maxChars) };
     }
 
     if (call.name === "run_tests") {
-      if (!runtimeConfig.computerControl.enabled || !runtimeConfig.computerControl.shell) {
-        throw new Error("Computer control shell is disabled by config/agent.toml");
-      }
-
+      if (!runtimeConfig.computerControl.enabled || !runtimeConfig.computerControl.shell) throw new Error("Computer control shell is disabled by config/agent.toml");
       const cwd = getWorkingDirectory(call.arguments.cwd, workspaceRoot);
       const command = getOptionalString(call.arguments.command) ?? await getDefaultTestCommand(cwd);
       const blocked = runtimeConfig.computerControl.blockedCommands.find((item) => command.includes(item));
-      if (blocked) {
-        throw new Error(`Command is blocked by policy: ${blocked}`);
-      }
-
+      if (blocked) throw new Error(`Command is blocked by policy: ${blocked}`);
       const timeout = Math.max(10000, Math.min(getOptionalNumber(call.arguments.timeoutMs) ?? 120000, 10 * 60 * 1000));
       const result = await runProjectCommand(command, cwd, timeout, 4 * 1024 * 1024);
       const parsed = parseTestResult(command, result.ok, result.output);
       const structuredSummary = formatParsedTestResult(parsed);
-
-      return {
-        toolCallId: call.id,
-        name: call.name,
-        ok: result.ok,
-        content: truncateToolOutput(`${structuredSummary}\n\n## Raw Output\n$ ${command}\n\n${result.output}`, 26000)
-      };
+      return { toolCallId: call.id, name: call.name, ok: result.ok, content: truncateToolOutput(`${structuredSummary}\n\n## Raw Output\n$ ${command}\n\n${result.output}`, 26000) };
     }
 
     if (call.name === "open_pull_request") {
-      if (!runtimeConfig.computerControl.enabled || !runtimeConfig.computerControl.shell) {
-        throw new Error("Computer control shell is disabled by config/agent.toml");
-      }
-
+      if (!runtimeConfig.computerControl.enabled || !runtimeConfig.computerControl.shell) throw new Error("Computer control shell is disabled by config/agent.toml");
       const cwd = getWorkingDirectory(call.arguments.cwd, workspaceRoot);
       const title = getString(call.arguments.title, "title");
       const body = getString(call.arguments.body, "body");
       const base = getOptionalString(call.arguments.base) ?? "main";
       const draft = call.arguments.draft === true;
-      const command = [
-        "gh pr create",
-        "--title", shellQuote(title),
-        "--body", shellQuote(body),
-        "--base", shellQuote(base),
-        draft ? "--draft" : ""
-      ].filter(Boolean).join(" ");
-      const result = await runProjectCommand(command, cwd, 60000, 1024 * 1024);
 
-      return {
-        toolCallId: call.id,
-        name: call.name,
-        ok: result.ok,
-        content: truncateToolOutput(`$ ${command}\n\n${result.output}`, 12000)
-      };
+      const nativeResult = await createPullRequestWithGitHubApi({ cwd, title, body, base, draft });
+      if (nativeResult) {
+        return { toolCallId: call.id, name: call.name, ok: nativeResult.ok, content: truncateToolOutput(nativeResult.output, 12000) };
+      }
+
+      const command = ["gh pr create", "--title", shellQuote(title), "--body", shellQuote(body), "--base", shellQuote(base), draft ? "--draft" : ""].filter(Boolean).join(" ");
+      const result = await runProjectCommand(command, cwd, 60000, 1024 * 1024);
+      return { toolCallId: call.id, name: call.name, ok: result.ok, content: truncateToolOutput(`$ ${command}\n\n${result.output}`, 12000) };
     }
 
     const exhaustive: never = call.name;
     throw new Error(`Unknown tool: ${exhaustive}`);
   } catch (error) {
-    return {
-      toolCallId: call.id,
-      name: call.name as AgentToolName,
-      ok: false,
-      content: error instanceof Error ? error.message : "Unknown tool error"
-    };
+    return { toolCallId: call.id, name: call.name as AgentToolName, ok: false, content: error instanceof Error ? error.message : "Unknown tool error" };
   }
 }
 
-/** 基于 LCS 的简单行级 diff，生成 unified diff 行 */
 function computeDiff(filePath: string, oldContent: string | null, newContent: string): DiffResult {
   const oldLines = oldContent ? oldContent.split("\n") : [];
   const newLines = newContent.split("\n");
-
   const m = oldLines.length;
   const n = newLines.length;
   const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
 
   for (let i = 1; i <= m; i++) {
     for (let j = 1; j <= n; j++) {
-      if (oldLines[i - 1] === newLines[j - 1]) {
-        dp[i][j] = dp[i - 1][j - 1] + 1;
-      } else {
-        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
-      }
+      dp[i][j] = oldLines[i - 1] === newLines[j - 1] ? dp[i - 1][j - 1] + 1 : Math.max(dp[i - 1][j], dp[i][j - 1]);
     }
   }
 
