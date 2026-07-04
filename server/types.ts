@@ -2,7 +2,15 @@ export type PermissionMode = "request_approval" | "auto_approve" | "full_access"
 
 export type ToolRisk = "low" | "medium" | "high";
 
-export type AgentToolName = "read_file" | "write_file" | "web_fetch" | "run_shell";
+export type AgentToolName =
+  | "read_file"
+  | "write_file"
+  | "web_fetch"
+  | "run_shell"
+  | "git_status"
+  | "git_diff"
+  | "run_tests"
+  | "open_pull_request";
 
 export interface ToolCall {
   id: string;
