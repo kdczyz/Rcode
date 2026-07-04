@@ -19,7 +19,7 @@ export interface OptimizedAgentStreamEvent {
 
 function logContextStats(label: string, stats: ReturnType<typeof prepareAgentContext>["stats"]) {
   console.log(
-    `[AgentContext] ${label}: messages ${stats.originalMessages}->${stats.finalMessages}, chars ${stats.originalChars}->${stats.finalChars}, skills=${stats.matchedSkills.join(",") || "none"}`
+    `[AgentContext] ${label}: intent=${stats.deliveryIntent}, messages ${stats.originalMessages}->${stats.finalMessages}, chars ${stats.originalChars}->${stats.finalChars}, skills=${stats.matchedSkills.join(",") || "none"}`
   );
 }
 
