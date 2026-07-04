@@ -8,6 +8,11 @@ import type { AgentToolName, DiffResult, ToolCall, ToolResult } from "./types";
 
 const execFileAsync = promisify(execFile);
 
+interface ProjectCommandResult {
+  ok: boolean;
+  output: string;
+}
+
 export const toolDefinitions = [
   {
     type: "function",
@@ -166,14 +171,29 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-async function runProjectCommand(command: string, cwd: string, timeout = 30000, maxBuffer = 1024 * 1024) {
-  const { stdout, stderr } = await execFileAsync("zsh", ["-lc", command], {
-    cwd,
-    timeout,
-    maxBuffer
-  });
+function extractCommandErrorOutput(error: unknown) {
+  if (error && typeof error === "object") {
+    const candidate = error as { stdout?: unknown; stderr?: unknown; message?: unknown; code?: unknown };
+    const chunks = [candidate.stdout, candidate.stderr, candidate.message]
+      .filter((value): value is string => typeof value === "string" && value.length > 0);
+    const output = chunks.join("\n");
+    return output || "Command failed without output.";
+  }
+  return error instanceof Error ? error.message : "Unknown command error";
+}
 
-  return [stdout, stderr].filter(Boolean).join("\n");
+async function runProjectCommand(command: string, cwd: string, timeout = 30000, maxBuffer = 1024 * 1024): Promise<ProjectCommandResult> {
+  try {
+    const { stdout, stderr } = await execFileAsync("zsh", ["-lc", command], {
+      cwd,
+      timeout,
+      maxBuffer
+    });
+
+    return { ok: true, output: [stdout, stderr].filter(Boolean).join("\n") };
+  } catch (error) {
+    return { ok: false, output: extractCommandErrorOutput(error) };
+  }
 }
 
 async function getDefaultTestCommand(cwd: string) {
@@ -224,7 +244,6 @@ export async function executeTool(call: ToolCall, projectPath?: string): Promise
       const filePath = resolveSafePath(call.arguments.path, workspaceRoot);
       const content = getString(call.arguments.content, "content");
 
-      // 读取旧文件内容用于生成 diff
       let oldContent: string | null = null;
       if (existsSync(filePath)) {
         try {
@@ -270,19 +289,19 @@ export async function executeTool(call: ToolCall, projectPath?: string): Promise
       }
 
       const cwd = getWorkingDirectory(call.arguments.cwd, workspaceRoot);
-      const output = await runProjectCommand(command, cwd, 30000, 1024 * 1024);
+      const result = await runProjectCommand(command, cwd, 30000, 1024 * 1024);
 
       return {
         toolCallId: call.id,
         name: call.name,
-        ok: true,
-        content: output.slice(0, 12000)
+        ok: result.ok,
+        content: truncateToolOutput(`$ ${command}\n\n${result.output}`, 12000)
       };
     }
 
     if (call.name === "git_status") {
       const cwd = getWorkingDirectory(call.arguments.cwd, workspaceRoot);
-      const output = await runProjectCommand(
+      const result = await runProjectCommand(
         "git branch --show-current && printf '\\n--- status ---\\n' && git status --short && printf '\\n--- upstream ---\\n' && git status --branch --short",
         cwd,
         30000,
@@ -292,8 +311,8 @@ export async function executeTool(call: ToolCall, projectPath?: string): Promise
       return {
         toolCallId: call.id,
         name: call.name,
-        ok: true,
-        content: output.slice(0, 12000)
+        ok: result.ok,
+        content: result.output.slice(0, 12000)
       };
     }
 
@@ -301,13 +320,13 @@ export async function executeTool(call: ToolCall, projectPath?: string): Promise
       const cwd = getWorkingDirectory(call.arguments.cwd, workspaceRoot);
       const staged = call.arguments.staged === true;
       const maxChars = Math.max(2000, Math.min(getOptionalNumber(call.arguments.maxChars) ?? 20000, 60000));
-      const output = await runProjectCommand(staged ? "git diff --staged" : "git diff", cwd, 30000, 4 * 1024 * 1024);
+      const result = await runProjectCommand(staged ? "git diff --staged" : "git diff", cwd, 30000, 4 * 1024 * 1024);
 
       return {
         toolCallId: call.id,
         name: call.name,
-        ok: true,
-        content: truncateToolOutput(output || "No diff.", maxChars)
+        ok: result.ok,
+        content: truncateToolOutput(result.output || "No diff.", maxChars)
       };
     }
 
@@ -324,13 +343,13 @@ export async function executeTool(call: ToolCall, projectPath?: string): Promise
       }
 
       const timeout = Math.max(10000, Math.min(getOptionalNumber(call.arguments.timeoutMs) ?? 120000, 10 * 60 * 1000));
-      const output = await runProjectCommand(command, cwd, timeout, 4 * 1024 * 1024);
+      const result = await runProjectCommand(command, cwd, timeout, 4 * 1024 * 1024);
 
       return {
         toolCallId: call.id,
         name: call.name,
-        ok: true,
-        content: truncateToolOutput(`$ ${command}\n\n${output}`, 24000)
+        ok: result.ok,
+        content: truncateToolOutput(`$ ${command}\n\n${result.output}`, 24000)
       };
     }
 
@@ -351,13 +370,13 @@ export async function executeTool(call: ToolCall, projectPath?: string): Promise
         "--base", shellQuote(base),
         draft ? "--draft" : ""
       ].filter(Boolean).join(" ");
-      const output = await runProjectCommand(command, cwd, 60000, 1024 * 1024);
+      const result = await runProjectCommand(command, cwd, 60000, 1024 * 1024);
 
       return {
         toolCallId: call.id,
         name: call.name,
-        ok: true,
-        content: truncateToolOutput(`$ ${command}\n\n${output}`, 12000)
+        ok: result.ok,
+        content: truncateToolOutput(`$ ${command}\n\n${result.output}`, 12000)
       };
     }
 
@@ -378,7 +397,6 @@ function computeDiff(filePath: string, oldContent: string | null, newContent: st
   const oldLines = oldContent ? oldContent.split("\n") : [];
   const newLines = newContent.split("\n");
 
-  // LCS 算法
   const m = oldLines.length;
   const n = newLines.length;
   const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
@@ -393,7 +411,6 @@ function computeDiff(filePath: string, oldContent: string | null, newContent: st
     }
   }
 
-  // 回溯生成 diff
   const lines: DiffResult["lines"] = [];
   let addedLines = 0;
   let removedLines = 0;
