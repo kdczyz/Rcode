@@ -1,5 +1,6 @@
 import { nanoid } from "nanoid";
-import { auditToolCallApproval, callAiStream, type ThinkingMode } from "./aiProvider";
+import { auditToolCallApproval, type ThinkingMode } from "./aiProvider";
+import { callAgentStreamOptimized } from "./agentInvoker";
 import { getToolCallRisk, needsApproval } from "./permissions";
 import { executeTool } from "./tools";
 import type { AgentMessage, PendingApproval, PermissionMode, StreamEvent, ToolCall, ToolResult, ToolRisk } from "./types";
@@ -132,12 +133,12 @@ async function* continueConversationStream(
     let aiSuccess = false;
     while (aiRetries < 3 && !aiSuccess) {
       try {
-        for await (const event of callAiStream(conversation.messages, options)) {
+        for await (const event of callAgentStreamOptimized(conversation.messages, options)) {
           if (event.type === "text_delta") {
             contentBuffer += event.content;
-            yield { type: "text_delta", content: event.content };
+            yield { type: "text_delta", content: event.content ?? "" };
           } else if (event.type === "tool_calls") {
-            toolCalls = event.toolCalls;
+            toolCalls = event.toolCalls ?? [];
             // 当从文本提取工具调用时，用清理后的内容替换原始内容
             if (event.cleanContent !== undefined) {
               contentBuffer = event.cleanContent;
