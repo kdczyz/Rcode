@@ -135,8 +135,9 @@ async function* continueConversationStream(
       try {
         for await (const event of callAgentStreamOptimized(conversation.messages, options)) {
           if (event.type === "text_delta") {
-            contentBuffer += event.content;
-            yield { type: "text_delta", content: event.content ?? "" };
+            const delta = event.content ?? "";
+            contentBuffer += delta;
+            yield { type: "text_delta", content: delta };
           } else if (event.type === "tool_calls") {
             toolCalls = event.toolCalls ?? [];
             // 当从文本提取工具调用时，用清理后的内容替换原始内容
