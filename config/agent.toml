@@ -52,3 +52,23 @@ enabled = true
 name = "run_shell"
 risk = "high"
 enabled = true
+
+[[tools]]
+name = "git_status"
+risk = "low"
+enabled = true
+
+[[tools]]
+name = "git_diff"
+risk = "medium"
+enabled = true
+
+[[tools]]
+name = "run_tests"
+risk = "high"
+enabled = true
+
+[[tools]]
+name = "open_pull_request"
+risk = "high"
+enabled = true
