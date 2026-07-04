@@ -6,7 +6,11 @@ const toolRisks: Record<AgentToolName, ToolRisk> = {
   read_file: "medium",
   write_file: "high",
   web_fetch: "medium",
-  run_shell: "high"
+  run_shell: "high",
+  git_status: "low",
+  git_diff: "medium",
+  run_tests: "high",
+  open_pull_request: "high"
 };
 
 export function getToolRisk(toolName: AgentToolName): ToolRisk {
@@ -28,12 +32,17 @@ function isPathOutsideWorkspace(value: unknown, projectPath?: string): boolean {
   return relativePath.startsWith("..") || path.isAbsolute(relativePath);
 }
 
+function optionalCwdOutsideWorkspace(value: unknown, projectPath?: string): boolean {
+  if (value === undefined || value === null || value === "") return false;
+  return isPathOutsideWorkspace(value, projectPath);
+}
+
 function commandReferencesOutsideWorkspace(value: unknown, projectPath?: string): boolean {
   if (typeof value !== "string" || value.trim().length === 0) {
     return true;
   }
 
-  const absolutePathMatches = value.matchAll(/(?:^|\s)(\/[^\s'"`;&|()]+)/g);
+  const absolutePathMatches = value.matchAll(/(?:^|\s)(\/[^^\s'"`;&|()]+)/g);
   for (const match of absolutePathMatches) {
     if (isPathOutsideWorkspace(match[1], projectPath)) {
       return true;
@@ -72,6 +81,21 @@ export function needsApproval(mode: PermissionMode, toolCall: ToolCall, projectP
       return isPathOutsideWorkspace(toolCall.arguments.path, projectPath);
     }
 
+    if (toolCall.name === "git_status" || toolCall.name === "git_diff") {
+      return optionalCwdOutsideWorkspace(toolCall.arguments.cwd, projectPath);
+    }
+
+    if (toolCall.name === "run_tests") {
+      if (optionalCwdOutsideWorkspace(toolCall.arguments.cwd, projectPath)) {
+        return true;
+      }
+      return commandReferencesOutsideWorkspace(toolCall.arguments.command ?? "npm run typecheck", projectPath);
+    }
+
+    if (toolCall.name === "open_pull_request") {
+      return true;
+    }
+
     // Shell 命令：工作目录或显式绝对路径离开项目时需要审批。
     if (toolCall.name === "run_shell") {
       if (toolCall.arguments.cwd && isPathOutsideWorkspace(toolCall.arguments.cwd, projectPath)) {
@@ -88,7 +112,7 @@ export function needsApproval(mode: PermissionMode, toolCall: ToolCall, projectP
 
 export function describePermissionMode(mode: PermissionMode): string {
   if (mode === "request_approval") {
-    return "项目内文件操作直接执行，项目外操作请求审批";
+    return "项目内文件和只读 Git 操作直接执行；开 PR、Shell、项目外操作请求审批";
   }
 
   if (mode === "auto_approve") {
