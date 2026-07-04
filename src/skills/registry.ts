@@ -1,7 +1,20 @@
 import { builtinSkills } from "./builtinSkills";
+import { mainstreamSkills } from "./mainstreamSkillPacks";
 import type { AgentSkill, SkillCategory, SkillRegistrySnapshot, SkillSearchOptions } from "./types";
 
-const skillsById = new Map<string, AgentSkill>(builtinSkills.map((skill) => [skill.id, skill]));
+const allSkills = dedupeSkills([...builtinSkills, ...mainstreamSkills]);
+const skillsById = new Map<string, AgentSkill>(allSkills.map((skill) => [skill.id, skill]));
+
+function dedupeSkills(skills: AgentSkill[]) {
+  const seen = new Set<string>();
+  const result: AgentSkill[] = [];
+  for (const skill of skills) {
+    if (seen.has(skill.id)) continue;
+    seen.add(skill.id);
+    result.push(skill);
+  }
+  return result;
+}
 
 function normalize(value: string) {
   return value.trim().toLowerCase();
@@ -28,7 +41,7 @@ function matchesKeyword(skill: AgentSkill, keyword: string) {
 }
 
 export function listSkills(options: SkillSearchOptions = {}) {
-  return builtinSkills.filter((skill) => {
+  return allSkills.filter((skill) => {
     if (!options.includeDisabled && !skill.enabledByDefault) return false;
     if (options.category && skill.category !== options.category) return false;
     if (options.keyword && !matchesKeyword(skill, options.keyword)) return false;
@@ -41,7 +54,7 @@ export function getSkillById(id: string) {
 }
 
 export function listSkillCategories() {
-  return [...new Set(builtinSkills.map((skill) => skill.category))] as SkillCategory[];
+  return [...new Set(allSkills.map((skill) => skill.category))] as SkillCategory[];
 }
 
 export function findSkillsForPrompt(prompt: string) {
@@ -58,9 +71,9 @@ export function getSkillSystemHints(skills: AgentSkill[]) {
 }
 
 export function getSkillRegistrySnapshot(): SkillRegistrySnapshot {
-  const enabledSkills = builtinSkills.filter((skill) => skill.enabledByDefault);
+  const enabledSkills = allSkills.filter((skill) => skill.enabledByDefault);
   return {
-    total: builtinSkills.length,
+    total: allSkills.length,
     enabled: enabledSkills.length,
     categories: listSkillCategories(),
     skills: enabledSkills
