@@ -12,6 +12,8 @@
     "dev:web": "vite --host 0.0.0.0",
     "client": "concurrently -k \"npm:dev:server\" \"npm:dev:web\" \"npm:client:electron\"",
     "client:electron": "wait-on http://localhost:5173 http://localhost:8787/api/health && cross-env ELECTRON_START_URL=http://localhost:5173 electron electron/main.cjs",
+    "mcp:server": "tsx server/mcp/stdioServer.ts",
+    "mcp:inspect": "npx @modelcontextprotocol/inspector npm run mcp:server",
     "build": "tsc && vite build",
     "build:server": "tsc -p tsconfig.server.json && node scripts/bundle-server.cjs",
     "build:app": "npm run build && npm run build:server && electron-builder --mac",
