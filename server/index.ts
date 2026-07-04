@@ -7,6 +7,7 @@ import { approveToolCallStream, runAgentStream } from "./agent";
 import type { PermissionMode, StreamEvent } from "./types";
 import { getRuntimeConfig } from "./config";
 import type { ThinkingMode } from "./aiProvider";
+import { authenticateLocalUser, deleteLocalSession, getLocalAuthStatus, getLocalSession } from "./localDatabase";
 
 dotenv.config();
 if (existsSync(".env.local")) {
@@ -45,6 +46,12 @@ function writeSse(response: express.Response, event: StreamEvent) {
   response.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
+function readBearerToken(request: express.Request) {
+  const header = request.header("authorization") ?? "";
+  const [scheme, token] = header.split(" ");
+  return scheme?.toLowerCase() === "bearer" && token ? token : undefined;
+}
+
 app.get("/api/health", (_request, response) => {
   const runtimeConfig = getRuntimeConfig();
   response.json({
@@ -54,6 +61,35 @@ app.get("/api/health", (_request, response) => {
     providerConfigured: Boolean(process.env.AI_API_KEY ?? process.env[runtimeConfig.provider.apiKeyEnv]),
     computerControl: runtimeConfig.computerControl
   });
+});
+
+app.get("/api/auth/session", (request, response) => {
+  response.json({
+    ...getLocalAuthStatus(),
+    user: getLocalSession(readBearerToken(request)) ?? null
+  });
+});
+
+app.post("/api/auth/login", (request, response) => {
+  const username = typeof request.body.username === "string" ? request.body.username.trim() : "";
+  const password = typeof request.body.password === "string" ? request.body.password : "";
+  if (!username || !password) {
+    response.status(400).json({ error: "username and password are required" });
+    return;
+  }
+
+  const result = authenticateLocalUser(username, password);
+  if (!result) {
+    response.status(401).json({ error: "用户名或密码不正确" });
+    return;
+  }
+
+  response.json(result);
+});
+
+app.post("/api/auth/logout", (request, response) => {
+  deleteLocalSession(readBearerToken(request));
+  response.json({ ok: true });
 });
 
 app.get("/api/permissions", (_request, response) => {

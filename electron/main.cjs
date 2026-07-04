@@ -102,7 +102,8 @@ app.whenReady().then(() => {
   ipcMain.handle("agent:create-folder-project", async (_event, rawName) => {
     const name = typeof rawName === "string" && rawName.trim() ? rawName.trim() : "未命名项目";
     const safeName = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-").slice(0, 80);
-    const projectsRoot = path.join(os.homedir(), "Agent Console Projects");
+    const documentsPath = app.getPath("documents") || path.join(os.homedir(), "Documents");
+    const projectsRoot = path.join(documentsPath, "Agent Console Projects");
     const targetPath = path.join(projectsRoot, safeName);
     await fs.mkdir(targetPath, { recursive: true });
     return targetPath;

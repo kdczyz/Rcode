@@ -3,6 +3,8 @@ dist
 dist-server
 dist-server-bundle
 release
+data
+.workbuddy
 .env
 .env.local
 .DS_Store

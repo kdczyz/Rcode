@@ -7,15 +7,18 @@ import {
   FileText,
   Folder,
   FolderOpen,
-  FolderPlus,
   HardDrive,
   ListFilter,
+  LogIn,
+  LogOut,
   MessageSquarePlus,
   MoreHorizontal,
   PanelLeft,
   PanelRight,
   Pencil,
   Plus,
+  Puzzle,
+  Settings,
   SquareChevronLeft,
   SquareChevronRight,
   Send,
@@ -23,15 +26,18 @@ import {
   Square,
   Terminal,
   Trash2,
+  UserRound,
   X
 } from "lucide-react";
-import { KeyboardEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, FormEvent, KeyboardEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type PermissionMode = "request_approval" | "auto_approve" | "full_access";
 type ThemePreference = "system" | "dark" | "light";
 type ThinkingMode = "fast" | "balanced" | "deep";
-type ProjectKind = "empty" | "folder";
+type ProjectKind = "empty" | "folder" | "temporary";
 type MessageStatus = "completed" | "approval_required" | "error" | "running";
+type ActiveView = "chat" | "settings";
+type SettingsSectionId = "general" | "profile" | "usage" | "mcp";
 
 interface ModelCatalog {
   recommendedForAgent?: string[];
@@ -98,6 +104,18 @@ interface WorkspaceState {
   activeSessionId: string;
 }
 
+interface AuthUser {
+  id: number;
+  username: string;
+  displayName: string;
+  lastLoginAt?: string;
+}
+
+interface AuthSessionResponse {
+  configured: boolean;
+  user: AuthUser | null;
+}
+
 interface QueuedPrompt {
   id: string;
   content: string;
@@ -127,6 +145,12 @@ interface DiffResult {
 }
 
 const workspaceStorageKey = "agent.workspace.projects.v1";
+const sidebarCollapsedStorageKey = "agent.workspace.sidebarCollapsed.v1";
+const sidebarWidthStorageKey = "agent.workspace.sidebarWidth.v1";
+const authTokenStorageKey = "agent.auth.token.v1";
+const defaultSidebarWidth = 318;
+const minSidebarWidth = 220;
+const maxSidebarWidth = 520;
 const API_BASE = window.location.protocol === "file:" || window.agentDesktop?.isDesktopClient ? "http://localhost:8787" : "";
 const thinkingOptions: Array<{ id: ThinkingMode; label: string }> = [
   { id: "fast", label: "快速" },
@@ -205,6 +229,22 @@ function loadWorkspaceState(): WorkspaceState {
     if (isWorkspaceState(parsed) && parsed.projects.length > 0) return parsed;
   } catch { /* ignore */ }
   return getDefaultWorkspace();
+}
+
+function clampSidebarWidth(width: number) {
+  return Math.min(maxSidebarWidth, Math.max(minSidebarWidth, Math.round(width)));
+}
+
+function loadSidebarWidth() {
+  const saved = Number(localStorage.getItem(sidebarWidthStorageKey));
+  return Number.isFinite(saved) ? clampSidebarWidth(saved) : defaultSidebarWidth;
+}
+
+function getAccountInitials(user?: AuthUser | null) {
+  const source = user?.displayName || user?.username || "AC";
+  const parts = source.trim().split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+  return source.slice(0, 2).toUpperCase();
 }
 
 function summarizeArguments(args: Record<string, unknown>) {
@@ -391,6 +431,17 @@ async function* parseSseStream(response: Response): AsyncGenerator<StreamEvent> 
 
 export default function App() {
   const [workspaceState, setWorkspaceState] = useState<WorkspaceState>(() => loadWorkspaceState());
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem(sidebarCollapsedStorageKey) === "true");
+  const [sidebarWidth, setSidebarWidth] = useState(() => loadSidebarWidth());
+  const [isSidebarResizing, setIsSidebarResizing] = useState(false);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authConfigured, setAuthConfigured] = useState(true);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState("");
+  const [loginUsername, setLoginUsername] = useState("local");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [activeView, setActiveView] = useState<ActiveView>("chat");
+  const [selectedSettingsSection, setSelectedSettingsSection] = useState<SettingsSectionId>("general");
   const [mode, setMode] = useState<PermissionMode>("request_approval");
   const [prompt, setPrompt] = useState("");
   const [themePreference] = useState<ThemePreference>(() => {
@@ -475,11 +526,27 @@ export default function App() {
     () => activeQueuedPrompts.length,
     [activeQueuedPrompts]
   );
+  const shellStyle = useMemo(
+    () => ({ "--sidebar-width": `${sidebarWidth}px` }) as CSSProperties,
+    [sidebarWidth]
+  );
 
   useEffect(() => {
     workspaceStateRef.current = workspaceState;
     localStorage.setItem(workspaceStorageKey, JSON.stringify(workspaceState));
   }, [workspaceState]);
+
+  useEffect(() => {
+    localStorage.setItem(sidebarCollapsedStorageKey, String(sidebarCollapsed));
+  }, [sidebarCollapsed]);
+
+  useEffect(() => {
+    localStorage.setItem(sidebarWidthStorageKey, String(sidebarWidth));
+  }, [sidebarWidth]);
+
+  useEffect(() => {
+    localStorage.setItem("agent.themePreference", themePreference);
+  }, [themePreference]);
 
   useEffect(() => {
     fetch(`${API_BASE}/api/health`)
@@ -500,6 +567,10 @@ export default function App() {
         setModelOptions([...new Set([...recommended, ...all])]);
       })
       .catch(() => setModelOptions([]));
+  }, []);
+
+  useEffect(() => {
+    void loadAuthSession();
   }, []);
 
   useEffect(() => {
@@ -544,6 +615,7 @@ export default function App() {
 
   function selectProject(project: AgentProject) {
     const firstSession = project.sessions.find((session) => !session.archivedAt) ?? createSession();
+    setActiveView("chat");
     setWorkspaceState((cur) => ({
       ...cur,
       projects: cur.projects.map((item) =>
@@ -558,6 +630,7 @@ export default function App() {
 
   function selectSession(projectId: string, sessionId: string) {
     setSwipedSessionId(undefined);
+    setActiveView("chat");
     setWorkspaceState((cur) => ({ ...cur, activeProjectId: projectId, activeSessionId: sessionId }));
   }
 
@@ -569,27 +642,29 @@ export default function App() {
     }));
   }
 
-  function addEmptyProject() {
-    const name = window.prompt("空项目名称", "空项目");
-    if (!name?.trim()) return;
-    addProject(createProject(name.trim(), "empty"));
-  }
-
   async function addFolderProject() {
     const folderPath = await window.agentDesktop?.selectProjectFolder?.();
     if (!folderPath) return;
     addProject(createProject(getFolderName(folderPath), "folder", folderPath));
   }
 
-  async function createFolderProject() {
-    const name = window.prompt("新建文件夹项目名称", "新项目");
-    if (!name?.trim()) return;
-    const folderPath = await window.agentDesktop?.createFolderProject?.(name.trim());
-    addProject(createProject(name.trim(), folderPath ? "folder" : "empty", folderPath));
+  async function createNewProject() {
+    const name = window.prompt("项目名称（默认存放在文稿）", "新项目");
+    const trimmedName = name?.trim();
+    if (!trimmedName) return;
+    const folderPath = await window.agentDesktop?.createFolderProject?.(trimmedName);
+    addProject(createProject(trimmedName, folderPath ? "folder" : "empty", folderPath));
+  }
+
+  function startTemporarySession() {
+    const project = createProject("不使用项目", "temporary");
+    const session = createSession("临时会话");
+    addProject({ ...project, sessions: [session], updatedAt: session.updatedAt });
   }
 
   function addSession(projectId = workspaceState.activeProjectId) {
     const session = createSession();
+    setActiveView("chat");
     setWorkspaceState((cur) => ({
       ...cur,
       projects: cur.projects.map((p) =>
@@ -634,18 +709,18 @@ export default function App() {
     });
   }
 
-  function handleSessionPointerDown(sessionId: string, event: PointerEvent<HTMLButtonElement>) {
+  function handleSessionPointerDown(sessionId: string, event: ReactPointerEvent<HTMLButtonElement>) {
     event.currentTarget.setPointerCapture(event.pointerId);
     swipeStartRef.current.set(sessionId, { x: event.clientX, y: event.clientY });
   }
 
-  function releaseSessionPointer(event: PointerEvent<HTMLButtonElement>) {
+  function releaseSessionPointer(event: ReactPointerEvent<HTMLButtonElement>) {
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
   }
 
-  function handleSessionPointerMove(sessionId: string, event: PointerEvent<HTMLButtonElement>) {
+  function handleSessionPointerMove(sessionId: string, event: ReactPointerEvent<HTMLButtonElement>) {
     const start = swipeStartRef.current.get(sessionId);
     if (!start) return;
     const deltaX = event.clientX - start.x;
@@ -655,7 +730,7 @@ export default function App() {
     }
   }
 
-  function handleSessionPointerUp(projectId: string, sessionId: string, event: PointerEvent<HTMLButtonElement>) {
+  function handleSessionPointerUp(projectId: string, sessionId: string, event: ReactPointerEvent<HTMLButtonElement>) {
     const start = swipeStartRef.current.get(sessionId);
     swipeStartRef.current.delete(sessionId);
     releaseSessionPointer(event);
@@ -1014,14 +1089,221 @@ export default function App() {
     void runAgent();
   }
 
+  function toggleSidebar() {
+    setSwipedSessionId(undefined);
+    setSidebarCollapsed((collapsed) => !collapsed);
+  }
+
+  function getAuthHeaders() {
+    const token = localStorage.getItem(authTokenStorageKey);
+    return token ? { authorization: `Bearer ${token}` } : undefined;
+  }
+
+  async function loadAuthSession() {
+    setAuthLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/auth/session`, { headers: getAuthHeaders() });
+      const data = (await response.json()) as AuthSessionResponse;
+      setAuthConfigured(data.configured);
+      setAuthUser(data.user);
+      if (!data.user) localStorage.removeItem(authTokenStorageKey);
+    } catch {
+      setAuthConfigured(false);
+      setAuthUser(null);
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function handleLogin(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setAuthError("");
+    if (!loginUsername.trim() || !loginPassword) {
+      setAuthError("请输入账号和密码");
+      return;
+    }
+
+    setAuthLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/auth/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username: loginUsername.trim(), password: loginPassword })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(typeof data.error === "string" ? data.error : "登录失败");
+      }
+      localStorage.setItem(authTokenStorageKey, data.token);
+      setAuthUser(data.user);
+      setLoginPassword("");
+    } catch (error) {
+      setAuthUser(null);
+      setAuthError(error instanceof Error ? error.message : "登录失败");
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function logout() {
+    const headers = getAuthHeaders();
+    localStorage.removeItem(authTokenStorageKey);
+    setAuthUser(null);
+    setLoginPassword("");
+    if (headers) {
+      try {
+        await fetch(`${API_BASE}/api/auth/logout`, { method: "POST", headers });
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  function openSettingsPage(section: SettingsSectionId = "general") {
+    setSelectedSettingsSection(section);
+    setActiveView("settings");
+  }
+
+  const settingsGroups: Array<{
+    title: string;
+    items: Array<{ id: SettingsSectionId; label: string; shortcut?: string }>;
+  }> = [
+    {
+      title: "个人",
+      items: [
+        { id: "general", label: "常规" },
+        { id: "profile", label: "个人资料" },
+        { id: "usage", label: "使用情况和计费" }
+      ]
+    },
+    {
+      title: "集成",
+      items: [
+        { id: "mcp", label: "MCP 服务器" }
+      ]
+    }
+  ];
+  const selectedSettingsItem =
+    settingsGroups.flatMap((group) => group.items).find((item) => item.id === selectedSettingsSection) ??
+    settingsGroups[0].items[0];
+  const activeSettingsSection = selectedSettingsItem.id;
+
+  function renderSettingsIcon(section: SettingsSectionId) {
+    const size = 18;
+    if (section === "general") return <Settings size={size} />;
+    if (section === "profile") return <UserRound size={size} />;
+    if (section === "usage") return <Brain size={size} />;
+    return <Puzzle size={size} />;
+  }
+
+  function renderSettingsContent() {
+    if (activeSettingsSection === "profile") {
+      return (
+        <div className="settingsContentStack">
+          <section className="settingsPaneSection">
+            <div className="settingsPaneHeader">
+              <h3>个人资料</h3>
+              <p>当前登录身份与本机账号信息。</p>
+            </div>
+            <div className="settingsProfileCard">
+              <div className="accountAvatar" aria-hidden="true">{getAccountInitials(authUser)}</div>
+              <span>
+                <strong>{authUser?.displayName ?? "本机账号"}</strong>
+                <small>{authUser?.username ?? "local"}</small>
+              </span>
+            </div>
+          </section>
+        </div>
+      );
+    }
+
+    if (activeSettingsSection === "general") {
+      return (
+        <div className="settingsContentStack">
+          <section className="settingsPaneSection">
+            <div className="settingsPaneHeader">
+              <h3>常规</h3>
+              <p>常用工作区偏好。</p>
+            </div>
+            <div className="settingsRows">
+              <div className="settingsRow">
+                <span>
+                  <strong>项目栏宽度</strong>
+                  <small>{sidebarCollapsed ? "已折叠" : `${sidebarWidth}px`}</small>
+                </span>
+                <button type="button" onClick={toggleSidebar}>
+                  {sidebarCollapsed ? "展开" : "折叠"}
+                </button>
+              </div>
+              <div className="settingsRow">
+                <span>
+                  <strong>默认权限模式</strong>
+                  <small>{selectedPermission.label}</small>
+                </span>
+                <button type="button" onClick={() => setMode("request_approval")}>重置</button>
+              </div>
+            </div>
+          </section>
+        </div>
+      );
+    }
+
+    return (
+      <div className="settingsContentStack">
+        <section className="settingsPaneSection">
+          <div className="settingsPaneHeader">
+            <h3>{selectedSettingsItem.label}</h3>
+            <p>暂无可配置项。</p>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
+  function handleSidebarResizePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (sidebarCollapsed) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = sidebarWidth;
+    setIsSidebarResizing(true);
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      setSidebarWidth(clampSidebarWidth(startWidth + moveEvent.clientX - startX));
+    };
+    const handlePointerUp = () => {
+      setIsSidebarResizing(false);
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerUp);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerUp);
+  }
+
   return (
-    <main className="desktopShell" data-client={isDesktopClient ? "electron" : "web"} data-theme={resolvedTheme}>
+    <main
+      className="desktopShell"
+      data-client={isDesktopClient ? "electron" : "web"}
+      data-resizing={isSidebarResizing ? "sidebar" : undefined}
+      data-sidebar={sidebarCollapsed ? "collapsed" : "expanded"}
+      data-theme={resolvedTheme}
+      style={shellStyle}
+    >
       <section className="clientWindow">
         {isDesktopClient && (
           <div className="appTopBar">
             <div className="topBarSidebarZone">
               <div className="appTopBarTrafficSpace" />
-              <button className="topBarIconButton" type="button" aria-label="切换侧边栏">
+              <button
+                className="topBarIconButton"
+                type="button"
+                aria-label={sidebarCollapsed ? "展开项目栏" : "折叠项目栏"}
+                aria-pressed={sidebarCollapsed}
+                title={sidebarCollapsed ? "展开项目栏" : "折叠项目栏"}
+                onClick={toggleSidebar}
+              >
                 <PanelLeft size={16} />
               </button>
               <button className="topBarIconButton muted" type="button" aria-label="返回">
@@ -1033,8 +1315,8 @@ export default function App() {
             </div>
             <div className="topBarMainZone">
               <div className="topBarTitle">
-                <MessageSquarePlus size={17} />
-                <span>{activeSession?.title ?? "Agent Console"}</span>
+                {activeView === "settings" ? <Settings size={17} /> : <MessageSquarePlus size={17} />}
+                <span>{activeView === "settings" ? selectedSettingsItem.label : activeSession?.title ?? "Agent Console"}</span>
                 <button className="topBarGhostButton" type="button" aria-label="更多">
                   <MoreHorizontal size={18} />
                 </button>
@@ -1057,7 +1339,100 @@ export default function App() {
           </div>
         )}
         <div className={`appLayout ${diffPanel ? "hasDiffPanel" : ""}`}>
-          <aside className="sidebar projectSidebar" aria-label="项目与会话">
+          <aside
+            className="sidebar projectSidebar"
+            aria-hidden={sidebarCollapsed}
+            inert={sidebarCollapsed ? true : undefined}
+            aria-label="项目与会话"
+          >
+            <section className={`accountPanel ${authUser ? "signedIn" : ""}`} aria-label="登录账号">
+              {authUser ? (
+                <>
+                  <div className="accountMenuCard" role="menu" aria-label="账号菜单">
+                    <div className="accountMenuIdentity">
+                      <UserRound size={17} />
+                      <span>{authUser.username}</span>
+                    </div>
+                    <button className="accountMenuItem muted" type="button" onClick={() => openSettingsPage("general")}>
+                      <Settings size={17} />
+                      <span>个人账户</span>
+                    </button>
+                    <div className="accountMenuDivider" />
+                    <button
+                      className={`accountMenuItem ${activeView === "settings" && selectedSettingsSection === "profile" ? "active" : ""}`}
+                      type="button"
+                      onClick={() => openSettingsPage("profile")}
+                    >
+                      <UserRound size={17} />
+                      <span>个人资料</span>
+                    </button>
+                    <button
+                      className={`accountMenuItem ${activeView === "settings" && selectedSettingsSection === "general" ? "active" : ""}`}
+                      type="button"
+                      onClick={() => openSettingsPage("general")}
+                    >
+                      <Settings size={17} />
+                      <span>设置</span>
+                      <kbd>⌘,</kbd>
+                    </button>
+                    <div className="accountMenuDivider" />
+                    <button className="accountMenuItem" type="button" onClick={() => openSettingsPage("usage")}>
+                      <Brain size={17} />
+                      <span>剩余用量</span>
+                      <ChevronDown className="accountMenuChevron" size={17} />
+                    </button>
+                    <button className="accountMenuItem" type="button" onClick={() => void logout()}>
+                      <LogOut size={17} />
+                      <span>退出登录</span>
+                    </button>
+                  </div>
+                  <div className="accountFooter">
+                    <div className="accountAvatar" aria-hidden="true">{getAccountInitials(authUser)}</div>
+                    <div className="accountCopy">
+                      <strong>{authUser.displayName}</strong>
+                      <span>本机账号</span>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <form className="accountLoginForm" onSubmit={handleLogin}>
+                  <div className="accountLoginTitle">
+                    <span>
+                      <LogIn size={15} />
+                      {authConfigured ? "登录账号" : "账号未初始化"}
+                    </span>
+                    <button
+                      className={`accountIconButton ${activeView === "settings" ? "active" : ""}`}
+                      type="button"
+                      onClick={() => openSettingsPage("general")}
+                      aria-label="设置"
+                    >
+                      <Settings size={15} />
+                    </button>
+                  </div>
+                  <input
+                    aria-label="账号"
+                    autoComplete="username"
+                    value={loginUsername}
+                    onChange={(event) => setLoginUsername(event.target.value)}
+                    placeholder="账号"
+                  />
+                  <input
+                    aria-label="密码"
+                    autoComplete="current-password"
+                    type="password"
+                    value={loginPassword}
+                    onChange={(event) => setLoginPassword(event.target.value)}
+                    placeholder="密码"
+                  />
+                  <button type="submit" disabled={authLoading || !authConfigured}>
+                    登录
+                  </button>
+                  {authError && <span className="accountError">{authError}</span>}
+                </form>
+              )}
+            </section>
+
             <div className="projectSidebarHeader">
               <div>
                 <span>项目</span>
@@ -1069,17 +1444,17 @@ export default function App() {
             </div>
 
             <div className="projectActions" aria-label="项目操作">
-              <button type="button" onClick={addEmptyProject}>
+              <button type="button" onClick={() => void createNewProject()}>
                 <Plus size={15} />
-                空项目
+                新项目
               </button>
               <button type="button" onClick={() => void addFolderProject()}>
                 <FolderOpen size={15} />
                 电脑文件夹
               </button>
-              <button type="button" onClick={() => void createFolderProject()}>
-                <FolderPlus size={15} />
-                自建文件夹
+              <button type="button" onClick={startTemporarySession}>
+                <MessageSquarePlus size={15} />
+                不使用项目
               </button>
             </div>
 
@@ -1092,12 +1467,19 @@ export default function App() {
                     <button
                       className={`projectRow ${isActiveProject ? "active" : ""}`}
                       type="button"
+                      title={`${project.name}${project.path ? ` · ${project.path}` : project.kind === "temporary" ? " · 临时会话" : " · 空项目"}`}
                       onClick={() => selectProject(project)}
                     >
-                      {project.kind === "folder" ? <Folder size={18} /> : <HardDrive size={18} />}
+                      {project.kind === "folder" ? (
+                        <Folder size={18} />
+                      ) : project.kind === "temporary" ? (
+                        <MessageSquarePlus size={18} />
+                      ) : (
+                        <HardDrive size={18} />
+                      )}
                       <span>
                         <strong>{project.name}</strong>
-                        <small>{project.path ?? "空项目"}</small>
+                        <small>{project.path ?? (project.kind === "temporary" ? "临时会话" : "空项目")}</small>
                       </span>
                     </button>
 
@@ -1155,9 +1537,66 @@ export default function App() {
             </div>
           </aside>
 
+          <div
+            className="sidebarResizeHandle"
+            onPointerDown={handleSidebarResizePointerDown}
+            role="separator"
+            aria-hidden={sidebarCollapsed}
+            aria-label="调整项目栏宽度"
+            aria-orientation="vertical"
+            aria-valuemin={minSidebarWidth}
+            aria-valuemax={maxSidebarWidth}
+            aria-valuenow={sidebarWidth}
+          />
+
           <section className="workspace">
             <section className="agentGrid">
               <div className="leftStack">
+                {activeView === "settings" ? (
+                  <section className="settingsPage" aria-label="设置">
+                    <aside className="settingsSidebar">
+                      {settingsGroups.map((group) => (
+                        <section className="settingsNavGroup" key={group.title}>
+                          <h2>{group.title}</h2>
+                          <div className="settingsNavList">
+                            {group.items.map((item) => (
+                              <button
+                                className={`settingsNavItem ${activeSettingsSection === item.id ? "active" : ""}`}
+                                key={item.id}
+                                type="button"
+                                onClick={() => setSelectedSettingsSection(item.id)}
+                              >
+                                {renderSettingsIcon(item.id)}
+                                <span>{item.label}</span>
+                                {item.shortcut && <kbd>{item.shortcut}</kbd>}
+                              </button>
+                            ))}
+                          </div>
+                        </section>
+                      ))}
+                      <div className="settingsNavFooter">
+                        <div className="accountAvatar" aria-hidden="true">{getAccountInitials(authUser)}</div>
+                        <span>
+                          <strong>{authUser?.displayName ?? "本机账号"}</strong>
+                          <small>{authUser ? "本机账号" : "未登录"}</small>
+                        </span>
+                      </div>
+                    </aside>
+                    <section className="settingsMainPane">
+                      <div className="settingsMainHeader">
+                        <button className="newChatButton" type="button" onClick={() => setActiveView("chat")}>
+                          <MessageSquarePlus size={16} />
+                          返回会话
+                        </button>
+                        <div>
+                          <h2>{selectedSettingsItem.label}</h2>
+                          <p>设置</p>
+                        </div>
+                      </div>
+                      {renderSettingsContent()}
+                    </section>
+                  </section>
+                ) : (
                 <section className="chatPanel">
                   <div className="composerHeader chatHeader">
                     <div className="chatHeaderTitle">
@@ -1167,10 +1606,18 @@ export default function App() {
                         {conversationId ? ` · Conversation ${conversationId.slice(0, 8)}` : " · 新会话"}
                       </p>
                     </div>
-                    <button className="newChatButton" type="button" onClick={() => addSession()}>
-                      <MessageSquarePlus size={16} />
-                      新会话
-                    </button>
+                    <div className="chatHeaderActions">
+                      {!isDesktopClient && sidebarCollapsed && (
+                        <button className="newChatButton" type="button" onClick={toggleSidebar}>
+                          <PanelLeft size={16} />
+                          项目
+                        </button>
+                      )}
+                      <button className="newChatButton" type="button" onClick={() => addSession()}>
+                        <MessageSquarePlus size={16} />
+                        新会话
+                      </button>
+                    </div>
                   </div>
 
                   <div className="messageList" aria-live="polite">
@@ -1529,6 +1976,7 @@ export default function App() {
                     </div>
                   </div>
                 </section>
+                )}
               </div>
             </section>
           </section>
