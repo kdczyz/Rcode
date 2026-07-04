@@ -1,5 +1,5 @@
+import { findAgentSkillHints, formatAgentSkillHints } from "./agentSkillHints";
 import type { AgentMessage } from "./types";
-import { findSkillsForPrompt, getSkillSystemHints } from "../src/skills";
 
 export interface AgentContextBudget {
   maxMessages: number;
@@ -117,9 +117,9 @@ export function prepareAgentContext(
   const budget: AgentContextBudget = { ...defaultBudget, ...options.budget };
   const originalChars = countChars(messages);
   const latestPrompt = findLastUserPrompt(messages);
-  const matchedSkills = findSkillsForPrompt(latestPrompt).slice(0, 8);
+  const matchedSkills = findAgentSkillHints(latestPrompt, 8);
   const matchedSkillIds = matchedSkills.map((skill) => skill.id);
-  const skillHints = getSkillSystemHints(matchedSkills);
+  const skillHints = formatAgentSkillHints(matchedSkills);
 
   let compacted = messages.map((message) => compactMessage(message, budget));
 
