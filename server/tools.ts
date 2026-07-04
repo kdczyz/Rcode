@@ -56,7 +56,7 @@ export const toolDefinitions = [
     type: "function",
     function: {
       name: "run_shell",
-      description: "Run a shell command. Use ONLY for: npm install, git operations, running tests, building projects. Do NOT use echo/cat/sed/printf to write files - use write_file instead.",
+      description: "Run a shell command. Use for package installs, git operations, running tests, building projects, or one-off project commands. Do NOT use echo/cat/sed/printf to write files - use write_file instead.",
       parameters: {
         type: "object",
         properties: {
@@ -64,6 +64,67 @@ export const toolDefinitions = [
           cwd: { type: "string", description: "Optional working directory. Defaults to project root." }
         },
         required: ["command"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "git_status",
+      description: "Read git branch, status, and short changed-file summary for the current project. Use before commits, PR summaries, or risky edits.",
+      parameters: {
+        type: "object",
+        properties: {
+          cwd: { type: "string", description: "Optional working directory. Defaults to project root." }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "git_diff",
+      description: "Read git diff for the current project. Use after edits to review changes and prepare PR summaries.",
+      parameters: {
+        type: "object",
+        properties: {
+          cwd: { type: "string", description: "Optional working directory. Defaults to project root." },
+          staged: { type: "boolean", description: "When true, return staged diff. Otherwise return working tree diff." },
+          maxChars: { type: "number", description: "Maximum number of diff characters to return. Defaults to 20000." }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "run_tests",
+      description: "Run project validation such as typecheck, build, lint, test, or a custom non-interactive command. Prefer this over raw run_shell for validation.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Optional validation command. Defaults to npm run typecheck when package.json has that script, otherwise npm test -- --runInBand." },
+          cwd: { type: "string", description: "Optional working directory. Defaults to project root." },
+          timeoutMs: { type: "number", description: "Optional timeout in milliseconds. Defaults to 120000." }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "open_pull_request",
+      description: "Open a GitHub pull request from the current branch using the GitHub CLI. Use only after changes are implemented and validation has been attempted.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Pull request title." },
+          body: { type: "string", description: "Pull request body with summary, tests, and risk notes." },
+          base: { type: "string", description: "Base branch. Defaults to main." },
+          cwd: { type: "string", description: "Optional working directory. Defaults to project root." },
+          draft: { type: "boolean", description: "Create as draft PR when true." }
+        },
+        required: ["title", "body"]
       }
     }
   }
@@ -87,6 +148,55 @@ function getString(value: unknown, field: string): string {
   }
 
   return value;
+}
+
+function getOptionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function getOptionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function getWorkingDirectory(rawCwd: unknown, workspaceRoot: string): string {
+  return rawCwd ? resolveSafePath(rawCwd, workspaceRoot) : workspaceRoot;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+async function runProjectCommand(command: string, cwd: string, timeout = 30000, maxBuffer = 1024 * 1024) {
+  const { stdout, stderr } = await execFileAsync("zsh", ["-lc", command], {
+    cwd,
+    timeout,
+    maxBuffer
+  });
+
+  return [stdout, stderr].filter(Boolean).join("\n");
+}
+
+async function getDefaultTestCommand(cwd: string) {
+  const packagePath = path.join(cwd, "package.json");
+  if (!existsSync(packagePath)) return "npm test -- --runInBand";
+
+  try {
+    const packageJson = JSON.parse(await readFile(packagePath, "utf8")) as { scripts?: Record<string, string> };
+    if (packageJson.scripts?.typecheck) return "npm run typecheck";
+    if (packageJson.scripts?.test) return "npm test -- --runInBand";
+    if (packageJson.scripts?.build) return "npm run build";
+  } catch {
+    // fall through
+  }
+
+  return "npm test -- --runInBand";
+}
+
+function truncateToolOutput(content: string, maxChars = 20000) {
+  if (content.length <= maxChars) return content;
+  const head = content.slice(0, Math.floor(maxChars * 0.7));
+  const tail = content.slice(-Math.floor(maxChars * 0.25));
+  return `${head}\n\n...[trimmed ${content.length - head.length - tail.length} chars]...\n\n${tail}`;
 }
 
 export async function executeTool(call: ToolCall, projectPath?: string): Promise<ToolResult> {
@@ -159,18 +269,95 @@ export async function executeTool(call: ToolCall, projectPath?: string): Promise
         throw new Error(`Command is blocked by policy: ${blocked}`);
       }
 
-      const cwd = call.arguments.cwd ? resolveSafePath(call.arguments.cwd, workspaceRoot) : workspaceRoot;
-      const { stdout, stderr } = await execFileAsync("zsh", ["-lc", command], {
-        cwd,
-        timeout: 30000,
-        maxBuffer: 1024 * 1024
-      });
+      const cwd = getWorkingDirectory(call.arguments.cwd, workspaceRoot);
+      const output = await runProjectCommand(command, cwd, 30000, 1024 * 1024);
 
       return {
         toolCallId: call.id,
         name: call.name,
         ok: true,
-        content: [stdout, stderr].filter(Boolean).join("\n").slice(0, 12000)
+        content: output.slice(0, 12000)
+      };
+    }
+
+    if (call.name === "git_status") {
+      const cwd = getWorkingDirectory(call.arguments.cwd, workspaceRoot);
+      const output = await runProjectCommand(
+        "git branch --show-current && printf '\\n--- status ---\\n' && git status --short && printf '\\n--- upstream ---\\n' && git status --branch --short",
+        cwd,
+        30000,
+        1024 * 1024
+      );
+
+      return {
+        toolCallId: call.id,
+        name: call.name,
+        ok: true,
+        content: output.slice(0, 12000)
+      };
+    }
+
+    if (call.name === "git_diff") {
+      const cwd = getWorkingDirectory(call.arguments.cwd, workspaceRoot);
+      const staged = call.arguments.staged === true;
+      const maxChars = Math.max(2000, Math.min(getOptionalNumber(call.arguments.maxChars) ?? 20000, 60000));
+      const output = await runProjectCommand(staged ? "git diff --staged" : "git diff", cwd, 30000, 4 * 1024 * 1024);
+
+      return {
+        toolCallId: call.id,
+        name: call.name,
+        ok: true,
+        content: truncateToolOutput(output || "No diff.", maxChars)
+      };
+    }
+
+    if (call.name === "run_tests") {
+      if (!runtimeConfig.computerControl.enabled || !runtimeConfig.computerControl.shell) {
+        throw new Error("Computer control shell is disabled by config/agent.toml");
+      }
+
+      const cwd = getWorkingDirectory(call.arguments.cwd, workspaceRoot);
+      const command = getOptionalString(call.arguments.command) ?? await getDefaultTestCommand(cwd);
+      const blocked = runtimeConfig.computerControl.blockedCommands.find((item) => command.includes(item));
+      if (blocked) {
+        throw new Error(`Command is blocked by policy: ${blocked}`);
+      }
+
+      const timeout = Math.max(10000, Math.min(getOptionalNumber(call.arguments.timeoutMs) ?? 120000, 10 * 60 * 1000));
+      const output = await runProjectCommand(command, cwd, timeout, 4 * 1024 * 1024);
+
+      return {
+        toolCallId: call.id,
+        name: call.name,
+        ok: true,
+        content: truncateToolOutput(`$ ${command}\n\n${output}`, 24000)
+      };
+    }
+
+    if (call.name === "open_pull_request") {
+      if (!runtimeConfig.computerControl.enabled || !runtimeConfig.computerControl.shell) {
+        throw new Error("Computer control shell is disabled by config/agent.toml");
+      }
+
+      const cwd = getWorkingDirectory(call.arguments.cwd, workspaceRoot);
+      const title = getString(call.arguments.title, "title");
+      const body = getString(call.arguments.body, "body");
+      const base = getOptionalString(call.arguments.base) ?? "main";
+      const draft = call.arguments.draft === true;
+      const command = [
+        "gh pr create",
+        "--title", shellQuote(title),
+        "--body", shellQuote(body),
+        "--base", shellQuote(base),
+        draft ? "--draft" : ""
+      ].filter(Boolean).join(" ");
+      const output = await runProjectCommand(command, cwd, 60000, 1024 * 1024);
+
+      return {
+        toolCallId: call.id,
+        name: call.name,
+        ok: true,
+        content: truncateToolOutput(`$ ${command}\n\n${output}`, 12000)
       };
     }
 
