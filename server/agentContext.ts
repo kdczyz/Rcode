@@ -1,5 +1,6 @@
 import { getDeliveryWorkflowProfile, formatDeliveryWorkflowProfile } from "./deliveryWorkflow";
 import { findAgentSkillHints, formatAgentSkillHints } from "./agentSkillHints";
+import { getProjectContextSnapshot, formatProjectContextSnapshot } from "./projectContext";
 import type { AgentMessage } from "./types";
 
 export interface AgentContextBudget {
@@ -7,6 +8,7 @@ export interface AgentContextBudget {
   maxTotalChars: number;
   maxToolResultChars: number;
   maxAssistantChars: number;
+  maxProjectContextChars: number;
   keepRecentMessages: number;
 }
 
@@ -24,6 +26,7 @@ export interface AgentContextStats {
   trimmedMessages: number;
   matchedSkills: string[];
   deliveryIntent: string;
+  projectContextChars: number;
 }
 
 export interface PreparedAgentContext {
@@ -37,6 +40,7 @@ const defaultBudget: AgentContextBudget = {
   maxTotalChars: 42000,
   maxToolResultChars: 6000,
   maxAssistantChars: 9000,
+  maxProjectContextChars: 16000,
   keepRecentMessages: 18
 };
 
@@ -95,6 +99,7 @@ function buildSystemAddendum(input: {
   skillHints: string;
   matchedSkillIds: string[];
   deliveryWorkflow: string;
+  projectContext: string;
 }) {
   return [
     "## Rcode Agent Context Policy",
@@ -108,15 +113,27 @@ function buildSystemAddendum(input: {
     "For bug fixes: identify root cause, make the smallest safe fix, run targeted validation, then explain root cause and result.",
     "For PR work: read git_status and git_diff, include Summary / Tests / Risks in the PR body, then use open_pull_request only when requested.",
     "Use run_tests for validation instead of generic run_shell when possible.",
+    "Use the Project Context Snapshot to choose likely files, commands, and project rules before reading more files.",
     "Keep answers grounded in the available project context and tool results.",
     "When context is compacted, treat the compacted summary as lower confidence than recent messages.",
     "Prefer small, reversible changes and explain the changed files after edits.",
     input.matchedSkillIds.length > 0 ? `Matched skills: ${input.matchedSkillIds.join(", ")}.` : "Matched skills: none.",
     `\n## Delivery Workflow\n${input.deliveryWorkflow}`,
+    input.projectContext ? `\n${input.projectContext}` : undefined,
     input.skillHints ? `\n## Active Skill Hints\n${input.skillHints}` : undefined
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function getFormattedProjectContext(projectPath: string | undefined, maxChars: number) {
+  try {
+    const snapshot = getProjectContextSnapshot(projectPath);
+    return truncateMiddle(formatProjectContextSnapshot(snapshot), maxChars);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown project context error";
+    return `## Project Context Snapshot\nFailed to build project context: ${message}`;
+  }
 }
 
 export function prepareAgentContext(
@@ -131,6 +148,7 @@ export function prepareAgentContext(
   const skillHints = formatAgentSkillHints(matchedSkills);
   const deliveryProfile = getDeliveryWorkflowProfile(latestPrompt);
   const deliveryWorkflow = formatDeliveryWorkflowProfile(deliveryProfile);
+  const projectContext = getFormattedProjectContext(options.projectPath, budget.maxProjectContextChars);
 
   let compacted = messages.map((message) => compactMessage(message, budget));
 
@@ -159,7 +177,8 @@ export function prepareAgentContext(
     thinkingMode: options.thinkingMode,
     skillHints,
     matchedSkillIds,
-    deliveryWorkflow
+    deliveryWorkflow,
+    projectContext
   });
 
   const contextMessage: AgentMessage = {
@@ -179,7 +198,8 @@ export function prepareAgentContext(
       finalChars: countChars(finalMessages),
       trimmedMessages: Math.max(0, messages.length - compacted.length),
       matchedSkills: matchedSkillIds,
-      deliveryIntent: deliveryProfile.intent
+      deliveryIntent: deliveryProfile.intent,
+      projectContextChars: projectContext.length
     }
   };
 }
