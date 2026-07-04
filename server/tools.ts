@@ -4,6 +4,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { getRuntimeConfig } from "./config";
+import { parseTestResult, formatParsedTestResult } from "./testResultParser";
 import type { AgentToolName, DiffResult, ToolCall, ToolResult } from "./types";
 
 const execFileAsync = promisify(execFile);
@@ -104,7 +105,7 @@ export const toolDefinitions = [
     type: "function",
     function: {
       name: "run_tests",
-      description: "Run project validation such as typecheck, build, lint, test, or a custom non-interactive command. Prefer this over raw run_shell for validation.",
+      description: "Run project validation such as typecheck, build, lint, test, or a custom non-interactive command. Prefer this over raw run_shell for validation. The output includes a structured parsed failure summary.",
       parameters: {
         type: "object",
         properties: {
@@ -344,12 +345,14 @@ export async function executeTool(call: ToolCall, projectPath?: string): Promise
 
       const timeout = Math.max(10000, Math.min(getOptionalNumber(call.arguments.timeoutMs) ?? 120000, 10 * 60 * 1000));
       const result = await runProjectCommand(command, cwd, timeout, 4 * 1024 * 1024);
+      const parsed = parseTestResult(command, result.ok, result.output);
+      const structuredSummary = formatParsedTestResult(parsed);
 
       return {
         toolCallId: call.id,
         name: call.name,
         ok: result.ok,
-        content: truncateToolOutput(`$ ${command}\n\n${result.output}`, 24000)
+        content: truncateToolOutput(`${structuredSummary}\n\n## Raw Output\n$ ${command}\n\n${result.output}`, 26000)
       };
     }
 
