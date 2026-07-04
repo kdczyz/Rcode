@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "rcode": {
+      "command": "npm",
+      "args": ["run", "mcp:server"],
+      "env": {
+        "NODE_ENV": "development"
+      }
+    }
+  }
+}
