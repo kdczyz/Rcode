@@ -1,3 +1,4 @@
+import { getDeliveryWorkflowProfile, formatDeliveryWorkflowProfile } from "./deliveryWorkflow";
 import { findAgentSkillHints, formatAgentSkillHints } from "./agentSkillHints";
 import type { AgentMessage } from "./types";
 
@@ -22,6 +23,7 @@ export interface AgentContextStats {
   finalChars: number;
   trimmedMessages: number;
   matchedSkills: string[];
+  deliveryIntent: string;
 }
 
 export interface PreparedAgentContext {
@@ -92,18 +94,25 @@ function buildSystemAddendum(input: {
   thinkingMode?: string;
   skillHints: string;
   matchedSkillIds: string[];
+  deliveryWorkflow: string;
 }) {
   return [
     "## Rcode Agent Context Policy",
-    "Rcode is positioned as a local coding agent comparable to Codex and other mainstream coding agents.",
+    "Rcode is a delivery-first local coding agent comparable to Codex and other mainstream coding agents.",
     input.projectPath
-      ? `Current project root: ${input.projectPath}. Prefer project-scoped reads, edits, and checks.`
+      ? `Current project root: ${input.projectPath}. Prefer project-scoped reads, edits, checks, git status, git diff, and PR actions.`
       : "No concrete project root was provided. Avoid assuming a real workspace path.",
     input.thinkingMode ? `Thinking mode requested by user interface: ${input.thinkingMode}.` : undefined,
+    "Default behavior: directly deliver working code, bug fixes, tests, and PR-ready summaries instead of only explaining.",
+    "For feature work: inspect relevant files, implement the change, review diff, run validation when available, then summarize.",
+    "For bug fixes: identify root cause, make the smallest safe fix, run targeted validation, then explain root cause and result.",
+    "For PR work: read git_status and git_diff, include Summary / Tests / Risks in the PR body, then use open_pull_request only when requested.",
+    "Use run_tests for validation instead of generic run_shell when possible.",
     "Keep answers grounded in the available project context and tool results.",
     "When context is compacted, treat the compacted summary as lower confidence than recent messages.",
     "Prefer small, reversible changes and explain the changed files after edits.",
     input.matchedSkillIds.length > 0 ? `Matched skills: ${input.matchedSkillIds.join(", ")}.` : "Matched skills: none.",
+    `\n## Delivery Workflow\n${input.deliveryWorkflow}`,
     input.skillHints ? `\n## Active Skill Hints\n${input.skillHints}` : undefined
   ]
     .filter(Boolean)
@@ -120,6 +129,8 @@ export function prepareAgentContext(
   const matchedSkills = findAgentSkillHints(latestPrompt, 8);
   const matchedSkillIds = matchedSkills.map((skill) => skill.id);
   const skillHints = formatAgentSkillHints(matchedSkills);
+  const deliveryProfile = getDeliveryWorkflowProfile(latestPrompt);
+  const deliveryWorkflow = formatDeliveryWorkflowProfile(deliveryProfile);
 
   let compacted = messages.map((message) => compactMessage(message, budget));
 
@@ -147,7 +158,8 @@ export function prepareAgentContext(
     projectPath: options.projectPath,
     thinkingMode: options.thinkingMode,
     skillHints,
-    matchedSkillIds
+    matchedSkillIds,
+    deliveryWorkflow
   });
 
   const contextMessage: AgentMessage = {
@@ -166,7 +178,8 @@ export function prepareAgentContext(
       originalChars,
       finalChars: countChars(finalMessages),
       trimmedMessages: Math.max(0, messages.length - compacted.length),
-      matchedSkills: matchedSkillIds
+      matchedSkills: matchedSkillIds,
+      deliveryIntent: deliveryProfile.intent
     }
   };
 }
