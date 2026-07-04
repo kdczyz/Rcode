@@ -42,7 +42,7 @@ function commandReferencesOutsideWorkspace(value: unknown, projectPath?: string)
     return true;
   }
 
-  const absolutePathMatches = value.matchAll(/(?:^|\s)(\/[^^\s'"`;&|()]+)/g);
+  const absolutePathMatches = value.matchAll(/(?:^|\s)(\/[^\s'"`;&|()]+)/g);
   for (const match of absolutePathMatches) {
     if (isPathOutsideWorkspace(match[1], projectPath)) {
       return true;
