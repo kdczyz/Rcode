@@ -4,6 +4,7 @@ import express from "express";
 import { existsSync } from "node:fs";
 import { describePermissionMode } from "./permissions";
 import { approveToolCallStream, runAgentStream } from "./agent";
+import { getProjectContextSnapshot, formatProjectContextSnapshot } from "./projectContext";
 import type { PermissionMode, StreamEvent } from "./types";
 import { getRuntimeConfig } from "./config";
 import type { ThinkingMode } from "./aiProvider";
@@ -84,6 +85,19 @@ app.get("/api/models", (_request, response) => {
       owned_by: runtimeConfig.providerName
     }))
   });
+});
+
+app.get("/api/project/context", (request, response) => {
+  try {
+    const projectPath = parseProjectPath(request.query.projectPath);
+    const snapshot = getProjectContextSnapshot(projectPath);
+    response.json({
+      snapshot,
+      formatted: formatProjectContextSnapshot(snapshot)
+    });
+  } catch (error) {
+    response.status(500).json({ error: error instanceof Error ? error.message : "Unknown project context error" });
+  }
 });
 
 app.post("/api/agent/run", async (request, response) => {
