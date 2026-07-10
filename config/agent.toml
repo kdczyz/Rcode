@@ -1,5 +1,5 @@
 [client]
-name = "Agent Console Desktop"
+name = "Rcode Desktop"
 mode = "desktop"
 description = "本地客户端 agent，可连接 AI 并在审批策略约束下控制电脑。"
 
@@ -10,10 +10,10 @@ temperature = 0.3
 max_tokens = 16384
 
 [permissions]
-default_mode = "auto_approve"
-require_approval_for_internet = false
+default_mode = "workspace_write"
+require_approval_for_internet = true
 require_approval_for_file_write = false
-require_approval_for_shell = false
+require_approval_for_shell = true
 
 [computer_control]
 enabled = true
@@ -23,7 +23,7 @@ screenshot = false
 dangerous_commands_require_approval = true
 
 [computer_control.command_policy]
-workspace_only = false
+workspace_only = true
 blocked = [
   "rm -rf /",
   "sudo rm",

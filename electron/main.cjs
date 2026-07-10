@@ -1,15 +1,41 @@
-const { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, shell } = require("electron");
+const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const { fork } = require("node:child_process");
 
 const isDev = !app.isPackaged;
 const startUrl = process.env.ELECTRON_START_URL || `file://${path.join(__dirname, "../dist/index.html")}`;
 
 let serverProcess = null;
+const localApiToken = process.env.AGENT_LOCAL_TOKEN || crypto.randomBytes(32).toString("base64url");
+const preferencesPath = () => path.join(app.getPath("userData"), "preferences.json");
 
-function startServer() {
+async function migrateLegacyDatabase(databasePath) {
+  const legacyPath = path.join(process.resourcesPath, "data", "agent-console.sqlite");
+  try {
+    await fs.access(databasePath);
+    return;
+  } catch {
+    // No persistent database yet; try to carry forward state from older builds.
+  }
+  try {
+    await fs.access(legacyPath);
+    await fs.mkdir(path.dirname(databasePath), { recursive: true });
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try {
+        await fs.copyFile(`${legacyPath}${suffix}`, `${databasePath}${suffix}`);
+      } catch {
+        // WAL/SHM files are optional.
+      }
+    }
+  } catch {
+    // A fresh install has no legacy database to migrate.
+  }
+}
+
+async function startServer() {
   if (isDev) {
     console.log("Dev mode: server should be started separately");
     return;
@@ -25,10 +51,18 @@ function startServer() {
     return;
   }
 
+  const databasePath = path.join(app.getPath("userData"), "agent-console.sqlite");
+  await migrateLegacyDatabase(databasePath);
+
   serverProcess = fork(serverPath, [], {
     cwd: process.resourcesPath,
     env: {
       ...process.env,
+      AGENT_LOCAL_TOKEN: localApiToken,
+      // Runtime state must live outside the signed/read-only application bundle.
+      // This also keeps provider/API settings across client upgrades.
+      LOCAL_DATABASE_PATH: databasePath,
+      HOST: "127.0.0.1",
       PORT: "8787"
     },
     silent: false
@@ -48,15 +82,29 @@ function startServer() {
   });
 }
 
-function createWindow() {
-  nativeTheme.themeSource = "dark";
+async function waitForServer(timeoutMs = 12000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch("http://127.0.0.1:8787/api/health", {
+        headers: { "x-agent-token": localApiToken }
+      });
+      if (response.ok) return true;
+    } catch {
+      // Server is still starting.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return false;
+}
 
+function createWindow() {
   const window = new BrowserWindow({
     width: 1240,
     height: 820,
     minWidth: 980,
     minHeight: 680,
-    title: "Agent Console Desktop",
+    title: "Rcode Desktop",
     backgroundColor: "#151515",
     titleBarStyle: "hiddenInset",
     trafficLightPosition: { x: 18, y: 17 },
@@ -71,10 +119,7 @@ function createWindow() {
   if (isDev) {
     window.loadURL(startUrl);
   } else {
-    // In production, wait a bit for server to start then load
-    setTimeout(() => {
-      window.loadURL(startUrl);
-    }, 3000);
+    waitForServer().then(() => window.loadURL(startUrl));
   }
 
   window.webContents.setWindowOpenHandler(({ url }) => {
@@ -85,7 +130,7 @@ function createWindow() {
   return window;
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   ipcMain.handle("agent:select-folder", async () => {
     const result = await dialog.showOpenDialog({
       title: "选择项目文件夹",
@@ -103,16 +148,35 @@ app.whenReady().then(() => {
     const name = typeof rawName === "string" && rawName.trim() ? rawName.trim() : "未命名项目";
     const safeName = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-").slice(0, 80);
     const documentsPath = app.getPath("documents") || path.join(os.homedir(), "Documents");
-    const projectsRoot = path.join(documentsPath, "Agent Console Projects");
+    const projectsRoot = path.join(documentsPath, "Rcode Projects");
     const targetPath = path.join(projectsRoot, safeName);
     await fs.mkdir(targetPath, { recursive: true });
     return targetPath;
   });
 
+  ipcMain.handle("agent:get-local-api-token", async () => localApiToken);
+  ipcMain.handle("agent:get-theme-preference", async () => {
+    try {
+      const raw = await fs.readFile(preferencesPath(), "utf8");
+      const parsed = JSON.parse(raw);
+      return parsed.themePreference;
+    } catch {
+      return undefined;
+    }
+  });
+  ipcMain.handle("agent:set-theme-preference", async (_event, themePreference) => {
+    const value = themePreference === "light" || themePreference === "dark" || themePreference === "system"
+      ? themePreference
+      : "system";
+    await fs.mkdir(path.dirname(preferencesPath()), { recursive: true });
+    await fs.writeFile(preferencesPath(), JSON.stringify({ themePreference: value }, null, 2));
+    return value;
+  });
+
   Menu.setApplicationMenu(
     Menu.buildFromTemplate([
       {
-        label: "Agent Console",
+        label: "Rcode",
         submenu: [
           { role: "about" },
           { type: "separator" },
@@ -149,7 +213,7 @@ app.whenReady().then(() => {
 
   // Start the server in production mode
   if (!isDev) {
-    startServer();
+    await startServer();
   }
 
   createWindow();

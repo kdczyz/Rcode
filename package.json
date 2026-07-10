@@ -4,29 +4,36 @@
   "private": true,
   "type": "module",
   "main": "electron/main.cjs",
-  "description": "Agent Console Desktop Application",
-  "author": "Agent Console",
+  "bin": {
+    "agent-console": "cli/agent-console.cjs",
+    "rcode": "cli/agent-console.cjs"
+  },
+  "description": "Rcode Desktop Application",
+  "author": "Rcode",
   "scripts": {
     "dev": "concurrently \"npm:dev:server\" \"npm:dev:web\"",
     "dev:server": "tsx watch server/index.ts",
     "dev:web": "vite --host 0.0.0.0",
     "client": "concurrently -k \"npm:dev:server\" \"npm:dev:web\" \"npm:client:electron\"",
     "client:electron": "wait-on http://localhost:5173 http://localhost:8787/api/health && cross-env ELECTRON_START_URL=http://localhost:5173 electron electron/main.cjs",
+    "clean": "node scripts/clean.cjs",
     "build": "tsc && vite build",
     "build:server": "tsc -p tsconfig.server.json && node scripts/bundle-server.cjs",
     "build:app": "npm run build && npm run build:server && electron-builder --mac",
     "preview": "vite preview --host 0.0.0.0",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build:server && node scripts/run-server-tests.cjs"
   },
   "build": {
     "appId": "com.agent-console.desktop",
-    "productName": "Agent Console",
+    "productName": "Rcode",
     "directories": {
       "output": "release"
     },
     "files": [
       "dist/**/*",
       "electron/**/*",
+      "cli/**/*",
       "node_modules/**/*",
       "package.json"
     ],
@@ -38,10 +45,6 @@
       {
         "from": ".env.example",
         "to": ".env.example"
-      },
-      {
-        "from": ".env.local",
-        "to": ".env.local"
       },
       {
         "from": "dist-server-bundle",

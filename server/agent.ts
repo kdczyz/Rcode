@@ -1,8 +1,20 @@
 import { nanoid } from "nanoid";
-import { auditToolCallApproval, callAiStream, type ThinkingMode } from "./aiProvider";
-import { getToolCallRisk, needsApproval } from "./permissions";
+import { callAiStream, type ThinkingMode } from "./aiProvider";
+import { getToolCallRisk } from "./permissions";
+import { evaluatePermission, type PermissionDecision } from "./permissionRules";
 import { executeTool } from "./tools";
+import { runHooks } from "./hooks";
 import type { AgentMessage, PendingApproval, PermissionMode, StreamEvent, ToolCall, ToolResult, ToolRisk } from "./types";
+import {
+  appendConversationMessage,
+  deletePendingApproval,
+  getConversationById,
+  getOrCreateConversation,
+  getPendingApprovalById,
+  recordAgentUsageEvent,
+  recordAuditEvent,
+  savePendingApproval
+} from "./localDatabase";
 
 interface Conversation {
   id: string;
@@ -38,11 +50,12 @@ function getConversation(conversationId?: string, projectPath?: string): Convers
     return projectMap.get(conversationId)!;
   }
 
+  const stored = getOrCreateConversation({ conversationId, projectPath: projectKey });
   const conversation: Conversation = {
-    id: conversationId ?? nanoid(),
+    id: stored.id,
     projectPath: projectKey,
-    messages: [],
-    pendingApprovals: [],
+    messages: stored.messages,
+    pendingApprovals: stored.pendingApprovals,
     toolCallQueue: []
   };
   projectMap.set(conversation.id, conversation);
@@ -53,7 +66,7 @@ function buildApproval(
   conversationId: string,
   toolCall: ToolCall,
   projectPath?: string,
-  override?: { risk?: ToolRisk; reason?: string }
+  override?: { risk?: ToolRisk; reason?: string; remainingToolQueue?: ToolCall[]; resumeInput?: PendingApproval["resumeInput"] }
 ): PendingApproval {
   return {
     id: nanoid(),
@@ -62,57 +75,27 @@ function buildApproval(
     risk: override?.risk ?? getToolCallRisk(toolCall),
     reason: override?.reason ?? `Agent 请求执行 ${toolCall.name}`,
     createdAt: new Date().toISOString(),
-    projectPath
+    projectPath,
+    conversationSnapshotId: conversationId,
+    remainingToolQueue: override?.remainingToolQueue,
+    resumeInput: override?.resumeInput
   };
 }
 
-async function evaluateToolApproval(
-  mode: PermissionMode,
-  toolCall: ToolCall,
-  options: { model?: string; projectPath?: string; signal?: AbortSignal }
-): Promise<{ requiresApproval: boolean; risk?: ToolRisk; reason?: string }> {
-  if (mode === "full_access") {
-    return { requiresApproval: false };
-  }
-
-  if (mode === "request_approval") {
-    return { requiresApproval: needsApproval(mode, toolCall, options.projectPath) };
-  }
-
-  try {
-    const audit = await auditToolCallApproval(toolCall, {
-      model: options.model,
-      projectPath: options.projectPath,
-      signal: options.signal
-    });
-
-    if (audit) {
-      return {
-        requiresApproval: !audit.allow,
-        risk: audit.risk,
-        reason: audit.allow ? undefined : `模型自动审核：${audit.reason}`
-      };
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "未知审核错误";
-    return {
-      requiresApproval: true,
-      risk: "high",
-      reason: `模型自动审核失败，需要人工审批：${message}`
-    };
-  }
-
-  return {
-    requiresApproval: getToolCallRisk(toolCall) === "high",
-    risk: getToolCallRisk(toolCall),
-    reason: "模型自动审核不可用，按静态风险策略请求人工审批。"
+function appendToolResultMessage(conversation: Conversation, result: ToolResult) {
+  const message = {
+    role: "tool" as const,
+    toolCallId: result.toolCallId,
+    content: result.content
   };
+  conversation.messages.push(message);
+  appendConversationMessage(conversation.id, message);
 }
 
 async function* continueConversationStream(
   conversation: Conversation,
   mode: PermissionMode,
-  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; signal?: AbortSignal }
+  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; requestId?: string; signal?: AbortSignal }
 ): AsyncGenerator<StreamEvent> {
   let step = 0;
   while (true) {
@@ -136,6 +119,19 @@ async function* continueConversationStream(
           if (event.type === "text_delta") {
             contentBuffer += event.content;
             yield { type: "text_delta", content: event.content };
+          } else if (event.type === "usage") {
+            recordAgentUsageEvent({
+              eventType: "ai_call",
+              projectPath: options.projectPath,
+              conversationId: conversation.id,
+              requestId: options.requestId,
+              model: event.model,
+              provider: event.provider,
+              promptTokens: event.usage.prompt_tokens,
+              completionTokens: event.usage.completion_tokens,
+              totalTokens: event.usage.total_tokens,
+              cachedTokens: event.usage.prompt_tokens_details?.cached_tokens
+            });
           } else if (event.type === "tool_calls") {
             toolCalls = event.toolCalls;
             // 当从文本提取工具调用时，用清理后的内容替换原始内容
@@ -168,6 +164,11 @@ async function* continueConversationStream(
       content: contentBuffer,
       toolCalls
     });
+    appendConversationMessage(conversation.id, {
+      role: "assistant",
+      content: contentBuffer,
+      toolCalls
+    });
 
     if (toolCalls.length === 0) {
       yield { type: "completed", conversationId: conversation.id, answer: contentBuffer };
@@ -191,15 +192,85 @@ async function* processToolCallQueueStream(
     console.log(`[Agent] Executing tool: ${toolCall.name}`, JSON.stringify(toolCall.arguments).slice(0, 200));
     yield { type: "tool_call", toolCall };
 
-    const approvalDecision = await evaluateToolApproval(mode, toolCall, {
-      model: options.model,
+    const preHook = await runHooks("PreToolUse", {
       projectPath: options.projectPath,
-      signal: options.signal
+      conversationId: conversation.id,
+      toolName: toolCall.name,
+      payload: toolCall
     });
+    if (preHook.blocked) {
+      conversation.toolCallQueue.shift();
+      const result: ToolResult = {
+        toolCallId: toolCall.id,
+        name: toolCall.name,
+        ok: false,
+        content: `PreToolUse hook blocked this call: ${preHook.messages.join("\n")}`
+      };
+      yield { type: "tool_result", result };
+      appendToolResultMessage(conversation, result);
+      continue;
+    }
+
+    const approvalDecision = await evaluatePermission(mode === "default" ? "workspace_write" : mode, toolCall, options.projectPath);
+    yield {
+      type: "permission_decision",
+      toolCallId: toolCall.id,
+      effect: approvalDecision.effect,
+      reason: approvalDecision.reason
+    };
+
+    if (approvalDecision.effect === "deny") {
+      conversation.toolCallQueue.shift();
+      const result: ToolResult = {
+        toolCallId: toolCall.id,
+        name: toolCall.name,
+        ok: false,
+        content: `Permission denied: ${approvalDecision.reason}`
+      };
+      recordAuditEvent({
+        projectPath: options.projectPath,
+        conversationId: conversation.id,
+        toolCallId: toolCall.id,
+        toolName: toolCall.name,
+        permissionEffect: "deny",
+        permissionReason: approvalDecision.reason,
+        ok: false,
+        outputSummary: result.content
+      });
+      yield { type: "tool_result", result };
+      appendToolResultMessage(conversation, result);
+      continue;
+    }
 
     if (approvalDecision.requiresApproval) {
-      const approval = buildApproval(conversation.id, toolCall, options.projectPath, approvalDecision);
+      await runHooks("PermissionRequest", {
+        projectPath: options.projectPath,
+        conversationId: conversation.id,
+        toolName: toolCall.name,
+        payload: { toolCall, approvalDecision }
+      });
+      const approval = buildApproval(conversation.id, toolCall, options.projectPath, {
+        ...approvalDecision,
+        remainingToolQueue: conversation.toolCallQueue.slice(1),
+        resumeInput: {
+          mode,
+          model: options.model,
+          thinkingMode: options.thinkingMode,
+          projectPath: options.projectPath
+        }
+      });
       conversation.pendingApprovals = [approval];
+      savePendingApproval(approval);
+      recordAuditEvent({
+        projectPath: options.projectPath,
+        conversationId: conversation.id,
+        toolCallId: toolCall.id,
+        toolName: toolCall.name,
+        permissionEffect: "ask",
+        permissionReason: approvalDecision.reason,
+        ok: undefined,
+        outputSummary: "Approval required"
+      });
       yield {
         type: "approval_required",
         conversationId: conversation.id,
@@ -210,15 +281,24 @@ async function* processToolCallQueueStream(
     }
 
     conversation.toolCallQueue.shift();
-    const result = await executeTool(toolCall, options.projectPath);
+    const result = await executeTool(toolCall, options.projectPath, {
+      conversationId: conversation.id,
+      permissionEffect: approvalDecision.effect,
+      permissionReason: approvalDecision.reason
+    });
+    await runHooks("PostToolUse", {
+      projectPath: options.projectPath,
+      conversationId: conversation.id,
+      toolName: toolCall.name,
+      payload: { toolCall, result }
+    });
     console.log(`[Agent] Tool result: ok=${result.ok}, len=${result.content.length}`);
     yield { type: "tool_result", result };
+    if (result.diffs && result.diffs.length > 0) {
+      yield { type: "diff_created", diffs: result.diffs, auditEventId: result.auditEventId };
+    }
 
-    conversation.messages.push({
-      role: "tool",
-      toolCallId: result.toolCallId,
-      content: result.content
-    });
+    appendToolResultMessage(conversation, result);
   }
 
   return true;
@@ -233,16 +313,35 @@ export async function* runAgentStream(input: {
   projectPath?: string;
   signal?: AbortSignal;
 }): AsyncGenerator<StreamEvent> {
+  const requestId = nanoid();
+  const sessionWasExisting = Boolean(input.conversationId && getConversationById(input.conversationId));
   const conversation = getConversation(input.conversationId, input.projectPath);
+  recordAgentUsageEvent({
+    eventType: "prompt",
+    projectPath: input.projectPath,
+    conversationId: conversation.id,
+    requestId,
+    model: input.model,
+    sessionWasExisting
+  });
+  await runHooks(input.conversationId ? "UserPromptSubmit" : "SessionStart", {
+    projectPath: input.projectPath,
+    conversationId: conversation.id,
+    payload: { prompt: input.prompt }
+  });
   conversation.messages.push({ role: "user", content: input.prompt });
+  appendConversationMessage(conversation.id, { role: "user", content: input.prompt });
 
   try {
+    yield { type: "run_started", conversationId: conversation.id };
     yield* continueConversationStream(conversation, input.mode, {
       model: input.model,
       thinkingMode: input.thinkingMode,
       projectPath: input.projectPath,
+      requestId,
       signal: input.signal
     });
+    await runHooks("Stop", { projectPath: input.projectPath, conversationId: conversation.id });
   } catch (error) {
     if (isAbortError(error)) {
       throw error;
@@ -267,16 +366,13 @@ export async function* approveToolCallStream(input: {
   const projectKey = getProjectKey(input.projectPath);
   const projectMap = projectConversations.get(projectKey);
 
-  if (!projectMap) {
-    yield { type: "error", conversationId: "", message: "Approval request not found — no conversations exist for this project." };
-    return;
-  }
-
-  for (const conversation of projectMap.values()) {
+  const conversations = projectMap ? [...projectMap.values()] : [];
+  for (const conversation of conversations) {
     const approval = conversation.pendingApprovals.find((item) => item.id === input.approvalId);
     if (!approval) continue;
 
     conversation.pendingApprovals = conversation.pendingApprovals.filter((item) => item.id !== input.approvalId);
+    deletePendingApproval(input.approvalId);
     if (conversation.toolCallQueue[0]?.id === approval.toolCall.id) {
       conversation.toolCallQueue.shift();
     } else {
@@ -284,7 +380,11 @@ export async function* approveToolCallStream(input: {
     }
 
     const result: ToolResult = input.allow
-      ? await executeTool(approval.toolCall, approval.projectPath ?? input.projectPath)
+      ? await executeTool(approval.toolCall, approval.projectPath ?? input.projectPath, {
+          conversationId: conversation.id,
+          permissionEffect: "allow",
+          permissionReason: "User approved this tool call."
+        })
       : {
           toolCallId: approval.toolCall.id,
           name: approval.toolCall.name,
@@ -292,13 +392,12 @@ export async function* approveToolCallStream(input: {
           content: "User rejected this tool call."
         };
 
-    conversation.messages.push({
-      role: "tool",
-      toolCallId: result.toolCallId,
-      content: result.content
-    });
+    appendToolResultMessage(conversation, result);
 
     yield { type: "tool_result", result };
+    if (result.diffs && result.diffs.length > 0) {
+      yield { type: "diff_created", diffs: result.diffs, auditEventId: result.auditEventId };
+    }
 
     try {
       yield* continueConversationStream(conversation, input.mode, {
@@ -318,5 +417,57 @@ export async function* approveToolCallStream(input: {
     return;
   }
 
-  yield { type: "error", conversationId: "", message: "Approval request not found in the current project scope." };
+  const storedApproval = getPendingApprovalById(input.approvalId);
+  if (!storedApproval) {
+    yield { type: "error", conversationId: "", message: "Approval request not found in the current project scope." };
+    return;
+  }
+
+  const storedConversation = getConversationById(storedApproval.conversationId);
+  if (!storedConversation) {
+    yield { type: "error", conversationId: storedApproval.conversationId, message: "Stored conversation for approval was not found." };
+    return;
+  }
+
+  const conversation: Conversation = {
+    id: storedConversation.id,
+    projectPath: storedConversation.projectPath,
+    messages: storedConversation.messages,
+    pendingApprovals: storedConversation.pendingApprovals.filter((approval) => approval.id !== input.approvalId),
+    toolCallQueue: storedApproval.remainingToolQueue ?? []
+  };
+  let projectMapForResume = projectConversations.get(storedConversation.projectPath);
+  if (!projectMapForResume) {
+    projectMapForResume = new Map();
+    projectConversations.set(storedConversation.projectPath, projectMapForResume);
+  }
+  projectMapForResume.set(conversation.id, conversation);
+  deletePendingApproval(input.approvalId);
+
+  const projectPath = storedApproval.projectPath ?? input.projectPath;
+  const result: ToolResult = input.allow
+    ? await executeTool(storedApproval.toolCall, projectPath, {
+        conversationId: conversation.id,
+        permissionEffect: "allow",
+        permissionReason: "User approved this recovered tool call."
+      })
+    : {
+        toolCallId: storedApproval.toolCall.id,
+        name: storedApproval.toolCall.name,
+        ok: false,
+        content: "User rejected this recovered tool call."
+      };
+
+  appendToolResultMessage(conversation, result);
+  yield { type: "tool_result", result };
+  if (result.diffs && result.diffs.length > 0) {
+    yield { type: "diff_created", diffs: result.diffs, auditEventId: result.auditEventId };
+  }
+
+  yield* continueConversationStream(conversation, input.mode, {
+    model: input.model,
+    thinkingMode: input.thinkingMode,
+    projectPath,
+    signal: input.signal
+  });
 }

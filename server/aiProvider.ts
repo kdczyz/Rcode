@@ -1,7 +1,8 @@
-import { toolDefinitions } from "./tools";
+import { getToolDefinitions } from "./tools";
 import type { AgentMessage, ToolCall, ToolResult, AgentToolName, ToolRisk } from "./types";
 import { getRuntimeConfig } from "./config";
 import { nanoid } from "nanoid";
+import { buildProjectContext, compactMessagesForContext } from "./contextManager";
 
 interface ChatChoice {
   message?: {
@@ -18,6 +19,7 @@ interface ChatChoice {
 
 interface ChatResponse {
   choices?: ChatChoice[];
+  usage?: AiUsage;
 }
 
 interface StreamDelta {
@@ -37,11 +39,21 @@ interface StreamChunk {
     delta?: StreamDelta;
     finish_reason?: string | null;
   }>;
+  usage?: AiUsage;
 }
 
 export interface AiTurn {
   content: string;
   toolCalls: ToolCall[];
+}
+
+export interface AiUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  prompt_tokens_details?: {
+    cached_tokens?: number;
+  };
 }
 
 export interface ApprovalAuditResult {
@@ -52,10 +64,21 @@ export interface ApprovalAuditResult {
 
 export type ThinkingMode = "fast" | "balanced" | "deep";
 
-const VALID_TOOL_NAMES: readonly string[] = toolDefinitions.map((t) => t.function.name);
+const VALID_BUILTIN_TOOL_NAMES = new Set([
+  "read_file",
+  "write_file",
+  "list_files",
+  "search_text",
+  "inspect_tree",
+  "apply_patch",
+  "web_fetch",
+  "run_shell",
+  "git_status",
+  "git_diff"
+]);
 
 function isToolName(value: string): value is AgentToolName {
-  return (VALID_TOOL_NAMES as readonly string[]).includes(value);
+  return VALID_BUILTIN_TOOL_NAMES.has(value) || value.startsWith("mcp__");
 }
 
 /** Balanced-bracket extraction of the first complete JSON object starting at startIdx. */
@@ -173,13 +196,19 @@ function parseToolCallsFromText(rawContent: string): { cleanContent: string; too
   return { cleanContent, toolCalls };
 }
 
-const baseSystemPrompt = [
-  "You are a software engineering agent. You help users write, modify, and debug code.",
-  "",
-  "## Capabilities",
+function buildSystemPrompt(modelName: string, providerDisplayName: string) {
+  return [
+    `You are Rcode, running inside the Rcode Desktop application on macOS.`,
+    `Your current AI model is "${modelName}" provided by "${providerDisplayName}".`,
+    "You are NOT Claude, NOT ChatGPT, NOT any other AI assistant. You are Rcode.",
+    "Never claim to be Claude, Anthropic, OpenAI, or any other AI company's product.",
+    "You help users write, modify, and debug code in their local projects.",
+    "",
+    "## Capabilities",
   "- read_file: Read a file's content before editing it.",
   "- write_file: Write or overwrite a file with its COMPLETE content in one call.",
   "- run_shell: Run shell commands (npm install, git, tests, build, etc.).",
+  "- git_status/git_diff/git_branch/git_stage/git_commit: Inspect and manage local git workflow with approval for mutating actions.",
   "- web_fetch: Fetch documentation or API references.",
   "",
   "## Workflow Rules",
@@ -193,7 +222,8 @@ const baseSystemPrompt = [
   "- Use the project root as the working directory for all file paths.",
   "- When running shell commands, use non-interactive flags (e.g. --yes for npm).",
   "- Respond in the same language the user uses."
-].join("\n");
+  ].join("\n");
+}
 
 function getThinkingInstruction(mode: ThinkingMode = "balanced") {
   if (mode === "fast") {
@@ -208,27 +238,41 @@ function getThinkingInstruction(mode: ThinkingMode = "balanced") {
 function getConfig(modelOverride?: string) {
   const runtimeConfig = getRuntimeConfig();
   return {
-    apiKey: process.env.AI_API_KEY ?? process.env[runtimeConfig.provider.apiKeyEnv],
-    baseUrl: process.env.AI_BASE_URL ?? runtimeConfig.provider.baseUrl,
+    apiKey: runtimeConfig.provider.apiKey ?? process.env[runtimeConfig.provider.apiKeyEnv] ?? process.env.AI_API_KEY,
+    baseUrl: runtimeConfig.provider.baseUrl ?? process.env.AI_BASE_URL ?? "",
     chatPath: runtimeConfig.provider.chatCompletionsPath ?? "/chat/completions",
-    model: modelOverride || process.env.AI_MODEL || runtimeConfig.provider.defaultModel,
+    model: modelOverride || runtimeConfig.provider.defaultModel || process.env.AI_MODEL || "",
+    providerDisplayName: runtimeConfig.provider.displayName,
     temperature: runtimeConfig.temperature,
     maxTokens: runtimeConfig.maxTokens
   };
 }
 
-function toProviderMessages(
+async function toProviderMessages(
   messages: AgentMessage[],
   toolResults: ToolResult[] = [],
   thinkingMode?: ThinkingMode,
-  projectPath?: string
+  projectPath?: string,
+  modelName?: string,
+  providerDisplayName?: string
 ) {
   const projectInstruction = projectPath
     ? `Current project root: ${projectPath}. Resolve relative file paths and shell commands inside this project unless the user asks otherwise.`
     : "Current project type: empty project. Use relative file paths from the app workspace unless the user provides a folder path.";
+  const latestUserPrompt = [...messages].reverse().find((message) => message.role === "user")?.content ?? "";
+  const projectContext = await buildProjectContext(projectPath, latestUserPrompt);
+  const compactedMessages = compactMessagesForContext(messages);
   const providerMessages: Array<Record<string, unknown>> = [
-    { role: "system", content: `${baseSystemPrompt}\n${getThinkingInstruction(thinkingMode)}\n${projectInstruction}` },
-    ...messages.map((message) => {
+    {
+      role: "system",
+      content: [
+        buildSystemPrompt(modelName ?? "unknown", providerDisplayName ?? "unknown"),
+        getThinkingInstruction(thinkingMode),
+        projectInstruction,
+        projectContext ? `\n## Project Context\n${projectContext}` : ""
+      ].filter(Boolean).join("\n")
+    },
+    ...compactedMessages.map((message) => {
       if (message.role === "tool") {
         return { role: "tool", tool_call_id: message.toolCallId, content: message.content };
       }
@@ -309,7 +353,7 @@ export async function auditToolCallApproval(
         {
           role: "system",
           content: [
-            "You are a security and permission reviewer for a local coding agent.",
+            "You are Rcode's security and permission reviewer. You are NOT Claude or any other AI assistant.",
             "Decide whether a proposed tool call may run automatically under auto-approve mode.",
             "Return ONLY compact JSON with this shape: {\"allow\": boolean, \"risk\": \"low\"|\"medium\"|\"high\", \"reason\": string}.",
             "Allow routine reads/writes/build/test commands that are clearly scoped to the current project.",
@@ -361,8 +405,8 @@ export async function callAi(
     headers: { "content-type": "application/json", authorization: `Bearer ${config.apiKey}` },
     body: JSON.stringify({
       model: config.model,
-      messages: toProviderMessages(messages, toolResults, options.thinkingMode, options.projectPath),
-      tools: toolDefinitions,
+      messages: await toProviderMessages(messages, toolResults, options.thinkingMode, options.projectPath, config.model, config.providerDisplayName),
+      tools: await getToolDefinitions(options.projectPath),
       tool_choice: "auto",
       temperature: config.temperature,
       max_tokens: config.maxTokens
@@ -399,7 +443,11 @@ export async function callAi(
 export async function* callAiStream(
   messages: AgentMessage[],
   options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; signal?: AbortSignal } = {}
-): AsyncGenerator<{ type: "text_delta"; content: string } | { type: "tool_calls"; toolCalls: ToolCall[]; cleanContent?: string }> {
+): AsyncGenerator<
+  | { type: "text_delta"; content: string }
+  | { type: "usage"; usage: AiUsage; model: string; provider: string }
+  | { type: "tool_calls"; toolCalls: ToolCall[]; cleanContent?: string }
+> {
   const config = getConfig(options.model);
 
   if (!config.apiKey) {
@@ -408,24 +456,43 @@ export async function* callAiStream(
     return;
   }
 
-  const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}${config.chatPath}`, {
+  const requestBody = {
+    model: config.model,
+    messages: await toProviderMessages(messages, [], options.thinkingMode, options.projectPath, config.model, config.providerDisplayName),
+    tools: await getToolDefinitions(options.projectPath),
+    tool_choice: "auto",
+    temperature: config.temperature,
+    max_tokens: config.maxTokens,
+    stream: true,
+    stream_options: { include_usage: true }
+  };
+
+  let response = await fetch(`${config.baseUrl.replace(/\/$/, "")}${config.chatPath}`, {
     method: "POST",
     signal: options.signal,
     headers: { "content-type": "application/json", authorization: `Bearer ${config.apiKey}` },
-    body: JSON.stringify({
-      model: config.model,
-      messages: toProviderMessages(messages, [], options.thinkingMode, options.projectPath),
-      tools: toolDefinitions,
-      tool_choice: "auto",
-      temperature: config.temperature,
-      max_tokens: config.maxTokens,
-      stream: true
-    })
+    body: JSON.stringify(requestBody)
   });
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`AI provider error ${response.status}: ${body.slice(0, 500)}`);
+    if ((response.status === 400 || response.status === 422) && /stream_options|include_usage/i.test(body)) {
+      const { stream_options: _streamOptions, ...fallbackBody } = requestBody;
+      response = await fetch(`${config.baseUrl.replace(/\/$/, "")}${config.chatPath}`, {
+        method: "POST",
+        signal: options.signal,
+        headers: { "content-type": "application/json", authorization: `Bearer ${config.apiKey}` },
+        body: JSON.stringify(fallbackBody)
+      });
+      if (response.ok) {
+        // This provider can stream, but it does not expose usage in streaming mode.
+      } else {
+        const fallbackErrorBody = await response.text();
+        throw new Error(`AI provider error ${response.status}: ${fallbackErrorBody.slice(0, 500)}`);
+      }
+    } else {
+      throw new Error(`AI provider error ${response.status}: ${body.slice(0, 500)}`);
+    }
   }
 
   const reader = response.body!.getReader();
@@ -451,6 +518,9 @@ export async function* callAiStream(
 
       try {
         const chunk = JSON.parse(data) as StreamChunk;
+        if (chunk.usage) {
+          yield { type: "usage", usage: chunk.usage, model: config.model, provider: config.providerDisplayName };
+        }
         const delta = chunk.choices?.[0]?.delta;
         if (!delta) continue;
 

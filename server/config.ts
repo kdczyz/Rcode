@@ -1,17 +1,21 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { parse as parseToml } from "smol-toml";
-import type { AgentToolName, PermissionMode, ToolRisk } from "./types";
+import type { AgentToolName, LegacyPermissionMode, PermissionMode, ToolRisk } from "./types";
+import { getActiveAiProviderId, listUserAiProviders } from "./localDatabase";
 
-interface ProviderEntry {
+export interface ProviderEntry {
   type: "openai-compatible";
   displayName: string;
   baseUrl: string;
+  apiKey?: string;
   apiKeyEnv: string;
   chatCompletionsPath?: string;
   modelsPath?: string;
   defaultModel: string;
   fallbackModels?: string[];
+  enabled?: boolean;
+  source?: "builtin" | "user";
 }
 
 interface ProvidersConfig {
@@ -33,7 +37,7 @@ interface AgentTomlConfig {
     max_tokens?: number;
   };
   permissions?: {
-    default_mode?: PermissionMode;
+    default_mode?: PermissionMode | LegacyPermissionMode;
     require_approval_for_internet?: boolean;
     require_approval_for_file_write?: boolean;
     require_approval_for_shell?: boolean;
@@ -53,6 +57,7 @@ interface AgentTomlConfig {
 export interface RuntimeConfig {
   provider: ProviderEntry;
   providerName: string;
+  providers: Record<string, ProviderEntry>;
   temperature: number;
   maxTokens: number;
   defaultPermissionMode: PermissionMode;
@@ -89,19 +94,79 @@ function buildRuntimeConfig(): RuntimeConfig {
   const agentConfig = readToml<AgentTomlConfig>(agentConfigPath);
   const providersPath = resolveWorkspacePath(agentConfig.ai?.provider_config ?? "config/providers.json");
   const providersConfig = readJson<ProvidersConfig>(providersPath);
-  const activeProvider = agentConfig.ai?.active_provider ?? providersConfig.activeProvider;
-  const provider = providersConfig.providers[activeProvider];
+  const builtinProviders = Object.fromEntries(
+    Object.entries(providersConfig.providers).map(([id, provider]) => [id, { ...provider, source: "builtin" as const }])
+  );
+  const userProviders = Object.fromEntries(
+    listUserAiProviders()
+      .filter((provider) => provider.enabled !== false)
+      .map((provider) => [
+        provider.id,
+        {
+          type: provider.type,
+          displayName: provider.displayName,
+          baseUrl: provider.baseUrl,
+          apiKey: provider.apiKey,
+          apiKeyEnv: provider.apiKeyEnv || "AI_API_KEY",
+          chatCompletionsPath: provider.chatCompletionsPath,
+          modelsPath: provider.modelsPath,
+          defaultModel: provider.defaultModel,
+          fallbackModels: provider.fallbackModels,
+          enabled: provider.enabled,
+          source: "user" as const
+        }
+      ])
+  );
+  const providers = { ...builtinProviders, ...userProviders };
+  const activeProvider =
+    process.env.AI_PROVIDER ??
+    getActiveAiProviderId() ??
+    agentConfig.ai?.active_provider ??
+    providersConfig.activeProvider;
+  const provider = providers[activeProvider] ?? providers[providersConfig.activeProvider];
+  const defaultMode = agentConfig.permissions?.default_mode === "request_approval" || agentConfig.permissions?.default_mode === "auto_approve"
+    ? "workspace_write"
+    : agentConfig.permissions?.default_mode;
 
   if (!provider) {
-    throw new Error(`AI provider "${activeProvider}" was not found in ${providersPath}`);
+    const defaultProvider: ProviderEntry = {
+      type: "openai-compatible",
+      displayName: "未配置",
+      baseUrl: "",
+      apiKeyEnv: "AI_API_KEY",
+      defaultModel: "",
+      source: "builtin"
+    };
+    return {
+      provider: defaultProvider,
+      providerName: activeProvider || "none",
+      providers,
+      temperature: agentConfig.ai?.temperature ?? 0.3,
+      maxTokens: agentConfig.ai?.max_tokens ?? 2048,
+      defaultPermissionMode: defaultMode ?? "workspace_write",
+      permissions: {
+        requireApprovalForInternet: agentConfig.permissions?.require_approval_for_internet ?? true,
+        requireApprovalForFileWrite: agentConfig.permissions?.require_approval_for_file_write ?? true,
+        requireApprovalForShell: agentConfig.permissions?.require_approval_for_shell ?? true
+      },
+      tools: new Map((agentConfig.tools ?? []).map((tool) => [tool.name, tool])),
+      computerControl: {
+        enabled: agentConfig.computer_control?.enabled ?? false,
+        shell: agentConfig.computer_control?.shell ?? false,
+        dangerousCommandsRequireApproval:
+          agentConfig.computer_control?.dangerous_commands_require_approval ?? true,
+        blockedCommands: agentConfig.computer_control?.command_policy?.blocked ?? []
+      }
+    };
   }
 
   return {
     provider,
-    providerName: activeProvider,
+    providerName: providers[activeProvider] ? activeProvider : providersConfig.activeProvider,
+    providers,
     temperature: agentConfig.ai?.temperature ?? 0.3,
     maxTokens: agentConfig.ai?.max_tokens ?? 2048,
-    defaultPermissionMode: agentConfig.permissions?.default_mode ?? "request_approval",
+    defaultPermissionMode: defaultMode ?? "workspace_write",
     permissions: {
       requireApprovalForInternet: agentConfig.permissions?.require_approval_for_internet ?? true,
       requireApprovalForFileWrite: agentConfig.permissions?.require_approval_for_file_write ?? true,
@@ -123,4 +188,9 @@ let cachedConfig: RuntimeConfig | undefined;
 export function getRuntimeConfig(): RuntimeConfig {
   cachedConfig ??= buildRuntimeConfig();
   return cachedConfig;
+}
+
+export function reloadRuntimeConfig(): RuntimeConfig {
+  cachedConfig = undefined;
+  return getRuntimeConfig();
 }

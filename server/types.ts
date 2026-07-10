@@ -1,8 +1,53 @@
-export type PermissionMode = "request_approval" | "auto_approve" | "full_access";
+export type PermissionMode = "default" | "plan" | "workspace_write" | "full_access" | "custom";
+
+export type LegacyPermissionMode = "request_approval" | "auto_approve";
 
 export type ToolRisk = "low" | "medium" | "high";
 
-export type AgentToolName = "read_file" | "write_file" | "web_fetch" | "run_shell";
+export type BuiltinToolName =
+  | "read_file"
+  | "write_file"
+  | "list_files"
+  | "search_text"
+  | "inspect_tree"
+  | "apply_patch"
+  | "web_fetch"
+  | "run_shell"
+  | "git_status"
+  | "git_diff"
+  | "git_branch"
+  | "git_stage"
+  | "git_commit";
+
+export type AgentToolName = BuiltinToolName | `mcp__${string}__${string}` | string;
+
+export type PermissionEffect = "allow" | "ask" | "deny";
+export type EnforcementDecision = "guarded" | "requires_approval" | "denied" | "unavailable";
+export type PermissionTargetType = "tool" | "path" | "command" | "url" | "mcp";
+export type PermissionScope = "user" | "project" | "managed";
+
+export interface PermissionRule {
+  id: string;
+  effect: PermissionEffect;
+  targetType: PermissionTargetType;
+  pattern: string;
+  scope: PermissionScope;
+  enabled: boolean;
+}
+
+export interface ToolDefinition {
+  id?: AgentToolName;
+  name: AgentToolName;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  source: "builtin" | "mcp";
+  sourceId?: string;
+  risk: ToolRisk;
+  requiresSandbox: boolean;
+  requiresExecutor?: boolean;
+  defaultApproval: PermissionEffect;
+  approvalMode?: PermissionEffect;
+}
 
 export interface ToolCall {
   id: string;
@@ -15,8 +60,43 @@ export interface ToolResult {
   name: AgentToolName;
   ok: boolean;
   content: string;
+  summary?: string;
+  exitCode?: number;
+  artifacts?: Array<{ id: string; label: string; kind: string }>;
+  stdoutArtifactId?: string;
+  stderrArtifactId?: string;
+  diffs?: DiffResult[];
+  auditEventId?: string;
   /** write_file 时包含的 diff 信息 */
   diff?: DiffResult;
+}
+
+export interface ShellAnalysis {
+  command: string;
+  cwd: string;
+  cwdInsideWorkspace: boolean;
+  mentionsOutsideWorkspace: boolean;
+  redirectsOutsideWorkspace: boolean;
+  mayUseNetwork: boolean;
+  destructive: boolean;
+  leaksEnvironment: boolean;
+  backgroundProcess: boolean;
+  interactive: boolean;
+  riskFlags: string[];
+  blockedReason?: string;
+}
+
+export interface ExecutorResult {
+  ok: boolean;
+  exitCode?: number;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+  blockedReason?: string;
+  riskFlags: string[];
+  cwd: string;
+  argv: string[];
+  executorKind: "portable";
 }
 
 export interface DiffResult {
@@ -37,6 +117,14 @@ export interface PendingApproval {
   risk: ToolRisk;
   createdAt: string;
   projectPath?: string;
+  conversationSnapshotId?: string;
+  remainingToolQueue?: ToolCall[];
+  resumeInput?: {
+    mode?: PermissionMode;
+    model?: string;
+    thinkingMode?: string;
+    projectPath?: string;
+  };
 }
 
 export interface AgentMessage {
@@ -56,9 +144,12 @@ export interface AgentRunResponse {
 }
 
 export type StreamEvent =
+  | { type: "run_started"; conversationId: string }
   | { type: "text_delta"; content: string }
   | { type: "tool_call"; toolCall: ToolCall }
+  | { type: "permission_decision"; toolCallId: string; effect: PermissionEffect; reason: string }
   | { type: "tool_result"; result: ToolResult }
+  | { type: "diff_created"; diffs: DiffResult[]; auditEventId?: string }
   | { type: "approval_required"; conversationId: string; answer: string; approvals: PendingApproval[] }
   | { type: "completed"; conversationId: string; answer: string }
   | { type: "error"; conversationId: string; message: string };

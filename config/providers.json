@@ -9,15 +9,7 @@
       "chatCompletionsPath": "/chat/completions",
       "modelsPath": "/models",
       "defaultModel": "mimo-v2.5-pro",
-      "fallbackModels": [
-        "mimo-v2.5"
-      ],
-      "supports": {
-        "chat": true,
-        "tools": true,
-        "streaming": true,
-        "embeddings": false
-      }
+      "source": "builtin"
     }
   }
 }

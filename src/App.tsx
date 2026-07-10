@@ -3,6 +3,9 @@ import {
   Brain,
   Check,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
   CornerDownRight,
   FileText,
   Folder,
@@ -12,32 +15,40 @@ import {
   LogIn,
   LogOut,
   MessageSquarePlus,
+  Monitor,
   MoreHorizontal,
+  Moon,
   PanelLeft,
   PanelRight,
   Pencil,
   Plus,
   Puzzle,
+  RefreshCw,
+  Save,
+  Search,
   Settings,
   SquareChevronLeft,
   SquareChevronRight,
   Send,
   SlidersHorizontal,
   Square,
+  Sun,
   Terminal,
   Trash2,
   UserRound,
   X
 } from "lucide-react";
-import { CSSProperties, FormEvent, KeyboardEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, FormEvent, Fragment, KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode, WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 
-type PermissionMode = "request_approval" | "auto_approve" | "full_access";
+type PermissionMode = "default" | "plan" | "workspace_write" | "full_access" | "custom";
 type ThemePreference = "system" | "dark" | "light";
 type ThinkingMode = "fast" | "balanced" | "deep";
 type ProjectKind = "empty" | "folder" | "temporary";
 type MessageStatus = "completed" | "approval_required" | "error" | "running";
 type ActiveView = "chat" | "settings";
-type SettingsSectionId = "general" | "profile" | "usage" | "mcp";
+type SettingsSectionId = "general" | "profile" | "usage" | "ai" | "mcp";
+type UsageActivityMode = "daily" | "weekly" | "total";
 
 interface ModelCatalog {
   recommendedForAgent?: string[];
@@ -61,10 +72,12 @@ interface ChatMessage {
   content: string;
   status?: MessageStatus;
   isStreaming?: boolean;
+  toolCallId?: string;
   toolName?: string;
   toolArgs?: Record<string, unknown>;
   toolResult?: { ok: boolean; content: string };
   diff?: DiffResult;
+  artifactDiffs?: DiffResult[];
 }
 
 interface PendingApproval {
@@ -116,22 +129,138 @@ interface AuthSessionResponse {
   user: AuthUser | null;
 }
 
+interface UsageSummary {
+  totals: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    cachedTokens: number;
+  };
+  prompts: {
+    total: number;
+    sessionHits: number;
+    hitRate: number;
+  };
+  aiCalls: number;
+  byModel: Array<{
+    model: string;
+    totalTokens: number;
+    promptTokens: number;
+    completionTokens: number;
+    calls: number;
+  }>;
+  daily?: Array<{
+    date: string;
+    totalTokens: number;
+    promptTokens: number;
+    completionTokens: number;
+    calls: number;
+  }>;
+  recent: Array<{
+    id: string;
+    createdAt: string;
+    eventType: "prompt" | "ai_call";
+    model?: string;
+    provider?: string;
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    cachedTokens: number;
+    sessionWasExisting?: boolean;
+  }>;
+}
+
+interface ToolCatalogItem {
+  name: string;
+  description: string;
+  risk: "low" | "medium" | "high";
+  source: "builtin" | "mcp";
+  defaultApproval: "allow" | "ask" | "deny";
+}
+
+interface AuditEvent {
+  id: string;
+  createdAt: string;
+  toolName?: string;
+  permissionEffect?: string;
+  permissionReason?: string;
+  ok?: boolean;
+  durationMs?: number;
+  outputSummary?: string;
+}
+
+interface McpServerConfig {
+  id: string;
+  name: string;
+  transport: "stdio" | "http";
+  command?: string;
+  args?: string[];
+  url?: string;
+  enabled: boolean;
+  defaultApproval: "allow" | "ask" | "deny";
+  instructions?: string;
+  tools?: Array<{ name: string; description?: string; enabled?: boolean; approvalMode?: "allow" | "ask" | "deny" }>;
+}
+
+interface AiProviderConfig {
+  id: string;
+  displayName: string;
+  type: "openai-compatible";
+  baseUrl: string;
+  apiKeyEnv?: string;
+  apiKeyPreview?: string;
+  chatCompletionsPath?: string;
+  modelsPath?: string;
+  defaultModel: string;
+  fallbackModels?: string[];
+  enabled: boolean;
+  source?: "builtin" | "user";
+  active: boolean;
+  configured: boolean;
+}
+
+interface AgentSkill {
+  name: string;
+  description: string;
+  path: string;
+  scope: "project" | "user";
+}
+
+interface MemoryItem {
+  id: string;
+  kind: string;
+  content: string;
+  importance: number;
+}
+
+interface SubagentDefinition {
+  name: string;
+  description: string;
+  scope: "project" | "user";
+}
+
 interface QueuedPrompt {
   id: string;
   content: string;
   kind?: "prompt" | "guide";
 }
 
+interface TaskTimerState {
+  startedAt?: number;
+  elapsedMs: number;
+}
+
 /** SSE 流事件 */
 interface StreamEvent {
-  type: "text_delta" | "tool_call" | "tool_result" | "approval_required" | "completed" | "error";
+  type: "run_started" | "text_delta" | "tool_call" | "permission_decision" | "tool_result" | "diff_created" | "approval_required" | "completed" | "error";
   content?: string;
   toolCall?: { id: string; name: string; arguments: Record<string, unknown> };
-  result?: { toolCallId: string; name: string; ok: boolean; content: string; diff?: DiffResult };
+  result?: { toolCallId: string; name: string; ok: boolean; content: string; diff?: DiffResult; diffs?: DiffResult[]; auditEventId?: string; exitCode?: number };
   conversationId?: string;
   answer?: string;
   message?: string;
   approvals?: PendingApproval[];
+  diffs?: DiffResult[];
 }
 
 /** 文件 diff 信息 */
@@ -144,13 +273,47 @@ interface DiffResult {
   removedLines: number;
 }
 
+type DiffLine = DiffResult["lines"][number];
+type DiffReviewRow =
+  | { kind: "line"; line: DiffLine; index: number }
+  | { kind: "fold"; hiddenCount: number; key: string };
+type SplitDiffReviewRow =
+  | { kind: "pair"; key: string; oldLine?: DiffLine; newLine?: DiffLine }
+  | { kind: "fold"; hiddenCount: number; key: string };
+type DiffViewMode = "split" | "unified";
+
+interface EditPreviewLine {
+  type: "same" | "add" | "remove" | "meta";
+  content: string;
+  oldLine?: number;
+  newLine?: number;
+}
+
+interface EditPreview {
+  label: string;
+  lines: EditPreviewLine[];
+  totalLines: number;
+}
+
 const workspaceStorageKey = "agent.workspace.projects.v1";
 const sidebarCollapsedStorageKey = "agent.workspace.sidebarCollapsed.v1";
 const sidebarWidthStorageKey = "agent.workspace.sidebarWidth.v1";
+const projectSessionCollapsedStorageKey = "agent.workspace.projectSessionCollapsed.v1";
 const authTokenStorageKey = "agent.auth.token.v1";
+const temporaryProjectId = "project_unassigned";
+const temporaryProjectName = "不使用项目";
+const localModeUser: AuthUser = {
+  id: 0,
+  username: "local",
+  displayName: "本机模式"
+};
 const defaultSidebarWidth = 318;
 const minSidebarWidth = 220;
 const maxSidebarWidth = 520;
+const sessionArchiveSwipeThreshold = 82;
+const sessionArchiveSwipeMax = 96;
+const editPreviewContextLines = 2;
+const editPreviewLineLimit = 90;
 const API_BASE = window.location.protocol === "file:" || window.agentDesktop?.isDesktopClient ? "http://localhost:8787" : "";
 const thinkingOptions: Array<{ id: ThinkingMode; label: string }> = [
   { id: "fast", label: "快速" },
@@ -159,9 +322,11 @@ const thinkingOptions: Array<{ id: ThinkingMode; label: string }> = [
 ];
 
 const defaultPermissionOptions: PermissionOption[] = [
-  { id: "request_approval", label: "请求批准", description: "项目内文件操作直接执行，项目外操作请求审批" },
-  { id: "auto_approve", label: "替我审批", description: "由当前模型自动审核工具风险并决定是否执行" },
-  { id: "full_access", label: "完全访问", description: "允许所有工具操作直接执行" }
+  { id: "default", label: "默认", description: "使用配置文件中的默认工作区沙箱策略" },
+  { id: "plan", label: "计划", description: "只读规划模式，不允许写文件、联网或执行命令" },
+  { id: "workspace_write", label: "工作区", description: "项目内自主执行，越界、联网和危险操作请求审批" },
+  { id: "custom", label: "自定义", description: "按自定义权限规则执行" },
+  { id: "full_access", label: "完全访问", description: "允许所有工具操作直接执行，高风险" }
 ];
 
 const toolActionLabels: Record<string, { running: string; completed: string; noun: string }> = {
@@ -169,6 +334,18 @@ const toolActionLabels: Record<string, { running: string; completed: string; nou
   write_file: { running: "正在编辑", completed: "已编辑", noun: "个文件" },
   run_shell: { running: "正在运行", completed: "已运行", noun: "条命令" },
   web_fetch: { running: "正在获取", completed: "已获取", noun: "个网页" }
+};
+
+type ToolActivityCategory = "command" | "edit" | "read" | "lookup" | "other";
+
+const toolActivityOrder: ToolActivityCategory[] = ["command", "edit", "read", "lookup", "other"];
+
+const toolActivityLabels: Record<ToolActivityCategory, { title: string; running: string; completed: string; noun: string; target: string }> = {
+  command: { title: "执行指令", running: "正在执行", completed: "已执行", noun: "条指令", target: "指令" },
+  edit: { title: "编辑文件", running: "正在编辑", completed: "已编辑", noun: "个文件", target: "编辑" },
+  read: { title: "读取文件", running: "正在读取", completed: "已读取", noun: "个文件", target: "读取" },
+  lookup: { title: "查取文件", running: "正在查取", completed: "已查取", noun: "项", target: "查取" },
+  other: { title: "调用工具", running: "正在调用", completed: "已调用", noun: "个工具", target: "工具" }
 };
 
 function createId(prefix: string) {
@@ -208,13 +385,73 @@ function createProject(name: string, kind: ProjectKind, path?: string): AgentPro
   };
 }
 
-function getDefaultWorkspace(): WorkspaceState {
-  const project = createProject("Agent Console", "empty");
+function getTimestampValue(value: string) {
+  const time = new Date(value).getTime();
+  return Number.isFinite(time) ? time : 0;
+}
+
+function getLatestTimestamp(...values: string[]) {
+  return values.reduce((latest, value) => (getTimestampValue(value) > getTimestampValue(latest) ? value : latest), values[0] ?? new Date().toISOString());
+}
+
+function getEarliestTimestamp(...values: string[]) {
+  return values.reduce((earliest, value) => (getTimestampValue(value) < getTimestampValue(earliest) ? value : earliest), values[0] ?? new Date().toISOString());
+}
+
+function createTemporaryProject(sessions: ProjectSession[] = []): AgentProject {
+  const now = new Date().toISOString();
+  const sortedSessions = [...sessions].sort((a, b) => getTimestampValue(b.updatedAt) - getTimestampValue(a.updatedAt));
   return {
+    id: temporaryProjectId,
+    name: temporaryProjectName,
+    kind: "temporary",
+    createdAt: sessions.length > 0 ? getEarliestTimestamp(...sessions.map((session) => session.createdAt)) : now,
+    updatedAt: sessions.length > 0 ? getLatestTimestamp(...sessions.map((session) => session.updatedAt)) : now,
+    sessions: sortedSessions
+  };
+}
+
+function normalizeWorkspaceState(state: WorkspaceState): WorkspaceState {
+  const temporaryProjects = state.projects.filter((project) => project.kind === "temporary");
+  const regularProjects = state.projects.filter((project) => project.kind !== "temporary");
+  const temporarySessions = temporaryProjects.flatMap((project) => project.sessions);
+  const temporaryProject = createTemporaryProject(temporarySessions);
+  let projects = [...regularProjects, temporaryProject];
+  const activeWasTemporary = temporaryProjects.some((project) => project.id === state.activeProjectId);
+  let activeProjectId = activeWasTemporary ? temporaryProjectId : state.activeProjectId;
+  let activeSessionId = state.activeSessionId;
+  let activeProject = projects.find((project) => project.id === activeProjectId);
+
+  if (!activeProject) {
+    activeProject = regularProjects[0] ?? temporaryProject;
+    activeProjectId = activeProject.id;
+  }
+
+  if (activeProject.sessions.length === 0) {
+    const fallbackSession = createSession(activeProject.kind === "temporary" ? "临时会话" : "新会话");
+    projects = projects.map((project) =>
+      project.id === activeProjectId
+        ? { ...project, updatedAt: fallbackSession.updatedAt, sessions: [fallbackSession] }
+        : project
+    );
+    activeProject = projects.find((project) => project.id === activeProjectId)!;
+    activeSessionId = fallbackSession.id;
+  }
+
+  if (!activeProject.sessions.some((session) => session.id === activeSessionId && !session.archivedAt)) {
+    activeSessionId = activeProject.sessions.find((session) => !session.archivedAt)?.id ?? activeProject.sessions[0].id;
+  }
+
+  return { projects, activeProjectId, activeSessionId };
+}
+
+function getDefaultWorkspace(): WorkspaceState {
+  const project = createProject("Rcode", "empty");
+  return normalizeWorkspaceState({
     projects: [project],
     activeProjectId: project.id,
     activeSessionId: project.sessions[0].id
-  };
+  });
 }
 
 function isWorkspaceState(value: unknown): value is WorkspaceState {
@@ -226,7 +463,7 @@ function isWorkspaceState(value: unknown): value is WorkspaceState {
 function loadWorkspaceState(): WorkspaceState {
   try {
     const parsed = JSON.parse(localStorage.getItem(workspaceStorageKey) ?? "null");
-    if (isWorkspaceState(parsed) && parsed.projects.length > 0) return parsed;
+    if (isWorkspaceState(parsed) && parsed.projects.length > 0) return normalizeWorkspaceState(parsed);
   } catch { /* ignore */ }
   return getDefaultWorkspace();
 }
@@ -240,11 +477,134 @@ function loadSidebarWidth() {
   return Number.isFinite(saved) ? clampSidebarWidth(saved) : defaultSidebarWidth;
 }
 
+function loadProjectSessionCollapsedState() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(projectSessionCollapsedStorageKey) ?? "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([key, value]) => typeof key === "string" && typeof value === "boolean")
+    ) as Record<string, boolean>;
+  } catch {
+    return {};
+  }
+}
+
 function getAccountInitials(user?: AuthUser | null) {
   const source = user?.displayName || user?.username || "AC";
   const parts = source.trim().split(/\s+/).filter(Boolean);
   if (parts.length >= 2) return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
   return source.slice(0, 2).toUpperCase();
+}
+
+function formatTaskDuration(durationMs: number) {
+  const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+function formatUsageNumber(value: number) {
+  return new Intl.NumberFormat("zh-CN").format(Math.max(0, Math.round(value)));
+}
+
+function formatPercent(value: number) {
+  return `${Math.round(Math.max(0, Math.min(1, value)) * 100)}%`;
+}
+
+function getDateKey(date: Date) {
+  const year = date.getFullYear();
+  const month = `${date.getMonth() + 1}`.padStart(2, "0");
+  const day = `${date.getDate()}`.padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function addDays(date: Date, days: number) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function getUsageWeekKey(date: Date) {
+  const start = addDays(date, -date.getDay());
+  return getDateKey(start);
+}
+
+function getUsageLevel(value: number, max: number) {
+  if (value <= 0 || max <= 0) return 0;
+  const ratio = value / max;
+  if (ratio >= 0.75) return 4;
+  if (ratio >= 0.45) return 3;
+  if (ratio >= 0.18) return 2;
+  return 1;
+}
+
+function buildUsageActivityGrid(
+  daily: NonNullable<UsageSummary["daily"]>,
+  mode: UsageActivityMode,
+  today = new Date()
+) {
+  const normalizedToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const totalDays = 53 * 7;
+  const start = addDays(normalizedToday, -(totalDays - 1));
+  const dailyMap = new Map(daily.map((item) => [item.date, item]));
+  const weeklyTotals = new Map<string, number>();
+  daily.forEach((item) => {
+    const date = new Date(`${item.date}T00:00:00`);
+    const weekKey = getUsageWeekKey(date);
+    weeklyTotals.set(weekKey, (weeklyTotals.get(weekKey) ?? 0) + item.totalTokens);
+  });
+
+  let runningTotal = 0;
+  const rawValues: number[] = [];
+  const dates = Array.from({ length: totalDays }, (_, index) => addDays(start, index));
+  dates.forEach((date) => {
+    const dateKey = getDateKey(date);
+    const dayTokens = dailyMap.get(dateKey)?.totalTokens ?? 0;
+    if (mode === "total") runningTotal += dayTokens;
+    rawValues.push(
+      mode === "weekly"
+        ? (weeklyTotals.get(getUsageWeekKey(date)) ?? 0)
+        : mode === "total"
+          ? runningTotal
+          : dayTokens
+    );
+  });
+
+  const positiveValues = rawValues.filter((value) => value > 0);
+  const maxValue = positiveValues.length > 0 ? Math.max(...positiveValues) : 0;
+  const cells = dates.map((date, index) => {
+    const dateKey = getDateKey(date);
+    const item = dailyMap.get(dateKey);
+    const value = rawValues[index];
+    return {
+      dateKey,
+      month: date.getMonth() + 1,
+      day: date.getDate(),
+      weekday: date.getDay(),
+      value,
+      calls: item?.calls ?? 0,
+      level: getUsageLevel(value, maxValue)
+    };
+  });
+
+  const monthLabels: Array<{ key: string; label: string; column: number }> = [];
+  let previousMonth = -1;
+  dates.forEach((date, index) => {
+    const month = date.getMonth();
+    if (month !== previousMonth && date.getDate() <= 7) {
+      monthLabels.push({
+        key: `${date.getFullYear()}-${month}`,
+        label: `${month + 1}月`,
+        column: Math.floor(index / 7) + 1
+      });
+      previousMonth = month;
+    }
+  });
+
+  return { cells, monthLabels };
 }
 
 function summarizeArguments(args: Record<string, unknown>) {
@@ -253,17 +613,100 @@ function summarizeArguments(args: Record<string, unknown>) {
     .join("\n");
 }
 
-function renderMessageContent(content: string) {
+function normalizeCodeBlockContent(code: string) {
+  return code.replace(/^\n/, "").replace(/\n$/, "");
+}
+
+async function copyTextToClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  textarea.remove();
+}
+
+function MessageCodeBlock({ code, language }: { code: string; language?: string }) {
+  const [copied, setCopied] = useState(false);
+  const codeContent = normalizeCodeBlockContent(code);
+  const label = language?.trim() || "text";
+
+  useEffect(() => {
+    if (!copied) return undefined;
+    const timeoutId = window.setTimeout(() => setCopied(false), 1400);
+    return () => window.clearTimeout(timeoutId);
+  }, [copied]);
+
+  return (
+    <figure className="messageCodeBlock">
+      <figcaption className="messageCodeHeader">
+        <span>{label}</span>
+        <button
+          aria-label={copied ? "已复制代码" : "复制代码"}
+          className="messageCodeCopy"
+          onClick={async () => {
+            await copyTextToClipboard(codeContent);
+            setCopied(true);
+          }}
+          title={copied ? "已复制" : "复制"}
+          type="button"
+        >
+          {copied ? <Check size={18} strokeWidth={2.15} /> : <Copy size={18} strokeWidth={2.05} />}
+        </button>
+      </figcaption>
+      <pre className="messageCodePre">
+        <code>{codeContent}</code>
+      </pre>
+    </figure>
+  );
+}
+
+function renderInlineMessageContent(content: string, keyPrefix: string) {
   return content.split(/(`[^`\n]+`)/g).map((part, index) => {
     if (part.startsWith("`") && part.endsWith("`")) {
       return (
-        <code className="inlineCode" key={`${part}-${index}`}>
+        <code className="inlineCode" key={`${keyPrefix}-inline-${index}`}>
           {part.slice(1, -1)}
         </code>
       );
     }
     return part;
   });
+}
+
+function renderMessageContent(content: string) {
+  const parts: ReactNode[] = [];
+  const codeFencePattern = /```([^\n`]*)\n?([\s\S]*?)```/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = codeFencePattern.exec(content)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(...renderInlineMessageContent(content.slice(lastIndex, match.index), `text-${lastIndex}`));
+    }
+    parts.push(
+      <MessageCodeBlock
+        code={match[2] ?? ""}
+        key={`code-${match.index}`}
+        language={match[1]?.trim()}
+      />
+    );
+    lastIndex = match.index + match[0].length;
+  }
+
+  if (lastIndex < content.length) {
+    parts.push(...renderInlineMessageContent(content.slice(lastIndex), `text-${lastIndex}`));
+  }
+
+  return parts;
 }
 
 function getToolShortTarget(message: ChatMessage) {
@@ -279,6 +722,241 @@ function getFileName(filePath: string) {
   return filePath.split(/[\\/]/).filter(Boolean).at(-1) ?? filePath;
 }
 
+function normalizeFilePath(filePath: string) {
+  return filePath.replace(/\\/g, "/");
+}
+
+function getDisplayFilePath(filePath: string, projectPath?: string) {
+  const normalizedPath = normalizeFilePath(filePath);
+  const normalizedProject = projectPath ? normalizeFilePath(projectPath).replace(/\/$/, "") : "";
+  if (normalizedProject && normalizedPath.startsWith(`${normalizedProject}/`)) {
+    return normalizedPath.slice(normalizedProject.length + 1);
+  }
+  return normalizedPath;
+}
+
+function getDiffEditKind(diff?: DiffResult) {
+  if (!diff) return "编辑中";
+  if (diff.oldContent === null) return "新增";
+  if (diff.addedLines > 0 && diff.removedLines > 0) return "修改";
+  if (diff.addedLines > 0) return "新增内容";
+  if (diff.removedLines > 0) return "删减";
+  return "更新";
+}
+
+function getEditSummaryText(diffs: DiffResult[]) {
+  if (diffs.length === 0) return "等待文件变更结果";
+  const created = diffs.filter((diff) => diff.oldContent === null).length;
+  const changed = diffs.length - created;
+  const parts = [
+    created > 0 ? `新增 ${created} 个文件` : "",
+    changed > 0 ? `修改 ${changed} 个文件` : ""
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join("，") : "已更新文件内容";
+}
+
+function lineCount(text: string) {
+  if (!text) return 0;
+  return text.split("\n").length;
+}
+
+function trimEditPreviewLines(lines: EditPreviewLine[], limit = editPreviewLineLimit) {
+  if (lines.length <= limit) return lines;
+  const hiddenCount = lines.length - limit;
+  return [
+    ...lines.slice(0, limit),
+    { type: "meta" as const, content: `... 已隐藏 ${hiddenCount} 行` }
+  ];
+}
+
+function getCompactDiffPreviewLines(diff: DiffResult) {
+  const includedIndexes = new Set<number>();
+  diff.lines.forEach((line, index) => {
+    if (line.type === "same") return;
+    const start = Math.max(0, index - editPreviewContextLines);
+    const end = Math.min(diff.lines.length - 1, index + editPreviewContextLines);
+    for (let cursor = start; cursor <= end; cursor++) {
+      includedIndexes.add(cursor);
+    }
+  });
+
+  if (includedIndexes.size === 0) {
+    return trimEditPreviewLines(diff.lines.slice(0, 18));
+  }
+
+  const previewLines: EditPreviewLine[] = [];
+  let previousIndex = -1;
+  [...includedIndexes].sort((a, b) => a - b).forEach((index) => {
+    if (previousIndex !== -1 && index > previousIndex + 1) {
+      previewLines.push({ type: "meta", content: `... 跳过 ${index - previousIndex - 1} 行未变更内容` });
+    }
+    previewLines.push(diff.lines[index]);
+    previousIndex = index;
+  });
+  return trimEditPreviewLines(previewLines);
+}
+
+function getDiffReviewRows(diff: DiffResult, contextLines = 3): DiffReviewRow[] {
+  const rows: DiffReviewRow[] = [];
+  let index = 0;
+  while (index < diff.lines.length) {
+    const line = diff.lines[index];
+    if (line.type !== "same") {
+      rows.push({ kind: "line", line, index });
+      index += 1;
+      continue;
+    }
+
+    const start = index;
+    while (index < diff.lines.length && diff.lines[index].type === "same") {
+      index += 1;
+    }
+    const end = index;
+    const count = end - start;
+
+    if (count > contextLines * 2 + 4) {
+      for (let cursor = start; cursor < start + contextLines; cursor++) {
+        rows.push({ kind: "line", line: diff.lines[cursor], index: cursor });
+      }
+      rows.push({
+        kind: "fold",
+        hiddenCount: count - contextLines * 2,
+        key: `${start}-${end}`
+      });
+      for (let cursor = end - contextLines; cursor < end; cursor++) {
+        rows.push({ kind: "line", line: diff.lines[cursor], index: cursor });
+      }
+    } else {
+      for (let cursor = start; cursor < end; cursor++) {
+        rows.push({ kind: "line", line: diff.lines[cursor], index: cursor });
+      }
+    }
+  }
+  return rows;
+}
+
+function getSplitDiffReviewRows(rows: DiffReviewRow[]): SplitDiffReviewRow[] {
+  const splitRows: SplitDiffReviewRow[] = [];
+  let cursor = 0;
+
+  while (cursor < rows.length) {
+    const row = rows[cursor];
+    if (row.kind === "fold") {
+      splitRows.push(row);
+      cursor += 1;
+      continue;
+    }
+
+    if (row.line.type === "same") {
+      splitRows.push({ kind: "pair", key: `same-${row.index}`, oldLine: row.line, newLine: row.line });
+      cursor += 1;
+      continue;
+    }
+
+    const changedRows: Array<Extract<DiffReviewRow, { kind: "line" }>> = [];
+    while (cursor < rows.length) {
+      const candidate = rows[cursor];
+      if (candidate.kind !== "line" || candidate.line.type === "same") break;
+      changedRows.push(candidate);
+      cursor += 1;
+    }
+
+    const removedLines = changedRows.filter((changed) => changed.line.type === "remove").map((changed) => changed.line);
+    const addedLines = changedRows.filter((changed) => changed.line.type === "add").map((changed) => changed.line);
+    const pairCount = Math.max(removedLines.length, addedLines.length);
+
+    for (let index = 0; index < pairCount; index += 1) {
+      splitRows.push({
+        kind: "pair",
+        key: `change-${changedRows[0].index}-${index}`,
+        oldLine: removedLines[index],
+        newLine: addedLines[index]
+      });
+    }
+  }
+
+  return splitRows;
+}
+
+function getPatchPreviewLines(patchText: string) {
+  const lines = patchText.split("\n").map<EditPreviewLine>((line) => {
+    if (line.startsWith("@@") || line.startsWith("diff --git") || line.startsWith("index ")) {
+      return { type: "meta", content: line };
+    }
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      return { type: "add", content: line.slice(1) };
+    }
+    if (line.startsWith("-") && !line.startsWith("---")) {
+      return { type: "remove", content: line.slice(1) };
+    }
+    if (line.startsWith(" ")) {
+      return { type: "same", content: line.slice(1) };
+    }
+    return { type: "meta", content: line };
+  });
+  return trimEditPreviewLines(lines);
+}
+
+function getTextBlockPreviewLines(text: string, type: EditPreviewLine["type"]) {
+  return trimEditPreviewLines(text.split("\n").map((content, index) => (
+    type === "add"
+      ? { type, content, newLine: index + 1 }
+      : type === "remove"
+        ? { type, content, oldLine: index + 1 }
+        : { type, content, oldLine: index + 1, newLine: index + 1 }
+  )));
+}
+
+function getEditPreview(message: ChatMessage): EditPreview | undefined {
+  if (message.diff) {
+    return {
+      label: "实时 diff",
+      lines: getCompactDiffPreviewLines(message.diff),
+      totalLines: message.diff.lines.length
+    };
+  }
+
+  if (!message.toolArgs || !isEditToolName(message.toolName)) return undefined;
+
+  const contentArg = typeof message.toolArgs.content === "string" ? message.toolArgs.content : "";
+  if (message.toolName === "write_file" && contentArg) {
+    return {
+      label: `即将写入完整内容 · ${lineCount(contentArg)} 行`,
+      lines: getTextBlockPreviewLines(contentArg, "add"),
+      totalLines: lineCount(contentArg)
+    };
+  }
+
+  const patchArg = typeof message.toolArgs.patch === "string" ? message.toolArgs.patch : "";
+  if (patchArg) {
+    return {
+      label: `补丁预览 · ${lineCount(patchArg)} 行`,
+      lines: getPatchPreviewLines(patchArg),
+      totalLines: lineCount(patchArg)
+    };
+  }
+
+  const oldTextArg = typeof message.toolArgs.oldText === "string" ? message.toolArgs.oldText : "";
+  const newTextArg = typeof message.toolArgs.newText === "string" ? message.toolArgs.newText : "";
+  if (oldTextArg || newTextArg) {
+    const lines = [
+      ...(oldTextArg ? getTextBlockPreviewLines(oldTextArg, "remove") : []),
+      ...(newTextArg ? getTextBlockPreviewLines(newTextArg, "add") : [])
+    ];
+    return {
+      label: "替换文本预览",
+      lines: trimEditPreviewLines(lines),
+      totalLines: lineCount(oldTextArg) + lineCount(newTextArg)
+    };
+  }
+
+  return undefined;
+}
+
+function isEditToolName(toolName?: string) {
+  return toolName === "write_file" || toolName === "apply_patch";
+}
+
 function getToolDisplayTarget(message: ChatMessage) {
   const pathArg = message.toolArgs?.path as string | undefined;
   const commandArg = message.toolArgs?.command as string | undefined;
@@ -289,7 +967,64 @@ function getToolDisplayTarget(message: ChatMessage) {
   return target.length > 42 ? `...${target.slice(-39)}` : target;
 }
 
-function getToolGroupSummary(toolMessages: ChatMessage[]) {
+function getToolActivityCategory(toolName?: string): ToolActivityCategory {
+  if (toolName === "run_shell") return "command";
+  if (toolName === "write_file" || toolName === "apply_patch") return "edit";
+  if (toolName === "read_file") return "read";
+  if (toolName === "list_files" || toolName === "search_text" || toolName === "inspect_tree" || toolName === "web_fetch") return "lookup";
+  return "other";
+}
+
+function getToolActivityTarget(message: ChatMessage, projectPath?: string) {
+  const category = getToolActivityCategory(message.toolName);
+  const pathArg = message.toolArgs?.path as string | undefined;
+  const commandArg = message.toolArgs?.command as string | undefined;
+  const urlArg = message.toolArgs?.url as string | undefined;
+  const queryArg = message.toolArgs?.query as string | undefined;
+
+  if (category === "command" && commandArg) {
+    return commandArg.length > 72 ? `${commandArg.slice(0, 69)}...` : commandArg;
+  }
+
+  if ((category === "edit" || category === "read" || category === "lookup") && pathArg) {
+    const displayPath = getDisplayFilePath(pathArg, projectPath);
+    if (category === "lookup" && queryArg) {
+      const query = queryArg.length > 28 ? `${queryArg.slice(0, 25)}...` : queryArg;
+      return `${displayPath} · ${query}`;
+    }
+    return displayPath;
+  }
+
+  if (category === "lookup" && urlArg) {
+    return urlArg.length > 72 ? `...${urlArg.slice(-69)}` : urlArg;
+  }
+
+  const fallback = pathArg ?? commandArg ?? urlArg ?? message.toolName ?? "";
+  return fallback.length > 72 ? `...${fallback.slice(-69)}` : fallback;
+}
+
+function getToolActivityGroups(toolMessages: ChatMessage[], projectPath?: string) {
+  return toolActivityOrder
+    .map((category) => ({
+      category,
+      messages: toolMessages.filter((message) => getToolActivityCategory(message.toolName) === category),
+      labels: toolActivityLabels[category]
+    }))
+    .filter((group) => group.messages.length > 0)
+    .map((group) => ({
+      ...group,
+      targets: group.messages.map((message) => getToolActivityTarget(message, projectPath)).filter(Boolean)
+    }));
+}
+
+function formatToolActivityTargets(targets: string[]) {
+  const uniqueTargets = [...new Set(targets)];
+  const visibleTargets = uniqueTargets.slice(0, 2);
+  const hiddenCount = uniqueTargets.length - visibleTargets.length;
+  return `${visibleTargets.join("、")}${hiddenCount > 0 ? ` 等 ${hiddenCount + visibleTargets.length} 项` : ""}`;
+}
+
+function getToolGroupSummary(toolMessages: ChatMessage[], projectPath?: string) {
   const runningCount = toolMessages.filter((m) => m.status === "running").length;
   const doneCount = toolMessages.filter((m) => m.status === "completed").length;
   const hasRunning = runningCount > 0;
@@ -297,6 +1032,7 @@ function getToolGroupSummary(toolMessages: ChatMessage[]) {
   const toolNames = [...new Set(toolMessages.map((m) => m.toolName).filter(Boolean))] as string[];
   const primaryTool = toolNames.length === 1 ? toolNames[0] : undefined;
   const labels = primaryTool ? toolActionLabels[primaryTool] : undefined;
+  const activityGroups = getToolActivityGroups(toolMessages, projectPath);
   const diffMessages = toolMessages.filter((message) => message.diff);
   const addedLines = diffMessages.reduce((sum, message) => sum + (message.diff?.addedLines ?? 0), 0);
   const removedLines = diffMessages.reduce((sum, message) => sum + (message.diff?.removedLines ?? 0), 0);
@@ -308,9 +1044,22 @@ function getToolGroupSummary(toolMessages: ChatMessage[]) {
   const target = focusedMessage ? getToolDisplayTarget(focusedMessage) : "";
 
   if (hasRunning) {
+    const runningGroups = activityGroups.filter((group) => group.messages.some((message) => message.status === "running"));
+    const summaryGroups = runningGroups.length > 0 ? runningGroups : activityGroups;
+    const label = summaryGroups
+      .map((group) => {
+        const count = group.messages.filter((message) => message.status === "running").length || group.messages.length;
+        return `${group.labels.running} ${count} ${group.labels.noun}`;
+      })
+      .join("，");
+    const detail = summaryGroups
+      .map((group) => group.targets.length > 0 ? `${group.labels.target}：${formatToolActivityTargets(group.targets)}` : "")
+      .filter(Boolean)
+      .join(" · ");
+
     return {
-      label: labels ? `${labels.running} ${runningCount} ${labels.noun}` : `正在调用工具 ${toolNames.join(", ")}...`,
-      detail: target ? `${labels?.running ?? "正在处理"} ${target}` : undefined,
+      label: label || (labels ? `${labels.running} ${runningCount} ${labels.noun}` : `正在调用工具 ${toolNames.join(", ")}...`),
+      detail: detail || (target ? `${labels?.running ?? "正在处理"} ${target}` : undefined),
       addedLines,
       removedLines,
       isRunning: true,
@@ -319,9 +1068,17 @@ function getToolGroupSummary(toolMessages: ChatMessage[]) {
   }
 
   if (allDone) {
+    const label = activityGroups
+      .map((group) => `${group.labels.completed} ${group.messages.length} ${group.labels.noun}`)
+      .join("，");
+    const detail = activityGroups
+      .map((group) => group.targets.length > 0 ? `${group.labels.target}：${formatToolActivityTargets(group.targets)}` : "")
+      .filter(Boolean)
+      .join(" · ");
+
     return {
-      label: labels ? `${labels.completed} ${toolMessages.length} ${labels.noun}` : `已完成 ${toolMessages.length} 次工具调用`,
-      detail: target ? `${labels?.completed ?? "已处理"} ${target}` : undefined,
+      label: label || (labels ? `${labels.completed} ${toolMessages.length} ${labels.noun}` : `已完成 ${toolMessages.length} 次工具调用`),
+      detail: detail || (target ? `${labels?.completed ?? "已处理"} ${target}` : undefined),
       addedLines,
       removedLines,
       isRunning: false,
@@ -433,6 +1190,9 @@ export default function App() {
   const [workspaceState, setWorkspaceState] = useState<WorkspaceState>(() => loadWorkspaceState());
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem(sidebarCollapsedStorageKey) === "true");
   const [sidebarWidth, setSidebarWidth] = useState(() => loadSidebarWidth());
+  const [projectSessionCollapsed, setProjectSessionCollapsed] = useState<Record<string, boolean>>(
+    () => loadProjectSessionCollapsedState()
+  );
   const [isSidebarResizing, setIsSidebarResizing] = useState(false);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [authConfigured, setAuthConfigured] = useState(true);
@@ -442,9 +1202,10 @@ export default function App() {
   const [loginPassword, setLoginPassword] = useState("");
   const [activeView, setActiveView] = useState<ActiveView>("chat");
   const [selectedSettingsSection, setSelectedSettingsSection] = useState<SettingsSectionId>("general");
-  const [mode, setMode] = useState<PermissionMode>("request_approval");
+  const [mode, setMode] = useState<PermissionMode>("workspace_write");
+  const [localApiToken, setLocalApiToken] = useState<string | undefined>();
   const [prompt, setPrompt] = useState("");
-  const [themePreference] = useState<ThemePreference>(() => {
+  const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
     const saved = localStorage.getItem("agent.themePreference");
     return saved === "dark" || saved === "light" || saved === "system" ? saved : "system";
   });
@@ -452,6 +1213,8 @@ export default function App() {
     window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"
   );
   const [runningSessionIds, setRunningSessionIds] = useState<Set<string>>(new Set());
+  const [taskTimers, setTaskTimers] = useState<Record<string, TaskTimerState>>({});
+  const [timerTick, setTimerTick] = useState(() => Date.now());
   const [health, setHealth] = useState<{ providerConfigured: boolean; model: string; provider?: string }>();
   const [modelOptions, setModelOptions] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState("");
@@ -459,28 +1222,89 @@ export default function App() {
   const [thinkingMode, setThinkingMode] = useState<ThinkingMode>("balanced");
   const [permissionMenuOpen, setPermissionMenuOpen] = useState(false);
   const [permissionOptions, setPermissionOptions] = useState<PermissionOption[]>(defaultPermissionOptions);
+  const [usageSummary, setUsageSummary] = useState<UsageSummary | undefined>();
+  const [toolCatalog, setToolCatalog] = useState<ToolCatalogItem[]>([]);
+  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  const [aiProviders, setAiProviders] = useState<AiProviderConfig[]>([]);
+  const [aiActiveProviderId, setAiActiveProviderId] = useState("");
+  const [mcpServers, setMcpServers] = useState<McpServerConfig[]>([]);
+  const [skills, setSkills] = useState<AgentSkill[]>([]);
+  const [memories, setMemories] = useState<MemoryItem[]>([]);
+  const [subagents, setSubagents] = useState<SubagentDefinition[]>([]);
+  const [aiDraft, setAiDraft] = useState({
+    id: "",
+    displayName: "",
+    baseUrl: "",
+    apiKey: "",
+    defaultModel: "",
+    modelsPath: "/models",
+    chatCompletionsPath: "/chat/completions",
+    apiKeyEnv: "AI_API_KEY",
+    protocol: "openai-compatible" as string
+  });
+  const [aiDraftModels, setAiDraftModels] = useState<string[]>([]);
+  const [aiDraftModelStatus, setAiDraftModelStatus] = useState("");
+  const [aiDraftError, setAiDraftError] = useState("");
+  const [aiDraftFetchingModels, setAiDraftFetchingModels] = useState(false);
+  const [aiDraftSaving, setAiDraftSaving] = useState(false);
+  const [aiProviderStatus, setAiProviderStatus] = useState<Record<string, string>>({});
+  const [aiProviderBusy, setAiProviderBusy] = useState<Record<string, "activate" | "delete" | "test">>({});
+  const [showAddProviderModal, setShowAddProviderModal] = useState(false);
+  const [editingAiProviderId, setEditingAiProviderId] = useState<string | undefined>();
+  const [selectedProviders, setSelectedProviders] = useState<Set<string>>(new Set());
+  const [mcpDraft, setMcpDraft] = useState({ name: "", command: "", url: "" });
+  const [usageActivityMode, setUsageActivityMode] = useState<UsageActivityMode>("daily");
   const isDesktopClient = Boolean(window.agentDesktop?.isDesktopClient);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messageListRef = useRef<HTMLDivElement>(null);
+  const usageActivityScrollRef = useRef<HTMLDivElement>(null);
   const workspaceStateRef = useRef(workspaceState);
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const themeToggleRef = useRef<HTMLButtonElement>(null);
+  const themeTransitionRef = useRef<{ overlay: HTMLDivElement; timeoutId: number } | null>(null);
   const queuedPromptsRef = useRef<Map<string, QueuedPrompt[]>>(new Map());
-  const swipeStartRef = useRef<Map<string, { x: number; y: number }>>(new Map());
+  const sessionWheelSwipeRef = useRef<Map<string, { offset: number; timeoutId?: number }>>(new Map());
   const [queueVersion, setQueueVersion] = useState(0);
-  const [swipedSessionId, setSwipedSessionId] = useState<string | undefined>();
+  const [sessionSwipeOffsets, setSessionSwipeOffsets] = useState<Record<string, number>>({});
   // 追踪用户手动关闭的工具折叠组，避免重渲染时自动展开
   const manualClosedGroupsRef = useRef<Set<string>>(new Set());
   // diff 对比面板
   const [diffPanel, setDiffPanel] = useState<DiffResult | null>(null);
+  const [diffSearch, setDiffSearch] = useState("");
+  const [diffChangesOnly, setDiffChangesOnly] = useState(false);
+  const [diffPathCopied, setDiffPathCopied] = useState(false);
+  const [diffView, setDiffView] = useState<DiffViewMode>("split");
+  const [reviewDiffScope, setReviewDiffScope] = useState<DiffResult[] | null>(null);
+  // 最终交付卡默认保持 Codex 式的一行摘要；完整文件清单按需展开，
+  // 所有变更始终可在审核面板右侧切换。
+  const [expandedArtifactCards, setExpandedArtifactCards] = useState<Set<string>>(() => new Set());
 
   function markSessionRunning(sessionId: string) {
+    const now = Date.now();
     setRunningSessionIds((cur) => new Set(cur).add(sessionId));
+    setTaskTimers((cur) => ({
+      ...cur,
+      [sessionId]: { startedAt: now, elapsedMs: 0 }
+    }));
+    setTimerTick(now);
   }
   function markSessionIdle(sessionId: string) {
+    const now = Date.now();
     setRunningSessionIds((cur) => {
       const next = new Set(cur);
       next.delete(sessionId);
       return next;
     });
+    setTaskTimers((cur) => {
+      const current = cur[sessionId];
+      if (!current?.startedAt) return cur;
+      return {
+        ...cur,
+        [sessionId]: {
+          elapsedMs: current.elapsedMs + Math.max(0, now - current.startedAt)
+        }
+      };
+    });
+    setTimerTick(now);
   }
 
   const resolvedTheme = themePreference === "system" ? systemTheme : themePreference;
@@ -503,6 +1327,13 @@ export default function App() {
   const pendingApprovals = activeSession?.pendingApprovals ?? [];
   const conversationId = activeSession?.conversationId;
   const isActiveSessionRunning = activeSession ? runningSessionIds.has(activeSession.id) : false;
+  const activeTaskTimer = activeSession ? taskTimers[activeSession.id] : undefined;
+  const activeTaskElapsedMs = activeTaskTimer
+    ? activeTaskTimer.startedAt
+      ? activeTaskTimer.elapsedMs + Math.max(0, timerTick - activeTaskTimer.startedAt)
+      : activeTaskTimer.elapsedMs
+    : 0;
+  const shouldShowTaskDuration = Boolean(activeTaskTimer && (isActiveSessionRunning || activeTaskElapsedMs > 0));
   const hasVisibleProcess =
     isActiveSessionRunning ||
     pendingApprovals.length > 0 ||
@@ -514,10 +1345,74 @@ export default function App() {
   const visibleMessages = useMemo(
     () =>
       completedViewMessageIds
-        ? messages.filter((message) => message.role !== "tool" && completedViewMessageIds.has(message.id))
+        ? messages.filter((message) => {
+            if (message.role !== "tool") return completedViewMessageIds.has(message.id);
+            // 会话完成后压缩普通工具日志，但保留带有成功 diff 的编辑操作。
+            // 编辑产物卡片与“审核”入口均由这些消息驱动，不能一并过滤。
+            return Boolean(message.diff && message.toolResult?.ok !== false);
+          })
         : messages,
     [completedViewMessageIds, messages]
   );
+  const reviewDiffs = useMemo(() => {
+    const diffs = new Map<string, DiffResult>();
+    if (reviewDiffScope) {
+      reviewDiffScope.forEach((diff) => diffs.set(normalizeFilePath(diff.filePath), diff));
+    } else {
+      messages.forEach((message) => {
+        if (message.diff && message.toolResult?.ok !== false) {
+          diffs.set(normalizeFilePath(message.diff.filePath), message.diff);
+        }
+      });
+    }
+    if (diffPanel) {
+      diffs.set(normalizeFilePath(diffPanel.filePath), diffPanel);
+    }
+    return [...diffs.values()].sort((a, b) => normalizeFilePath(a.filePath).localeCompare(normalizeFilePath(b.filePath)));
+  }, [diffPanel, messages, reviewDiffScope]);
+  const diffReviewRows = useMemo(() => (diffPanel ? getDiffReviewRows(diffPanel) : []), [diffPanel]);
+  const filteredReviewDiffs = useMemo(() => {
+    const query = diffSearch.trim().toLocaleLowerCase();
+    if (!query) return reviewDiffs;
+    return reviewDiffs.filter((diff) => diff.filePath.toLocaleLowerCase().includes(query));
+  }, [diffSearch, reviewDiffs]);
+  const reviewTotals = useMemo(
+    () => reviewDiffs.reduce(
+      (totals, diff) => ({ added: totals.added + diff.addedLines, removed: totals.removed + diff.removedLines }),
+      { added: 0, removed: 0 }
+    ),
+    [reviewDiffs]
+  );
+  const visibleDiffReviewRows = useMemo(
+    () => diffChangesOnly
+      ? diffReviewRows.filter((row): row is Extract<DiffReviewRow, { kind: "line" }> => row.kind === "line" && row.line.type !== "same")
+      : diffReviewRows,
+    [diffChangesOnly, diffReviewRows]
+  );
+  const splitDiffReviewRows = useMemo(
+    () => getSplitDiffReviewRows(visibleDiffReviewRows),
+    [visibleDiffReviewRows]
+  );
+  const activeReviewIndex = diffPanel
+    ? reviewDiffs.findIndex((diff) => normalizeFilePath(diff.filePath) === normalizeFilePath(diffPanel.filePath))
+    : -1;
+
+  const selectAdjacentReviewFile = (direction: -1 | 1) => {
+    if (reviewDiffs.length < 2 || activeReviewIndex < 0) return;
+    const nextIndex = (activeReviewIndex + direction + reviewDiffs.length) % reviewDiffs.length;
+    setDiffPanel(reviewDiffs[nextIndex]);
+  };
+
+  const copyReviewFilePath = async () => {
+    if (!diffPanel || !navigator.clipboard) return;
+    try {
+      await navigator.clipboard.writeText(diffPanel.filePath);
+      setDiffPathCopied(true);
+      window.setTimeout(() => setDiffPathCopied(false), 1600);
+    } catch {
+      setDiffPathCopied(false);
+    }
+  };
   const activeQueuedPrompts = useMemo(
     () => (activeSession ? (queuedPromptsRef.current.get(activeSession.id) ?? []) : []),
     [activeSession, queueVersion]
@@ -530,6 +1425,18 @@ export default function App() {
     () => ({ "--sidebar-width": `${sidebarWidth}px` }) as CSSProperties,
     [sidebarWidth]
   );
+  const aiDraftId = useMemo(
+    () => aiDraft.id.trim() || aiDraft.displayName.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, ""),
+    [aiDraft.displayName, aiDraft.id]
+  );
+  const aiDraftCanSave = Boolean(aiDraftId && aiDraft.baseUrl.trim() && aiDraft.defaultModel.trim());
+
+  useEffect(() => {
+    if (selectedSettingsSection !== "usage") return;
+    const node = usageActivityScrollRef.current;
+    if (!node) return;
+    node.scrollLeft = node.scrollWidth;
+  }, [selectedSettingsSection, usageActivityMode, usageSummary?.daily?.length]);
 
   useEffect(() => {
     workspaceStateRef.current = workspaceState;
@@ -545,8 +1452,38 @@ export default function App() {
   }, [sidebarWidth]);
 
   useEffect(() => {
+    localStorage.setItem(projectSessionCollapsedStorageKey, JSON.stringify(projectSessionCollapsed));
+  }, [projectSessionCollapsed]);
+
+  useEffect(() => {
     localStorage.setItem("agent.themePreference", themePreference);
+    void window.agentDesktop?.setThemePreference?.(themePreference);
   }, [themePreference]);
+
+  useEffect(() => {
+    void window.agentDesktop?.getThemePreference?.().then((saved) => {
+      if (saved === "dark" || saved === "light" || saved === "system") {
+        setThemePreference(saved);
+        localStorage.setItem("agent.themePreference", saved);
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (!themeTransitionRef.current) return;
+      window.clearTimeout(themeTransitionRef.current.timeoutId);
+      themeTransitionRef.current.overlay.remove();
+      document.querySelector(".desktopShell")?.classList.remove("theme-transitioning");
+      themeTransitionRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    void window.agentDesktop?.getLocalApiToken?.().then((token) => {
+      if (token) setLocalApiToken(token);
+    });
+  }, []);
 
   useEffect(() => {
     fetch(`${API_BASE}/api/health`)
@@ -592,6 +1529,41 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (isDesktopClient && !localApiToken) return;
+    const headers = getLocalApiHeaders();
+    void Promise.all([
+      fetch(`${API_BASE}/api/tools`, { headers }).then((r) => r.ok ? r.json() : { tools: [] }),
+      fetch(`${API_BASE}/api/audit`, { headers }).then((r) => r.ok ? r.json() : { events: [] }),
+      fetch(`${API_BASE}/api/usage`, { headers }).then((r) => r.ok ? r.json() : undefined),
+      fetch(`${API_BASE}/api/ai/providers`, { headers }).then((r) => r.ok ? r.json() : { providers: [], activeProviderId: "" }),
+      fetch(`${API_BASE}/api/mcp/servers`, { headers }).then((r) => r.ok ? r.json() : { servers: [] }),
+      fetch(`${API_BASE}/api/skills${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { skills: [] }),
+      fetch(`${API_BASE}/api/memory${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { memories: [] }),
+      fetch(`${API_BASE}/api/agents${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { agents: [] })
+    ]).then(([toolsData, auditData, usageData, aiData, mcpData, skillsData, memoryData, agentsData]) => {
+      setToolCatalog(toolsData.tools ?? []);
+      setAuditEvents(auditData.events ?? []);
+      setUsageSummary(usageData);
+      setAiProviders(aiData.providers ?? []);
+      setAiActiveProviderId(aiData.activeProviderId ?? "");
+      setMcpServers(mcpData.servers ?? []);
+      setSkills(skillsData.skills ?? []);
+      setMemories(memoryData.memories ?? []);
+      setSubagents(agentsData.agents ?? []);
+    }).catch(() => {
+      setToolCatalog([]);
+      setAuditEvents([]);
+      setUsageSummary(undefined);
+      setAiProviders([]);
+      setAiActiveProviderId("");
+      setMcpServers([]);
+      setSkills([]);
+      setMemories([]);
+      setSubagents([]);
+    });
+  }, [localApiToken, isDesktopClient, activeProject?.path]);
+
+  useEffect(() => {
     const query = window.matchMedia("(prefers-color-scheme: dark)");
     const handleChange = (e: MediaQueryListEvent) => setSystemTheme(e.matches ? "dark" : "light");
     query.addEventListener("change", handleChange);
@@ -599,8 +1571,44 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    if (!aiDraft.baseUrl.trim() || !aiDraft.apiKey.trim()) {
+      setAiDraftModels([]);
+      setAiDraftModelStatus("");
+      return;
+    }
+    const timeoutId = window.setTimeout(() => {
+      void fetchAiDraftModels({ silent: true });
+    }, 900);
+    return () => window.clearTimeout(timeoutId);
+  }, [aiDraft.baseUrl, aiDraft.apiKey, aiDraft.modelsPath]);
+
+  useEffect(() => {
+    const messageList = messageListRef.current;
+    if (!messageList) return;
+    const frameId = window.requestAnimationFrame(() => {
+      // 直接滚动消息容器。末尾锚点的 scrollIntoView 在 Electron 的
+      // 嵌套 grid/overflow 布局中有时不会带动正确的滚动层。
+      messageList.scrollTo({
+        top: messageList.scrollHeight,
+        behavior: isActiveSessionRunning ? "smooth" : "auto"
+      });
+    });
+    return () => window.cancelAnimationFrame(frameId);
   }, [workspaceState.activeSessionId, messages.length, pendingApprovals.length, isActiveSessionRunning]);
+
+  useEffect(() => {
+    if (runningSessionIds.size === 0) return undefined;
+    const intervalId = window.setInterval(() => setTimerTick(Date.now()), 1000);
+    return () => window.clearInterval(intervalId);
+  }, [runningSessionIds]);
+
+  function setAiProviderBusyState(id: string, state?: "activate" | "delete" | "test") {
+    setAiProviderBusy((cur) => {
+      const next = { ...cur };
+      if (state) next[id] = state; else delete next[id];
+      return next;
+    });
+  }
 
   function updateSession(projectId: string, sessionId: string, updater: (session: ProjectSession) => ProjectSession) {
     setWorkspaceState((cur) => ({
@@ -615,6 +1623,7 @@ export default function App() {
 
   function selectProject(project: AgentProject) {
     const firstSession = project.sessions.find((session) => !session.archivedAt) ?? createSession();
+    expandProjectSessions(project.id);
     setActiveView("chat");
     setWorkspaceState((cur) => ({
       ...cur,
@@ -629,17 +1638,22 @@ export default function App() {
   }
 
   function selectSession(projectId: string, sessionId: string) {
-    setSwipedSessionId(undefined);
+    resetSessionSwipe(sessionId);
     setActiveView("chat");
     setWorkspaceState((cur) => ({ ...cur, activeProjectId: projectId, activeSessionId: sessionId }));
   }
 
   function addProject(project: AgentProject) {
-    setWorkspaceState((cur) => ({
-      projects: [project, ...cur.projects],
-      activeProjectId: project.id,
-      activeSessionId: project.sessions[0].id
-    }));
+    expandProjectSessions(project.id);
+    setWorkspaceState((cur) => {
+      const regularProjects = cur.projects.filter((item) => item.kind !== "temporary");
+      const temporaryProject = cur.projects.find((item) => item.kind === "temporary") ?? createTemporaryProject();
+      return normalizeWorkspaceState({
+        projects: [project, ...regularProjects, temporaryProject],
+        activeProjectId: project.id,
+        activeSessionId: project.sessions[0].id
+      });
+    });
   }
 
   async function addFolderProject() {
@@ -657,13 +1671,27 @@ export default function App() {
   }
 
   function startTemporarySession() {
-    const project = createProject("不使用项目", "temporary");
     const session = createSession("临时会话");
-    addProject({ ...project, sessions: [session], updatedAt: session.updatedAt });
+    expandProjectSessions(temporaryProjectId);
+    setActiveView("chat");
+    setWorkspaceState((cur) => {
+      const temporaryProject = cur.projects.find((project) => project.kind === "temporary") ?? createTemporaryProject([]);
+      const regularProjects = cur.projects.filter((project) => project.kind !== "temporary");
+      return normalizeWorkspaceState({
+        ...cur,
+        projects: [
+          ...regularProjects,
+          { ...temporaryProject, sessions: [session, ...temporaryProject.sessions], updatedAt: session.updatedAt }
+        ],
+        activeProjectId: temporaryProjectId,
+        activeSessionId: session.id
+      });
+    });
   }
 
   function addSession(projectId = workspaceState.activeProjectId) {
     const session = createSession();
+    expandProjectSessions(projectId);
     setActiveView("chat");
     setWorkspaceState((cur) => ({
       ...cur,
@@ -676,7 +1704,7 @@ export default function App() {
   }
 
   function archiveSession(projectId: string, sessionId: string) {
-    setSwipedSessionId(undefined);
+    resetSessionSwipe(sessionId);
     queuedPromptsRef.current.delete(sessionId);
     abortControllersRef.current.get(sessionId)?.abort();
     abortControllersRef.current.delete(sessionId);
@@ -709,37 +1737,69 @@ export default function App() {
     });
   }
 
-  function handleSessionPointerDown(sessionId: string, event: ReactPointerEvent<HTMLButtonElement>) {
-    event.currentTarget.setPointerCapture(event.pointerId);
-    swipeStartRef.current.set(sessionId, { x: event.clientX, y: event.clientY });
+  function expandProjectSessions(projectId: string) {
+    setProjectSessionCollapsed((cur) => {
+      if (!cur[projectId]) return cur;
+      const next = { ...cur };
+      delete next[projectId];
+      return next;
+    });
   }
 
-  function releaseSessionPointer(event: ReactPointerEvent<HTMLButtonElement>) {
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
+  function toggleProjectSessions(projectId: string) {
+    setProjectSessionCollapsed((cur) => {
+      const next = { ...cur };
+      if (next[projectId]) {
+        delete next[projectId];
+      } else {
+        next[projectId] = true;
+      }
+      return next;
+    });
   }
 
-  function handleSessionPointerMove(sessionId: string, event: ReactPointerEvent<HTMLButtonElement>) {
-    const start = swipeStartRef.current.get(sessionId);
-    if (!start) return;
-    const deltaX = event.clientX - start.x;
-    const deltaY = event.clientY - start.y;
-    if (deltaX < -28 && Math.abs(deltaX) > Math.abs(deltaY) * 1.4) {
-      setSwipedSessionId(sessionId);
-    }
+  function resetSessionSwipe(sessionId: string) {
+    const state = sessionWheelSwipeRef.current.get(sessionId);
+    if (state?.timeoutId) window.clearTimeout(state.timeoutId);
+    sessionWheelSwipeRef.current.delete(sessionId);
+    setSessionSwipeOffsets((cur) => {
+      if (!cur[sessionId]) return cur;
+      const next = { ...cur };
+      delete next[sessionId];
+      return next;
+    });
   }
 
-  function handleSessionPointerUp(projectId: string, sessionId: string, event: ReactPointerEvent<HTMLButtonElement>) {
-    const start = swipeStartRef.current.get(sessionId);
-    swipeStartRef.current.delete(sessionId);
-    releaseSessionPointer(event);
-    if (!start) return;
-    const deltaX = event.clientX - start.x;
-    const deltaY = event.clientY - start.y;
-    if (deltaX < -86 && Math.abs(deltaX) > Math.abs(deltaY) * 1.4) {
-      archiveSession(projectId, sessionId);
-    }
+  function setSessionSwipeOffset(sessionId: string, offset: number) {
+    const clamped = Math.max(0, Math.min(sessionArchiveSwipeMax, Math.round(offset)));
+    const current = sessionWheelSwipeRef.current.get(sessionId) ?? { offset: 0 };
+    sessionWheelSwipeRef.current.set(sessionId, { ...current, offset: clamped });
+    setSessionSwipeOffsets((cur) => ({ ...cur, [sessionId]: clamped }));
+  }
+
+  function handleSessionWheel(projectId: string, sessionId: string, event: ReactWheelEvent<HTMLDivElement>) {
+    const absX = Math.abs(event.deltaX);
+    const absY = Math.abs(event.deltaY);
+    if (absX < 4 || absX < absY * 1.15) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const current = sessionWheelSwipeRef.current.get(sessionId) ?? { offset: sessionSwipeOffsets[sessionId] ?? 0 };
+    if (current.timeoutId) window.clearTimeout(current.timeoutId);
+
+    const nextOffset = Math.max(0, Math.min(sessionArchiveSwipeMax, current.offset + event.deltaX));
+    setSessionSwipeOffset(sessionId, nextOffset);
+
+    const timeoutId = window.setTimeout(() => {
+      const finalOffset = sessionWheelSwipeRef.current.get(sessionId)?.offset ?? 0;
+      if (finalOffset >= sessionArchiveSwipeThreshold) {
+        archiveSession(projectId, sessionId);
+      } else {
+        resetSessionSwipe(sessionId);
+      }
+    }, 160);
+    sessionWheelSwipeRef.current.set(sessionId, { offset: nextOffset, timeoutId });
   }
 
   function getSessionContext(projectId: string, sessionId: string) {
@@ -835,15 +1895,79 @@ export default function App() {
     let currentAssistantId = _initialAssistantId;
     // 每次工具调用完成后，下一个 text_delta 需要新起一行
     let needNewAssistantRow = false;
+    // 编辑工具会把前置说明和最终交付拆成两条 assistant 消息。只有真正
+    // 收到工具之后的文本，才可以承载最终的“已编辑文件”交付卡。
+    // 否则（例如模型执行完工具后直接结束）主动创建一条稳定的交付消息。
+    let hasPostToolAssistantResponse = false;
+    // 当前 Agent 运行产生的文件变更，在最终回复上作为可审核交付物展示。
+    const runDiffs = new Map<string, DiffResult>();
+
+    const attachCompletion = (
+      status: Extract<MessageStatus, "completed" | "error">,
+      fallbackContent: string,
+      serverConversationId?: string
+    ) => {
+      const artifactDiffs = runDiffs.size > 0 ? [...runDiffs.values()] : undefined;
+      const completionContent = fallbackContent || (status === "error" ? "任务执行时发生错误。" : "任务已完成。");
+
+      updateSession(projectId, sessionId, (session) => {
+        // 一旦有成功编辑，最终交付必须位于工具调用之后。这样工具日志的
+        // 展开/折叠和模型是否补充结语，都不会影响“审核”卡片的可见性。
+        if (artifactDiffs?.length && !hasPostToolAssistantResponse) {
+          return {
+            ...session,
+            conversationId: serverConversationId || session.conversationId,
+            pendingApprovals: [],
+            messages: [
+              ...session.messages.map((message) =>
+                message.id === currentAssistantId ? { ...message, isStreaming: false } : message
+              ),
+              {
+                id: createId("message"),
+                role: "assistant" as const,
+                content: completionContent,
+                status,
+                artifactDiffs
+              }
+            ]
+          };
+        }
+
+        return {
+          ...session,
+          conversationId: serverConversationId || session.conversationId,
+          pendingApprovals: [],
+          messages: session.messages.map((message) =>
+            message.id === currentAssistantId
+              ? {
+                  ...message,
+                  isStreaming: false,
+                  status,
+                  content: message.content || completionContent,
+                  artifactDiffs
+                }
+              : message
+          )
+        };
+      });
+    };
 
     for await (const event of parseSseStream(response)) {
       switch (event.type) {
+        case "run_started":
+          updateSession(projectId, sessionId, (s) => ({
+            ...s,
+            conversationId: event.conversationId || s.conversationId
+          }));
+          break;
+
         case "text_delta": {
           if (needNewAssistantRow) {
             // 新起一行 assistant 消息
             const newId = createId("message");
             currentAssistantId = newId;
             needNewAssistantRow = false;
+            hasPostToolAssistantResponse = true;
             updateSession(projectId, sessionId, (s) => ({
               ...s,
               messages: [...s.messages, { id: newId, role: "assistant" as const, content: event.content ?? "", isStreaming: true }]
@@ -876,33 +2000,63 @@ export default function App() {
                   id: createId("message"),
                   role: "tool" as const,
                   content: "",
+                  toolCallId: event.toolCall!.id,
                   toolName: event.toolCall!.name,
                   toolArgs: event.toolCall!.arguments,
                   status: "running" as const
                 }
               ]
             }));
+            // 即使工具没有返回后续的 text_delta，也要在完成时生成独立交付。
+            hasPostToolAssistantResponse = false;
           }
+          break;
+
+        case "permission_decision":
           break;
 
         case "tool_result":
           if (event.result) {
+            const resultDiff = event.result.diff ?? event.result.diffs?.[0];
+            if (resultDiff && event.result.ok) {
+              runDiffs.set(normalizeFilePath(resultDiff.filePath), resultDiff);
+            }
             updateSession(projectId, sessionId, (s) => ({
               ...s,
-              messages: s.messages.map((m) =>
-                m.status === "running" && m.role === "tool"
-                  ? {
-                      ...m,
-                      content: event.result!.content,
-                      toolResult: { ok: event.result!.ok, content: event.result!.content },
-                      diff: event.result!.diff,
-                      status: "completed" as const
-                    }
-                  : m
-              )
+              messages: (() => {
+                let matched = false;
+                return s.messages.map((m) => {
+                  if (m.role !== "tool" || m.status !== "running") return m;
+                  const isMatchingTool = m.toolCallId ? m.toolCallId === event.result!.toolCallId : !matched;
+                  if (!isMatchingTool) return m;
+                  matched = true;
+                  return {
+                    ...m,
+                    content: event.result!.content,
+                    toolResult: { ok: event.result!.ok, content: event.result!.content },
+                    diff: resultDiff,
+                    status: "completed" as const
+                  };
+                });
+              })()
             }));
             // 下一个 text_delta 需要新起一行
             needNewAssistantRow = true;
+          }
+          break;
+
+        case "diff_created":
+          if (event.diffs && event.diffs.length > 0) {
+            event.diffs.forEach((diff) => runDiffs.set(normalizeFilePath(diff.filePath), diff));
+            updateSession(projectId, sessionId, (s) => ({
+              ...s,
+              messages: s.messages.map((m) => {
+                if (!isEditToolName(m.toolName) || m.diff) return m;
+                const rawPath = m.toolArgs?.path as string | undefined;
+                const matched = event.diffs?.find((diff) => rawPath && normalizeFilePath(diff.filePath).endsWith(normalizeFilePath(rawPath)));
+                return matched ? { ...m, diff: matched } : m;
+              })
+            }));
           }
           break;
 
@@ -920,28 +2074,11 @@ export default function App() {
           break;
 
         case "completed":
-          updateSession(projectId, sessionId, (s) => ({
-            ...s,
-            conversationId: event.conversationId || s.conversationId,
-            pendingApprovals: [],
-            messages: s.messages.map((m) =>
-              m.id === currentAssistantId
-                ? { ...m, isStreaming: false, status: "completed" as const, content: m.content || event.answer || "任务已完成。" }
-                : m
-            )
-          }));
+          attachCompletion("completed", event.answer || "任务已完成。", event.conversationId);
           break;
 
         case "error":
-          updateSession(projectId, sessionId, (s) => ({
-            ...s,
-            pendingApprovals: [],
-            messages: s.messages.map((m) =>
-              m.id === currentAssistantId
-                ? { ...m, isStreaming: false, status: "error" as const, content: event.message || "发生错误。" }
-                : m
-            )
-          }));
+          attachCompletion("error", event.message || "发生错误。", event.conversationId);
           break;
       }
     }
@@ -974,7 +2111,7 @@ export default function App() {
       const result = await fetch(`${API_BASE}/api/agent/run`, {
         method: "POST",
         signal: abortController.signal,
-        headers: { "content-type": "application/json" },
+        headers: getJsonHeaders(),
         body: JSON.stringify({
           prompt: content,
           mode,
@@ -1006,7 +2143,8 @@ export default function App() {
       }
     } finally {
       if (abortControllersRef.current.get(sessionId) === abortController) abortControllersRef.current.delete(sessionId);
-    markSessionIdle(sessionId);
+      markSessionIdle(sessionId);
+      void reloadPlatformData();
       void processNextQueuedPrompt(sessionId);
     }
   }
@@ -1045,7 +2183,7 @@ export default function App() {
       const result = await fetch(`${API_BASE}/api/agent/approve`, {
         method: "POST",
         signal: abortController.signal,
-        headers: { "content-type": "application/json" },
+        headers: getJsonHeaders(),
         body: JSON.stringify({
           approvalId,
           allow,
@@ -1070,7 +2208,7 @@ export default function App() {
       }
     } finally {
       if (abortControllersRef.current.get(sessionId) === abortController) abortControllersRef.current.delete(sessionId);
-    markSessionIdle(sessionId);
+      markSessionIdle(sessionId);
       void processNextQueuedPrompt(sessionId);
     }
   }
@@ -1090,13 +2228,101 @@ export default function App() {
   }
 
   function toggleSidebar() {
-    setSwipedSessionId(undefined);
+    sessionWheelSwipeRef.current.forEach((state) => {
+      if (state.timeoutId) window.clearTimeout(state.timeoutId);
+    });
+    sessionWheelSwipeRef.current.clear();
+    setSessionSwipeOffsets({});
     setSidebarCollapsed((collapsed) => !collapsed);
+  }
+
+  function setThemePreferenceWithTransition(nextPreference: ThemePreference, sourceElement?: HTMLElement | null) {
+    const nextResolvedTheme = nextPreference === "system" ? systemTheme : nextPreference;
+    if (nextPreference === themePreference) return;
+
+    if (nextResolvedTheme === resolvedTheme || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setThemePreference(nextPreference);
+      return;
+    }
+
+    if (themeTransitionRef.current) {
+      window.clearTimeout(themeTransitionRef.current.timeoutId);
+      themeTransitionRef.current.overlay.remove();
+      themeTransitionRef.current = null;
+    }
+
+    const anchor = sourceElement ?? themeToggleRef.current;
+    const rect = anchor?.getBoundingClientRect();
+    const cx = rect ? rect.left + rect.width / 2 : window.innerWidth / 2;
+    const cy = rect ? rect.top + rect.height / 2 : 48;
+    const shell = document.querySelector(".desktopShell") as HTMLElement | null;
+
+    const overlay = document.createElement("div");
+    overlay.className = `themeRevealOverlay ${nextResolvedTheme === "light" ? "to-light" : "to-dark"}`;
+    overlay.setAttribute("aria-hidden", "true");
+
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const farthestX = Math.max(cx, vw - cx);
+    const farthestY = Math.max(cy, vh - cy);
+    const diameter = Math.hypot(farthestX, farthestY) * 2.16;
+    const half = diameter / 2;
+
+    overlay.style.width = `${diameter}px`;
+    overlay.style.height = `${diameter}px`;
+    overlay.style.left = `${cx - half}px`;
+    overlay.style.top = `${cy - half}px`;
+    document.body.appendChild(overlay);
+
+    const finishTransition = () => {
+      if (themeTransitionRef.current?.overlay !== overlay) return;
+      if (shell) shell.classList.remove("theme-transitioning");
+      window.clearTimeout(themeTransitionRef.current.timeoutId);
+      overlay.remove();
+      themeTransitionRef.current = null;
+    };
+
+    const timeoutId = window.setTimeout(finishTransition, 1100);
+    themeTransitionRef.current = { overlay, timeoutId };
+
+    const onPhase1End = () => {
+      overlay.removeEventListener("animationend", onPhase1End);
+
+      if (shell) {
+        shell.classList.add("theme-transitioning");
+        shell.dataset.theme = nextResolvedTheme;
+      }
+
+      flushSync(() => {
+        setThemePreference(nextPreference);
+      });
+
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          overlay.classList.add("fading");
+          overlay.addEventListener("animationend", finishTransition, { once: true });
+        });
+      });
+    };
+    overlay.addEventListener("animationend", onPhase1End);
+  }
+
+  function handleThemeToggle(e: React.MouseEvent<HTMLButtonElement>) {
+    const targetTheme = resolvedTheme === "dark" ? "light" : "dark";
+    setThemePreferenceWithTransition(targetTheme, e.currentTarget);
   }
 
   function getAuthHeaders() {
     const token = localStorage.getItem(authTokenStorageKey);
     return token ? { authorization: `Bearer ${token}` } : undefined;
+  }
+
+  function getLocalApiHeaders(): HeadersInit {
+    return localApiToken ? { "x-agent-token": localApiToken } : {};
+  }
+
+  function getJsonHeaders(): HeadersInit {
+    return { "content-type": "application/json", ...getLocalApiHeaders() };
   }
 
   async function loadAuthSession() {
@@ -1105,11 +2331,16 @@ export default function App() {
       const response = await fetch(`${API_BASE}/api/auth/session`, { headers: getAuthHeaders() });
       const data = (await response.json()) as AuthSessionResponse;
       setAuthConfigured(data.configured);
-      setAuthUser(data.user);
-      if (!data.user) localStorage.removeItem(authTokenStorageKey);
+      if (data.configured) {
+        setAuthUser(data.user);
+        if (!data.user) localStorage.removeItem(authTokenStorageKey);
+      } else {
+        localStorage.removeItem(authTokenStorageKey);
+        setAuthUser(localModeUser);
+      }
     } catch {
       setAuthConfigured(false);
-      setAuthUser(null);
+      setAuthUser(localModeUser);
     } finally {
       setAuthLoading(false);
     }
@@ -1148,7 +2379,7 @@ export default function App() {
   async function logout() {
     const headers = getAuthHeaders();
     localStorage.removeItem(authTokenStorageKey);
-    setAuthUser(null);
+    setAuthUser(authConfigured ? null : localModeUser);
     setLoginPassword("");
     if (headers) {
       try {
@@ -1157,6 +2388,307 @@ export default function App() {
         /* ignore */
       }
     }
+  }
+
+  async function reloadPlatformData() {
+    const headers = getLocalApiHeaders();
+    const [mcpData, auditData, usageData, toolsData, aiData, skillsData, memoryData, agentsData] = await Promise.all([
+      fetch(`${API_BASE}/api/mcp/servers`, { headers }).then((r) => r.ok ? r.json() : { servers: [] }),
+      fetch(`${API_BASE}/api/audit`, { headers }).then((r) => r.ok ? r.json() : { events: [] }),
+      fetch(`${API_BASE}/api/usage`, { headers }).then((r) => r.ok ? r.json() : undefined),
+      fetch(`${API_BASE}/api/tools`, { headers }).then((r) => r.ok ? r.json() : { tools: [] }),
+      fetch(`${API_BASE}/api/ai/providers`, { headers }).then((r) => r.ok ? r.json() : { providers: [], activeProviderId: "" }),
+      fetch(`${API_BASE}/api/skills${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { skills: [] }),
+      fetch(`${API_BASE}/api/memory${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { memories: [] }),
+      fetch(`${API_BASE}/api/agents${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { agents: [] })
+    ]);
+    setMcpServers(mcpData.servers ?? []);
+    setAuditEvents(auditData.events ?? []);
+    setUsageSummary(usageData);
+    setToolCatalog(toolsData.tools ?? []);
+    setAiProviders(aiData.providers ?? []);
+    setAiActiveProviderId(aiData.activeProviderId ?? "");
+    setSkills(skillsData.skills ?? []);
+    setMemories(memoryData.memories ?? []);
+    setSubagents(agentsData.agents ?? []);
+  }
+
+  async function reloadRuntimeData() {
+    const [healthData, modelData] = await Promise.all([
+      fetch(`${API_BASE}/api/health`).then((r) => r.json()).catch(() => undefined),
+      fetch(`${API_BASE}/api/models`).then((r) => r.json()).catch(() => undefined)
+    ]);
+    if (healthData) {
+      setHealth(healthData);
+      setSelectedModel(healthData.model || "");
+    }
+    if (modelData) {
+      const recommended = modelData.recommendedForAgent ?? [];
+      const all = modelData.models?.map((m: { id: string }) => m.id) ?? [];
+      setModelOptions([...new Set([...recommended, ...all])]);
+    }
+  }
+
+  function applyAiPreset(provider: AiProviderConfig) {
+    setAiDraft({
+      id: provider.id,
+      displayName: provider.displayName,
+      baseUrl: provider.baseUrl,
+      apiKey: "",
+      defaultModel: provider.defaultModel,
+      modelsPath: provider.modelsPath || "/models",
+      chatCompletionsPath: "/chat/completions",
+      apiKeyEnv: "AI_API_KEY",
+      protocol: "openai-compatible"
+    });
+    setAiDraftModels([]);
+    setAiDraftError("");
+    setAiDraftModelStatus(provider.configured ? "可使用环境变量中的密钥，也可以在这里填写新密钥。" : "填写密钥后会自动获取上游模型。");
+  }
+
+  async function fetchAiDraftModels(options: { silent?: boolean } = {}) {
+    setAiDraftError("");
+    if (!aiDraft.baseUrl.trim()) {
+      setAiDraftModelStatus("请先填写 URL");
+      return;
+    }
+    if (!aiDraft.apiKey.trim()) {
+      setAiDraftModelStatus("请填写密钥后获取模型");
+      return;
+    }
+    setAiDraftFetchingModels(true);
+    if (!options.silent) setAiDraftModelStatus("正在获取模型...");
+    try {
+      const response = await fetch(`${API_BASE}/api/ai/providers/models`, {
+        method: "POST",
+        headers: getJsonHeaders(),
+        body: JSON.stringify({
+          id: aiDraft.id.trim() || "draft",
+          displayName: aiDraft.displayName.trim() || "Draft provider",
+          baseUrl: aiDraft.baseUrl.trim(),
+          apiKey: aiDraft.apiKey.trim(),
+          modelsPath: aiDraft.modelsPath.trim() || "/models",
+          defaultModel: aiDraft.defaultModel.trim()
+        })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "获取模型失败");
+      if (data.error) throw new Error(data.error);
+      const models = (data.models ?? []).map((model: { id: string }) => model.id).filter(Boolean);
+      setAiDraftModels(models);
+      setAiDraftModelStatus(models.length ? `已获取 ${models.length} 个模型` : "未发现模型，请检查 URL 或密钥权限");
+      if (models.length && !models.includes(aiDraft.defaultModel)) {
+        setAiDraft((cur) => ({ ...cur, defaultModel: models[0] }));
+      }
+    } catch (error) {
+      setAiDraftModels([]);
+      setAiDraftModelStatus(error instanceof Error ? error.message : "获取模型失败");
+    } finally {
+      setAiDraftFetchingModels(false);
+    }
+  }
+
+  async function saveAiProviderFromDraft() {
+    if (!aiDraftCanSave) {
+      setAiDraftError("请至少填写接口 ID/名称、Base URL 和默认模型。");
+      return;
+    }
+    setAiDraftSaving(true);
+    setAiDraftError("");
+    try {
+      const response = await fetch(`${API_BASE}/api/ai/providers`, {
+        method: "POST",
+        headers: getJsonHeaders(),
+        body: JSON.stringify({
+          id: aiDraftId,
+          displayName: aiDraft.displayName.trim() || aiDraftId,
+          baseUrl: aiDraft.baseUrl.trim(),
+          apiKey: aiDraft.apiKey.trim() || undefined,
+          apiKeyEnv: aiDraft.apiKeyEnv.trim() || "AI_API_KEY",
+          defaultModel: aiDraft.defaultModel.trim(),
+          modelsPath: aiDraft.modelsPath.trim() || "/models",
+          chatCompletionsPath: aiDraft.chatCompletionsPath.trim() || "/chat/completions",
+          protocol: aiDraft.protocol || "openai-compatible",
+          enabled: true
+        })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "保存接口失败");
+      if (editingAiProviderId === aiActiveProviderId) {
+        await fetch(`${API_BASE}/api/ai/providers/${encodeURIComponent(aiDraftId)}/activate`, {
+          method: "POST",
+          headers: getLocalApiHeaders()
+        });
+      }
+      setAiDraft({ id: "", displayName: "", baseUrl: "", apiKey: "", defaultModel: "", modelsPath: "/models", chatCompletionsPath: "/chat/completions", apiKeyEnv: "AI_API_KEY", protocol: "openai-compatible" });
+      setAiDraftModels([]);
+      setAiDraftModelStatus("");
+      setShowAddProviderModal(false);
+      setEditingAiProviderId(undefined);
+      await Promise.all([reloadPlatformData(), reloadRuntimeData()]);
+    } catch (error) {
+      setAiDraftError(error instanceof Error ? error.message : "保存接口失败");
+    } finally {
+      setAiDraftSaving(false);
+    }
+  }
+
+  function openNewAiProvider() {
+    setEditingAiProviderId(undefined);
+    setAiDraft({ id: "", displayName: "", baseUrl: "", apiKey: "", defaultModel: "", modelsPath: "/models", chatCompletionsPath: "/chat/completions", apiKeyEnv: "AI_API_KEY", protocol: "openai-compatible" });
+    setAiDraftModels([]);
+    setAiDraftModelStatus("");
+    setAiDraftError("");
+    setShowAddProviderModal(true);
+  }
+
+  function openEditAiProvider(provider: AiProviderConfig) {
+    setEditingAiProviderId(provider.id);
+    setAiDraft({
+      id: provider.id,
+      displayName: provider.displayName,
+      baseUrl: provider.baseUrl,
+      apiKey: "",
+      defaultModel: provider.defaultModel,
+      modelsPath: provider.modelsPath || "/models",
+      chatCompletionsPath: provider.chatCompletionsPath || "/chat/completions",
+      apiKeyEnv: provider.apiKeyEnv || "AI_API_KEY",
+      protocol: "openai-compatible"
+    });
+    setAiDraftModels([]);
+    setAiDraftModelStatus(provider.configured ? "输入新密钥以替换当前密钥" : "请输入 API Key");
+    setAiDraftError("");
+    setShowAddProviderModal(true);
+  }
+
+  async function activateAiProvider(id: string) {
+    setAiProviderBusyState(id, "activate");
+    try {
+      const response = await fetch(`${API_BASE}/api/ai/providers/${encodeURIComponent(id)}/activate`, {
+        method: "POST",
+        headers: getLocalApiHeaders()
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "切换接口失败");
+      setAiProviderStatus((cur) => ({ ...cur, [id]: "已设为当前接口" }));
+      await Promise.all([reloadPlatformData(), reloadRuntimeData()]);
+    } catch (error) {
+      setAiProviderStatus((cur) => ({ ...cur, [id]: error instanceof Error ? `失败：${error.message}` : "切换接口失败" }));
+    } finally {
+      setAiProviderBusyState(id);
+    }
+  }
+
+  async function testAiProvider(id: string) {
+    setAiProviderBusyState(id, "test");
+    setAiProviderStatus((cur) => ({ ...cur, [id]: "测试中..." }));
+    try {
+      const response = await fetch(`${API_BASE}/api/ai/providers/${encodeURIComponent(id)}/test`, {
+        method: "POST",
+        headers: getLocalApiHeaders()
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "测试失败");
+      setAiProviderStatus((cur) => ({
+        ...cur,
+        [id]: data.ok ? `连接正常，发现 ${data.modelCount ?? 0} 个模型` : `失败：${data.error ?? "无法连接"}`
+      }));
+    } catch (error) {
+      setAiProviderStatus((cur) => ({ ...cur, [id]: error instanceof Error ? error.message : "测试失败" }));
+    } finally {
+      setAiProviderBusyState(id);
+    }
+  }
+
+  async function deleteAiProvider(id: string) {
+    setAiProviderBusyState(id, "delete");
+    try {
+      const response = await fetch(`${API_BASE}/api/ai/providers/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        headers: getLocalApiHeaders()
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "删除接口失败");
+      setSelectedProviders((cur) => {
+        const next = new Set(cur);
+        next.delete(id);
+        return next;
+      });
+      await Promise.all([reloadPlatformData(), reloadRuntimeData()]);
+    } catch (error) {
+      setAiProviderStatus((cur) => ({ ...cur, [id]: error instanceof Error ? `失败：${error.message}` : "删除接口失败" }));
+    } finally {
+      setAiProviderBusyState(id);
+    }
+  }
+
+  async function batchDeleteAiProviders() {
+    if (selectedProviders.size === 0) return;
+    const ids = Array.from(selectedProviders);
+    ids.forEach((id) => setAiProviderBusyState(id, "delete"));
+    const response = await fetch(`${API_BASE}/api/ai/providers/batch-delete`, {
+      method: "POST",
+      headers: getJsonHeaders(),
+      body: JSON.stringify({ ids })
+    });
+    ids.forEach((id) => setAiProviderBusyState(id));
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      setAiProviderStatus((cur) => ({ ...cur, [ids[0]]: typeof data.error === "string" ? `失败：${data.error}` : "批量删除失败" }));
+      return;
+    }
+    setSelectedProviders(new Set());
+    await Promise.all([reloadPlatformData(), reloadRuntimeData()]);
+  }
+
+  function toggleProviderSelect(id: string) {
+    setSelectedProviders((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleSelectAllProviders() {
+    const userProviders = aiProviders.filter((p) => p.source === "user");
+    if (selectedProviders.size === userProviders.length) {
+      setSelectedProviders(new Set());
+    } else {
+      setSelectedProviders(new Set(userProviders.map((p) => p.id)));
+    }
+  }
+
+  async function saveMcpServer(server: Partial<McpServerConfig>) {
+    await fetch(`${API_BASE}/api/mcp/servers`, {
+      method: "POST",
+      headers: getJsonHeaders(),
+      body: JSON.stringify(server)
+    });
+    await reloadPlatformData();
+  }
+
+  async function deleteMcpServer(id: string) {
+    await fetch(`${API_BASE}/api/mcp/servers/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: getLocalApiHeaders()
+    });
+    await reloadPlatformData();
+  }
+
+  async function addMcpServerFromDraft() {
+    const name = mcpDraft.name.trim();
+    if (!name) return;
+    const isHttp = Boolean(mcpDraft.url.trim());
+    await saveMcpServer({
+      name,
+      transport: isHttp ? "http" : "stdio",
+      url: isHttp ? mcpDraft.url.trim() : undefined,
+      command: isHttp ? undefined : mcpDraft.command.trim(),
+      args: [],
+      enabled: true,
+      defaultApproval: "ask"
+    });
+    setMcpDraft({ name: "", command: "", url: "" });
   }
 
   function openSettingsPage(section: SettingsSectionId = "general") {
@@ -1179,6 +2711,7 @@ export default function App() {
     {
       title: "集成",
       items: [
+        { id: "ai", label: "AI 接口" },
         { id: "mcp", label: "MCP 服务器" }
       ]
     }
@@ -1193,14 +2726,72 @@ export default function App() {
     if (section === "general") return <Settings size={size} />;
     if (section === "profile") return <UserRound size={size} />;
     if (section === "usage") return <Brain size={size} />;
+    if (section === "ai") return <SlidersHorizontal size={size} />;
     return <Puzzle size={size} />;
+  }
+
+  function renderUsageActivityPanel(usage: UsageSummary) {
+    const activity = buildUsageActivityGrid(usage.daily ?? [], usageActivityMode);
+    const activeModeLabel =
+      usageActivityMode === "weekly" ? "每周汇总" : usageActivityMode === "total" ? "累计 Token" : "每日 Token";
+    return (
+      <div className="usageActivityPanel">
+        <div className="usageActivityHeader">
+          <h4>Token 活动</h4>
+          <div className="usageActivityTabs" role="tablist" aria-label="Token 活动范围">
+            {([
+              ["daily", "每日"],
+              ["weekly", "每周"],
+              ["total", "累计"]
+            ] as Array<[UsageActivityMode, string]>).map(([modeId, label]) => (
+              <button
+                className={usageActivityMode === modeId ? "active" : ""}
+                key={modeId}
+                type="button"
+                onClick={() => setUsageActivityMode(modeId)}
+                role="tab"
+                aria-selected={usageActivityMode === modeId}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+              <div className="usageHeatmapShell" ref={usageActivityScrollRef} aria-label={`Token 活动：${activeModeLabel}`}>
+          <div className="usageHeatmapGrid">
+            {activity.cells.map((cell) => (
+              <span
+                className={`usageHeatmapCell level${cell.level}`}
+                key={cell.dateKey}
+                title={`${cell.dateKey} · ${formatUsageNumber(cell.value)} token · ${formatUsageNumber(cell.calls)} 次调用`}
+              />
+            ))}
+          </div>
+          <div className="usageHeatmapMonths" aria-hidden="true">
+            {activity.monthLabels.map((item) => (
+              <span key={item.key} style={{ gridColumn: item.column }}>
+                {item.label}
+              </span>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
   }
 
   function renderSettingsContent() {
     if (activeSettingsSection === "profile") {
+      const usage = usageSummary ?? {
+        totals: { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0 },
+        prompts: { total: 0, sessionHits: 0, hitRate: 0 },
+        aiCalls: 0,
+        byModel: [],
+        daily: [],
+        recent: []
+      };
       return (
         <div className="settingsContentStack">
-          <section className="settingsPaneSection">
+          <section className="settingsPaneSection aiProviderSection">
             <div className="settingsPaneHeader">
               <h3>个人资料</h3>
               <p>当前登录身份与本机账号信息。</p>
@@ -1212,6 +2803,29 @@ export default function App() {
                 <small>{authUser?.username ?? "local"}</small>
               </span>
             </div>
+            <div className="usageOverviewGrid">
+              <div className="usageMetric">
+                <span>总 Token</span>
+                <strong>{formatUsageNumber(usage.totals.totalTokens)}</strong>
+                <small>输入 {formatUsageNumber(usage.totals.promptTokens)} · 输出 {formatUsageNumber(usage.totals.completionTokens)}</small>
+              </div>
+              <div className="usageMetric">
+                <span>会话命中率</span>
+                <strong>{formatPercent(usage.prompts.hitRate)}</strong>
+                <small>{formatUsageNumber(usage.prompts.sessionHits)} / {formatUsageNumber(usage.prompts.total)} 次继续已有会话</small>
+              </div>
+              <div className="usageMetric">
+                <span>AI 调用</span>
+                <strong>{formatUsageNumber(usage.aiCalls)}</strong>
+                <small>已记录的模型请求次数</small>
+              </div>
+              <div className="usageMetric">
+                <span>缓存 Token</span>
+                <strong>{formatUsageNumber(usage.totals.cachedTokens)}</strong>
+                <small>由上游返回的 cached_tokens</small>
+              </div>
+            </div>
+            {renderUsageActivityPanel(usage)}
           </section>
         </div>
       );
@@ -1240,8 +2854,326 @@ export default function App() {
                   <strong>默认权限模式</strong>
                   <small>{selectedPermission.label}</small>
                 </span>
-                <button type="button" onClick={() => setMode("request_approval")}>重置</button>
+                <button type="button" onClick={() => setMode("workspace_write")}>重置</button>
               </div>
+            </div>
+          </section>
+        </div>
+      );
+    }
+
+    if (activeSettingsSection === "ai") {
+      const userProviders = aiProviders.filter((p) => p.source === "user");
+      const allSelected = userProviders.length > 0 && selectedProviders.size === userProviders.length;
+      const activeProvider = aiProviders.find((provider) => provider.id === aiActiveProviderId || provider.active);
+      const configuredProviders = aiProviders.filter((provider) => provider.configured).length;
+      const missingProviders = aiProviders.length - configuredProviders;
+      return (
+        <div className="settingsContentStack">
+          <section className="settingsPaneSection">
+            <div className="settingsPaneHeader">
+              <h3>AI 接口</h3>
+              <p>管理 AI 模型接口，支持 OpenAI-compatible 协议。添加后可直接切换当前 Agent 使用的模型来源。</p>
+            </div>
+            <div className="aiProviderSummary">
+              <div>
+                <span>当前接口</span>
+                <strong>{activeProvider?.displayName ?? "未选择"}</strong>
+                <small>{activeProvider?.defaultModel ?? health?.model ?? "等待配置模型"}</small>
+              </div>
+              <div>
+                <span>可用密钥</span>
+                <strong>{configuredProviders}/{aiProviders.length}</strong>
+                <small>{missingProviders > 0 ? `${missingProviders} 个接口缺少密钥` : "所有接口均可测试"}</small>
+              </div>
+              <div>
+                <span>模型候选</span>
+                <strong>{modelOptions.length || 0}</strong>
+                <small>{health?.providerConfigured ? "聊天栏可直接切换" : "配置密钥后刷新"}</small>
+              </div>
+            </div>
+            <div className="aiProviderToolbar">
+              <button className="settingsBtnPrimary" type="button" onClick={openNewAiProvider}>
+                <Plus size={15} />
+                添加接口
+              </button>
+              {userProviders.length > 0 && (
+                <>
+                  <label className="aiSelectAll">
+                    <input type="checkbox" checked={allSelected} onChange={toggleSelectAllProviders} />
+                    全选 ({selectedProviders.size}/{userProviders.length})
+                  </label>
+                  {selectedProviders.size > 0 && (
+                    <button className="settingsBtnDanger" type="button" onClick={() => void batchDeleteAiProviders()}>
+                      批量删除 ({selectedProviders.size})
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+            <div className="settingsRows aiProviderList">
+              {aiProviders.length === 0 && (
+                <div className="settingsRow">
+                  <span>
+                    <strong>暂无接口</strong>
+                    <small>点击上方「添加接口」按钮新建，或通过 config/providers.json 配置内置接口。</small>
+                  </span>
+                </div>
+              )}
+              {aiProviders.map((provider) => {
+                const isActiveProvider = provider.id === aiActiveProviderId || provider.active;
+                const isSelected = selectedProviders.has(provider.id);
+                const statusText = aiProviderStatus[provider.id];
+                return (
+                  <div className={`settingsRow aiProviderRow ${isActiveProvider ? "aiProviderActive" : ""} ${isSelected ? "aiProviderSelected" : ""}`} key={provider.id}>
+                    <div className="aiProviderSelectCell">
+                      {provider.source === "user" ? (
+                        <input
+                          aria-label={`选择 ${provider.displayName}`}
+                          checked={isSelected}
+                          className="aiProviderCheckbox"
+                          onChange={() => toggleProviderSelect(provider.id)}
+                          type="checkbox"
+                        />
+                      ) : (
+                        <span className={`aiProviderStateDot ${provider.configured ? "ready" : "missing"}`} />
+                      )}
+                    </div>
+                    <span className="aiProviderInfo">
+                      <strong className="aiProviderTitle">
+                        <span className="aiProviderName">{provider.displayName}</span>
+                        {isActiveProvider ? <span className="aiProviderBadge">当前</span> : ""}
+                        {provider.source === "builtin" ? <span className="aiProviderBadgeBuiltin">内置</span> : ""}
+                        <span className={`aiProviderBadgeSoft ${provider.configured ? "ready" : "missing"}`}>
+                          {provider.configured ? "密钥已配置" : "缺少密钥"}
+                        </span>
+                      </strong>
+                      <small className="aiProviderMeta">{provider.id} · {provider.defaultModel}</small>
+                      <small className="aiProviderEndpoint">{provider.baseUrl}</small>
+                      {statusText ? (
+                        <small className={`aiProviderStatusLine ${statusText.includes("失败") || statusText.includes("required") ? "error" : statusText.includes("测试中") ? "testing" : "ok"}`}>
+                          {statusText}
+                        </small>
+                      ) : null}
+                    </span>
+                    <div className="aiProviderActions">
+                      <button className="aiProviderActionButton" type="button" onClick={() => openEditAiProvider(provider)} disabled={Boolean(aiProviderBusy[provider.id])}>
+                        {provider.configured ? "配置" : "填写密钥"}
+                      </button>
+                      <button className="aiProviderActionButton" type="button" onClick={() => void testAiProvider(provider.id)} disabled={Boolean(aiProviderBusy[provider.id])}>
+                        {aiProviderBusy[provider.id] === "test" ? "测试中" : "测试"}
+                      </button>
+                      <button className="aiProviderActionButton primary" type="button" onClick={() => void activateAiProvider(provider.id)} disabled={isActiveProvider || Boolean(aiProviderBusy[provider.id])}>
+                        {isActiveProvider ? "使用中" : aiProviderBusy[provider.id] === "activate" ? "切换中" : "设为当前"}
+                      </button>
+                      {provider.source === "user" && (
+                        <button className="aiProviderActionButton danger" type="button" onClick={() => void deleteAiProvider(provider.id)} disabled={Boolean(aiProviderBusy[provider.id])}>删除</button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+
+          {showAddProviderModal && (
+            <div className="modalOverlay" onClick={() => { setShowAddProviderModal(false); setEditingAiProviderId(undefined); }}>
+              <div className="modalContent" onClick={(e) => e.stopPropagation()}>
+                <div className="modalHeader">
+                  <h3>{editingAiProviderId ? "配置 AI 接口" : "添加 AI 接口"}</h3>
+                  <button className="modalClose" onClick={() => { setShowAddProviderModal(false); setEditingAiProviderId(undefined); }}>&times;</button>
+                </div>
+                <div className="modalBody">
+                  <div className="aiFormField">
+                    <label>协议类型</label>
+                    <select value={aiDraft.protocol} onChange={(e) => setAiDraft((cur) => ({ ...cur, protocol: e.target.value }))}>
+                      <option value="openai-compatible">OpenAI-compatible (推荐)</option>
+                    </select>
+                  </div>
+                  <div className="aiFormRow">
+                    <div className="aiFormField">
+                      <label>接口 ID</label>
+                      <input value={aiDraft.id} disabled={Boolean(editingAiProviderId)} onChange={(e) => setAiDraft((cur) => ({ ...cur, id: e.target.value }))} placeholder="如 deepseek" />
+                    </div>
+                    <div className="aiFormField">
+                      <label>显示名称</label>
+                      <input value={aiDraft.displayName} onChange={(e) => setAiDraft((cur) => ({ ...cur, displayName: e.target.value }))} placeholder="显示名称" />
+                    </div>
+                  </div>
+                  <div className="aiFormField">
+                    <label>Base URL</label>
+                    <input value={aiDraft.baseUrl} onChange={(e) => setAiDraft((cur) => ({ ...cur, baseUrl: e.target.value }))} placeholder="https://api.openai.com/v1" />
+                  </div>
+                  <div className="aiFormField">
+                    <label>API Key</label>
+                    <input type="password" value={aiDraft.apiKey} onChange={(e) => setAiDraft((cur) => ({ ...cur, apiKey: e.target.value }))} placeholder={editingAiProviderId ? "输入新的 API Key" : "sk-..."} />
+                  </div>
+                  <div className="aiModelDiscovery">
+                    <span>
+                      <strong>模型发现</strong>
+                      <small>{aiDraftModelStatus || "填写 Base URL 和 API Key 后可获取模型列表"}</small>
+                    </span>
+                    <button type="button" className="settingsBtnSecondary" onClick={() => void fetchAiDraftModels()} disabled={aiDraftFetchingModels || !aiDraft.baseUrl.trim() || !aiDraft.apiKey.trim()}>
+                      <RefreshCw size={14} />
+                      {aiDraftFetchingModels ? "获取中" : "获取模型"}
+                    </button>
+                  </div>
+                  <div className="aiFormRow">
+                    <div className="aiFormField">
+                      <label>默认模型</label>
+                      {aiDraftModels.length > 0 ? (
+                        <select value={aiDraft.defaultModel} onChange={(e) => setAiDraft((cur) => ({ ...cur, defaultModel: e.target.value }))}>
+                          {aiDraftModels.map((model) => (
+                            <option key={model} value={model}>{model}</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input value={aiDraft.defaultModel} onChange={(e) => setAiDraft((cur) => ({ ...cur, defaultModel: e.target.value }))} placeholder="gpt-4o" />
+                      )}
+                    </div>
+                    <div className="aiFormField">
+                      <label>环境变量名</label>
+                      <input value={aiDraft.apiKeyEnv} onChange={(e) => setAiDraft((cur) => ({ ...cur, apiKeyEnv: e.target.value }))} placeholder="AI_API_KEY" />
+                    </div>
+                  </div>
+                  <div className="aiFormRow">
+                    <div className="aiFormField">
+                      <label>Chat 路径</label>
+                      <input value={aiDraft.chatCompletionsPath} onChange={(e) => setAiDraft((cur) => ({ ...cur, chatCompletionsPath: e.target.value }))} placeholder="/chat/completions" />
+                    </div>
+                    <div className="aiFormField">
+                      <label>模型列表路径</label>
+                      <input value={aiDraft.modelsPath} onChange={(e) => setAiDraft((cur) => ({ ...cur, modelsPath: e.target.value }))} placeholder="/models" />
+                    </div>
+                  </div>
+                  {aiDraftError ? <div className="aiFormError">{aiDraftError}</div> : null}
+                </div>
+                <div className="modalFooter">
+                  <button type="button" className="settingsBtnSecondary" onClick={() => { setShowAddProviderModal(false); setEditingAiProviderId(undefined); }} disabled={aiDraftSaving}>取消</button>
+                  <button type="button" className="settingsBtnPrimary" onClick={() => void saveAiProviderFromDraft()} disabled={!aiDraftCanSave || aiDraftSaving}>
+                    <Save size={14} />
+                    {aiDraftSaving ? "保存中" : editingAiProviderId ? "保存配置" : "保存接口"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    if (activeSettingsSection === "mcp") {
+      return (
+        <div className="settingsContentStack">
+          <section className="settingsPaneSection">
+            <div className="settingsPaneHeader">
+              <h3>MCP 服务器</h3>
+              <p>连接外部工具和上下文源。MCP 工具会进入统一权限规则和审计记录。</p>
+            </div>
+            <div className="settingsRows">
+              <div className="settingsRow mcpDraftRow">
+                <span>
+                  <strong>添加服务器</strong>
+                  <small>填写 URL 创建 HTTP server，填写命令创建 stdio server。</small>
+                </span>
+                <input
+                  aria-label="MCP 名称"
+                  value={mcpDraft.name}
+                  onChange={(event) => setMcpDraft((cur) => ({ ...cur, name: event.target.value }))}
+                  placeholder="名称"
+                />
+                <input
+                  aria-label="MCP 命令"
+                  value={mcpDraft.command}
+                  onChange={(event) => setMcpDraft((cur) => ({ ...cur, command: event.target.value }))}
+                  placeholder="stdio 命令"
+                />
+                <input
+                  aria-label="MCP URL"
+                  value={mcpDraft.url}
+                  onChange={(event) => setMcpDraft((cur) => ({ ...cur, url: event.target.value }))}
+                  placeholder="https://..."
+                />
+                <button type="button" onClick={() => void addMcpServerFromDraft()}>添加</button>
+              </div>
+              {mcpServers.length === 0 && (
+                <div className="settingsRow">
+                  <span>
+                    <strong>暂无 MCP 服务器</strong>
+                    <small>添加后可以在这里启用、禁用或删除。</small>
+                  </span>
+                </div>
+              )}
+              {mcpServers.map((server) => (
+                <div className="settingsRow" key={server.id}>
+                  <span>
+                    <strong>{server.name}</strong>
+                    <small>{server.transport === "http" ? server.url : server.command} · {server.enabled ? "已启用" : "已停用"} · 默认 {server.defaultApproval}</small>
+                  </span>
+                  <button type="button" onClick={() => void saveMcpServer({ ...server, enabled: !server.enabled })}>
+                    {server.enabled ? "停用" : "启用"}
+                  </button>
+                  <button type="button" onClick={() => void deleteMcpServer(server.id)}>删除</button>
+                </div>
+              ))}
+            </div>
+          </section>
+        </div>
+      );
+    }
+
+    if (activeSettingsSection === "usage") {
+      const usage = usageSummary ?? {
+        totals: { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0 },
+        prompts: { total: 0, sessionHits: 0, hitRate: 0 },
+        aiCalls: 0,
+        byModel: [],
+        daily: [],
+        recent: []
+      };
+      return (
+        <div className="settingsContentStack">
+          <section className="settingsPaneSection usageSection">
+            <div className="settingsPaneHeader">
+              <h3>使用情况和计费</h3>
+              <p>按时间记录 token 活动、模型调用和缓存命中。</p>
+            </div>
+            {renderUsageActivityPanel(usage)}
+            <div className="usageOverviewGrid">
+              <div className="usageMetric">
+                <span>总 Token</span>
+                <strong>{formatUsageNumber(usage.totals.totalTokens)}</strong>
+                <small>输入 {formatUsageNumber(usage.totals.promptTokens)} · 输出 {formatUsageNumber(usage.totals.completionTokens)}</small>
+              </div>
+              <div className="usageMetric">
+                <span>AI 调用</span>
+                <strong>{formatUsageNumber(usage.aiCalls)}</strong>
+                <small>已记录模型请求次数</small>
+              </div>
+              <div className="usageMetric">
+                <span>缓存 Token</span>
+                <strong>{formatUsageNumber(usage.totals.cachedTokens)}</strong>
+                <small>上游返回的 cached_tokens</small>
+              </div>
+            </div>
+            <div className="settingsRows usageModelRows">
+              {usage.byModel.length === 0 ? (
+                <div className="settingsRow">
+                  <span>
+                    <strong>暂无 token 记录</strong>
+                    <small>完成一次模型调用后，这里会显示模型、调用次数和 token 用量。</small>
+                  </span>
+                </div>
+              ) : usage.byModel.map((model) => (
+                <div className="settingsRow" key={model.model}>
+                  <span>
+                    <strong>{model.model}</strong>
+                    <small>
+                      {formatUsageNumber(model.totalTokens)} token · {formatUsageNumber(model.calls)} 次调用 · 输入 {formatUsageNumber(model.promptTokens)} / 输出 {formatUsageNumber(model.completionTokens)}
+                    </small>
+                  </span>
+                </div>
+              ))}
             </div>
           </section>
         </div>
@@ -1306,6 +3238,15 @@ export default function App() {
               >
                 <PanelLeft size={16} />
               </button>
+              <button
+                className="topBarIconButton themeToggleBtn"
+                type="button"
+                aria-label={resolvedTheme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
+                title={resolvedTheme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
+                onClick={handleThemeToggle}
+              >
+                {resolvedTheme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+              </button>
               <button className="topBarIconButton muted" type="button" aria-label="返回">
                 <SquareChevronLeft size={16} />
               </button>
@@ -1316,7 +3257,7 @@ export default function App() {
             <div className="topBarMainZone">
               <div className="topBarTitle">
                 {activeView === "settings" ? <Settings size={17} /> : <MessageSquarePlus size={17} />}
-                <span>{activeView === "settings" ? selectedSettingsItem.label : activeSession?.title ?? "Agent Console"}</span>
+                <span>{activeView === "settings" ? selectedSettingsItem.label : activeSession?.title ?? "Rcode"}</span>
                 <button className="topBarGhostButton" type="button" aria-label="更多">
                   <MoreHorizontal size={18} />
                 </button>
@@ -1376,6 +3317,42 @@ export default function App() {
                       <kbd>⌘,</kbd>
                     </button>
                     <div className="accountMenuDivider" />
+                    <div className="accountThemePanel" role="radiogroup" aria-label="外观主题">
+                      <button
+                        className={themePreference === "light" ? "active" : ""}
+                        type="button"
+                        role="radio"
+                        aria-checked={themePreference === "light"}
+                        onClick={(event) => setThemePreferenceWithTransition("light", event.currentTarget)}
+                      >
+                        <Sun size={14} />
+                        <span>浅色</span>
+                        {themePreference === "light" && <Check size={13} />}
+                      </button>
+                      <button
+                        className={themePreference === "dark" ? "active" : ""}
+                        type="button"
+                        role="radio"
+                        aria-checked={themePreference === "dark"}
+                        onClick={(event) => setThemePreferenceWithTransition("dark", event.currentTarget)}
+                      >
+                        <Moon size={14} />
+                        <span>深色</span>
+                        {themePreference === "dark" && <Check size={13} />}
+                      </button>
+                      <button
+                        className={themePreference === "system" ? "active" : ""}
+                        type="button"
+                        role="radio"
+                        aria-checked={themePreference === "system"}
+                        onClick={(event) => setThemePreferenceWithTransition("system", event.currentTarget)}
+                      >
+                        <Monitor size={14} />
+                        <span>跟随系统</span>
+                        {themePreference === "system" && <Check size={13} />}
+                      </button>
+                    </div>
+                    <div className="accountMenuDivider" />
                     <button className="accountMenuItem" type="button" onClick={() => openSettingsPage("usage")}>
                       <Brain size={17} />
                       <span>剩余用量</span>
@@ -1399,7 +3376,7 @@ export default function App() {
                   <div className="accountLoginTitle">
                     <span>
                       <LogIn size={15} />
-                      {authConfigured ? "登录账号" : "账号未初始化"}
+                      {authConfigured ? "登录账号" : "本机模式"}
                     </span>
                     <button
                       className={`accountIconButton ${activeView === "settings" ? "active" : ""}`}
@@ -1426,7 +3403,7 @@ export default function App() {
                     placeholder="密码"
                   />
                   <button type="submit" disabled={authLoading || !authConfigured}>
-                    登录
+                    {authConfigured ? "登录" : "已进入本机模式"}
                   </button>
                   {authError && <span className="accountError">{authError}</span>}
                 </form>
@@ -1462,74 +3439,89 @@ export default function App() {
               {workspaceState.projects.map((project) => {
                 const isActiveProject = project.id === activeProject?.id;
                 const visibleSessions = project.sessions.filter((session) => !session.archivedAt);
+                const isSessionListCollapsed = Boolean(projectSessionCollapsed[project.id]);
+                const sessionListId = `project-session-list-${project.id}`;
                 return (
-                  <section className="projectGroup" key={project.id}>
-                    <button
+                  <section className={`projectGroup ${isSessionListCollapsed ? "collapsed" : ""}`} key={project.id}>
+                    <div
                       className={`projectRow ${isActiveProject ? "active" : ""}`}
-                      type="button"
                       title={`${project.name}${project.path ? ` · ${project.path}` : project.kind === "temporary" ? " · 临时会话" : " · 空项目"}`}
-                      onClick={() => selectProject(project)}
                     >
-                      {project.kind === "folder" ? (
-                        <Folder size={18} />
-                      ) : project.kind === "temporary" ? (
-                        <MessageSquarePlus size={18} />
-                      ) : (
-                        <HardDrive size={18} />
-                      )}
-                      <span>
-                        <strong>{project.name}</strong>
-                        <small>{project.path ?? (project.kind === "temporary" ? "临时会话" : "空项目")}</small>
-                      </span>
-                    </button>
+                      <button className="projectSelectButton" type="button" onClick={() => selectProject(project)}>
+                        {project.kind === "folder" ? (
+                          <Folder size={18} />
+                        ) : project.kind === "temporary" ? (
+                          <MessageSquarePlus size={18} />
+                        ) : (
+                          <HardDrive size={18} />
+                        )}
+                        <span>
+                          <strong>{project.name}</strong>
+                          <small>{project.path ?? (project.kind === "temporary" ? "临时会话" : "空项目")}</small>
+                        </span>
+                      </button>
+                      <button
+                        className="projectFoldButton"
+                        type="button"
+                        aria-label={isSessionListCollapsed ? `展开 ${project.name} 的会话` : `收起 ${project.name} 的会话`}
+                        aria-controls={sessionListId}
+                        aria-expanded={!isSessionListCollapsed}
+                        onClick={() => toggleProjectSessions(project.id)}
+                        title={isSessionListCollapsed ? "展开会话" : "收起会话"}
+                      >
+                        <ChevronDown size={15} />
+                      </button>
+                    </div>
 
-                    <div className="sessionList">
-                      {visibleSessions.length === 0 && <div className="emptySession">暂无对话</div>}
-                      {visibleSessions.map((session) => (
-                        <div
-                          className={`sessionSwipeRow ${swipedSessionId === session.id ? "swiped" : ""}`}
-                          key={session.id}
-                        >
-                          <button
-                            className="sessionArchiveAction"
-                            type="button"
-                            onClick={() => archiveSession(project.id, session.id)}
+                    <div
+                      className="sessionListShell"
+                      id={sessionListId}
+                      aria-hidden={isSessionListCollapsed}
+                      inert={isSessionListCollapsed ? true : undefined}
+                    >
+                      <div className="sessionList">
+                        {visibleSessions.length === 0 && <div className="emptySession">暂无对话</div>}
+                        {visibleSessions.map((session) => (
+                          <div
+                            className={`sessionSwipeRow ${(sessionSwipeOffsets[session.id] ?? 0) > 0 ? "swiping" : ""} ${(sessionSwipeOffsets[session.id] ?? 0) >= sessionArchiveSwipeThreshold ? "ready" : ""}`}
+                            key={session.id}
+                            onWheel={(event) => handleSessionWheel(project.id, session.id, event)}
+                            style={{ "--session-swipe-offset": `${sessionSwipeOffsets[session.id] ?? 0}px` } as CSSProperties}
                           >
-                            <Archive size={14} />
-                            归档
-                          </button>
-                          <button
-                            className={`sessionRow ${
-                              project.id === activeProject?.id && session.id === activeSession?.id ? "active" : ""
-                            } ${runningSessionIds.has(session.id) ? "running" : ""}`}
-                            type="button"
-                            onClick={() => {
-                              if (swipedSessionId === session.id) {
-                                setSwipedSessionId(undefined);
-                                return;
-                              }
-                              selectSession(project.id, session.id);
-                            }}
-                            onContextMenu={(event) => {
-                              event.preventDefault();
-                              archiveSession(project.id, session.id);
-                            }}
-                            onPointerDown={(event) => handleSessionPointerDown(session.id, event)}
-                            onPointerMove={(event) => handleSessionPointerMove(session.id, event)}
-                            onPointerUp={(event) => handleSessionPointerUp(project.id, session.id, event)}
-                            onPointerCancel={(event) => {
-                              swipeStartRef.current.delete(session.id);
-                              releaseSessionPointer(event);
-                            }}
-                          >
-                            <span className="sessionTitle">
-                              {runningSessionIds.has(session.id) && <span className="sessionRunningDot" aria-hidden="true" />}
-                              <span className="sessionTitleText">{session.title}</span>
-                            </span>
-                            <time>{getRelativeTime(session.updatedAt)}</time>
-                          </button>
-                        </div>
-                      ))}
+                            <button
+                              className="sessionArchiveAction"
+                              type="button"
+                              onClick={() => archiveSession(project.id, session.id)}
+                            >
+                              <Archive size={14} />
+                              归档
+                            </button>
+                            <button
+                              className={`sessionRow ${
+                                project.id === activeProject?.id && session.id === activeSession?.id ? "active" : ""
+                              } ${runningSessionIds.has(session.id) ? "running" : ""}`}
+                              type="button"
+                              onClick={() => {
+                                if ((sessionSwipeOffsets[session.id] ?? 0) > 0) {
+                                  resetSessionSwipe(session.id);
+                                  return;
+                                }
+                                selectSession(project.id, session.id);
+                              }}
+                              onContextMenu={(event) => {
+                                event.preventDefault();
+                                archiveSession(project.id, session.id);
+                              }}
+                            >
+                              <span className="sessionTitle">
+                                {runningSessionIds.has(session.id) && <span className="sessionRunningDot" aria-hidden="true" />}
+                                <span className="sessionTitleText">{session.title}</span>
+                              </span>
+                              <time>{getRelativeTime(session.updatedAt)}</time>
+                            </button>
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   </section>
                 );
@@ -1620,7 +3612,24 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className="messageList" aria-live="polite">
+                  <div className="messageList" aria-live="polite" ref={messageListRef}>
+                    {shouldShowTaskDuration && (
+                      <div className={`taskDurationBar ${isActiveSessionRunning ? "running" : ""}`}>
+                        <span className="taskDurationSpinner" aria-hidden="true" />
+                        <span className="taskDurationText">
+                          任务耗时 {formatTaskDuration(activeTaskElapsedMs)}
+                        </span>
+                        {isActiveSessionRunning && (
+                          <span className="thinkingWave" aria-hidden="true">
+                            <i />
+                            <i />
+                            <i />
+                            <i />
+                          </span>
+                        )}
+                        <ChevronDown size={17} strokeWidth={2.1} />
+                      </div>
+                    )}
                     {(() => {
                       // 把连续的 tool 消息合并成一个折叠行
                       type RenderItem =
@@ -1633,6 +3642,15 @@ export default function App() {
                           currentToolGroup.push(message);
                         } else {
                           if (currentToolGroup.length > 0) {
+                            const containsEdits = currentToolGroup.some((toolMessage) => isEditToolName(toolMessage.toolName));
+                            // 编辑产物属于这次 Agent 的最终交付：放在最终回复之后，
+                            // 让用户先读结论，再决定是否进入完整 diff 审核。
+                            if (message.role === "assistant" && containsEdits && message.status === "completed" && !message.isStreaming) {
+                              renderItems.push({ type: "single", message });
+                              renderItems.push({ type: "toolGroup", messages: currentToolGroup });
+                              currentToolGroup = [];
+                              continue;
+                            }
                             renderItems.push({ type: "toolGroup", messages: currentToolGroup });
                             currentToolGroup = [];
                           }
@@ -1643,17 +3661,112 @@ export default function App() {
                         renderItems.push({ type: "toolGroup", messages: currentToolGroup });
                       }
 
+                      const renderArtifactCard = (message: ChatMessage) => {
+                        if (!message.artifactDiffs?.length) return null;
+                        const artifactDiffs = [...new Map(
+                          message.artifactDiffs.map((diff) => [normalizeFilePath(diff.filePath), diff])
+                        ).values()];
+                        const addedLines = artifactDiffs.reduce((sum, diff) => sum + diff.addedLines, 0);
+                        const removedLines = artifactDiffs.reduce((sum, diff) => sum + diff.removedLines, 0);
+                        const firstDiff = artifactDiffs[0];
+                        const isExpanded = expandedArtifactCards.has(message.id);
+                        const firstDisplayPath = getDisplayFilePath(firstDiff.filePath, activeProject?.path);
+                        const remainingFileCount = artifactDiffs.length - 1;
+
+                        const toggleFileList = () => {
+                          setExpandedArtifactCards((current) => {
+                            const next = new Set(current);
+                            if (next.has(message.id)) next.delete(message.id); else next.add(message.id);
+                            return next;
+                          });
+                        };
+                        const openArtifactReview = (diff: DiffResult) => {
+                          setReviewDiffScope(artifactDiffs);
+                          setDiffPanel(diff);
+                        };
+
+                        return (
+                          <section className="codeEditCard deliverable finalArtifactCard" aria-label="本次编辑产物">
+                            <div className="codeEditHeader">
+                              <span className="codeEditIcon" aria-hidden="true">
+                                <Pencil size={24} strokeWidth={2.1} />
+                              </span>
+                              <div className="codeEditTitleBlock">
+                                <div className="codeEditTitleRow">
+                                  <strong>已编辑 {artifactDiffs.length} 个文件</strong>
+                                  <span className="codeEditTotalStats">
+                                    {addedLines > 0 && <span className="diffAdded">+{addedLines}</span>}
+                                    {removedLines > 0 && <span className="diffRemoved">-{removedLines}</span>}
+                                  </span>
+                                </div>
+                                <p>变更已保存，可打开左右 diff 进行代码审查。</p>
+                              </div>
+                              <div className="codeEditActions">
+                                <button
+                                  className="codeEditAction secondary"
+                                  type="button"
+                                  onClick={toggleFileList}
+                                  aria-expanded={isExpanded}
+                                >
+                                  {isExpanded ? "收起清单" : `文件 ${artifactDiffs.length}`}
+                                </button>
+                                <button className="codeEditAction review" type="button" onClick={() => openArtifactReview(firstDiff)}>
+                                  审核
+                                </button>
+                              </div>
+                            </div>
+                            {!isExpanded && (
+                              <button className="codeEditReviewHint" type="button" onClick={() => openArtifactReview(firstDiff)}>
+                                <FileText size={16} aria-hidden="true" />
+                                <span>
+                                  <strong>{firstDisplayPath}</strong>
+                                  {remainingFileCount > 0 && <small>以及另外 {remainingFileCount} 个文件</small>}
+                                </span>
+                                <ChevronRight size={17} aria-hidden="true" />
+                              </button>
+                            )}
+                            {isExpanded && (
+                              <div className="codeEditFileList">
+                                {artifactDiffs.map((diff) => {
+                                const displayPath = getDisplayFilePath(diff.filePath, activeProject?.path);
+                                const fileName = getFileName(displayPath);
+                                const dirName = displayPath === fileName ? "" : displayPath.slice(0, -fileName.length).replace(/\/$/, "");
+                                return (
+                                  <button className="codeEditFile" key={diff.filePath} type="button" onClick={() => openArtifactReview(diff)}>
+                                    <span className="codeEditFilePath">
+                                      {dirName && <span className="codeEditFileDir">{dirName}/</span>}
+                                      <span className="codeEditFileName">{fileName}</span>
+                                    </span>
+                                    <span className="codeEditFileKind">{getDiffEditKind(diff)}</span>
+                                    <span className="codeEditFileStats">
+                                      {diff.addedLines > 0 && <span className="diffAdded">+{diff.addedLines}</span>}
+                                      {diff.removedLines > 0 && <span className="diffRemoved">-{diff.removedLines}</span>}
+                                      {diff.addedLines === 0 && diff.removedLines === 0 && <span className="diffNeutral">0</span>}
+                                    </span>
+                                  </button>
+                                );
+                                })}
+                              </div>
+                            )}
+                          </section>
+                        );
+                      };
+
                       return renderItems.map((item) => {
                         if (item.type === "toolGroup") {
                           const toolMessages = item.messages;
                           const runningCount = toolMessages.filter((m) => m.status === "running").length;
                           const failCount = toolMessages.filter((m) => m.status === "completed" && m.toolResult && !m.toolResult.ok).length;
                           const hasRunning = runningCount > 0;
-                          const groupSummary = getToolGroupSummary(toolMessages);
+                          const groupSummary = getToolGroupSummary(toolMessages, activeProject?.path);
+                          const activityGroups = getToolActivityGroups(toolMessages, activeProject?.path);
                           const groupId = `group-${toolMessages[0].id}`;
                           const isManuallyClosed = manualClosedGroupsRef.current.has(groupId);
-                          // 用户手动关闭后不再自动打开；否则运行时自动展开
-                          const isOpen = !isManuallyClosed && hasRunning;
+                          const isEditToolGroup = toolMessages.some((message) => isEditToolName(message.toolName));
+                          // 编辑状态保持为紧凑提示，避免补丁内容在执行期间占满聊天流。
+                          // 用户仍可展开查看每一步工具详情；完成后会显示完整的差异交付卡。
+                          const isOpen = !isManuallyClosed && hasRunning && !isEditToolGroup;
+                          if (isEditToolGroup && !hasRunning) return null;
 
                           return (
                             <details
@@ -1668,13 +3781,15 @@ export default function App() {
                               }}
                             >
                               <summary className="toolToggleSummary">
-                                {groupSummary.primaryTool === "write_file" ? (
-                                  <Pencil size={17} strokeWidth={2} />
-                                ) : groupSummary.primaryTool === "read_file" ? (
-                                  <FileText size={17} strokeWidth={2} />
-                                ) : (
-                                  <Terminal size={17} strokeWidth={2} />
-                                )}
+                                <span className="toolToggleIcon" aria-hidden="true">
+                                  {isEditToolGroup ? (
+                                    <Pencil size={15} strokeWidth={2.15} />
+                                  ) : groupSummary.primaryTool === "read_file" ? (
+                                    <FileText size={15} strokeWidth={2.15} />
+                                  ) : (
+                                    <Terminal size={15} strokeWidth={2.15} />
+                                  )}
+                                </span>
                                 <span className="toolToggleCopy">
                                   <span className="toolToggleText">{groupSummary.label}</span>
                                   {groupSummary.detail && (
@@ -1689,15 +3804,29 @@ export default function App() {
                                     </span>
                                   )}
                                 </span>
-                                <span className="toolToggleArrow">&gt;</span>
+                                {groupSummary.isRunning && (
+                                  <span className="thinkingWave toolWave" aria-hidden="true">
+                                    <i />
+                                    <i />
+                                    <i />
+                                    <i />
+                                  </span>
+                                )}
+                                <ChevronDown className="toolToggleArrow" size={18} strokeWidth={2.1} />
                                 {failCount > 0 && <span className="toolToggleFail">{failCount} 失败</span>}
                               </summary>
                               <div className="toolToggleBody">
-                                {toolMessages.map((message) => {
-                                  const isRunning = message.status === "running";
-                                  const summary = getToolDisplayTarget(message);
-                                  const addedLines = message.diff?.addedLines ?? 0;
-                                  const removedLines = message.diff?.removedLines ?? 0;
+                                {activityGroups.map((activityGroup) => (
+                                  <section className="toolActivitySection" key={activityGroup.category}>
+                                    <div className="toolActivityHeading">
+                                      <span>{activityGroup.labels.title}</span>
+                                      <small>{activityGroup.messages.length}</small>
+                                    </div>
+                                    {activityGroup.messages.map((message) => {
+                                      const isRunning = message.status === "running";
+                                      const summary = getToolActivityTarget(message, activeProject?.path) || getToolDisplayTarget(message);
+                                      const addedLines = message.diff?.addedLines ?? 0;
+                                      const removedLines = message.diff?.removedLines ?? 0;
                                   return (
                                     <div className={`toolToggleItem ${isRunning ? "running" : ""}`} key={message.id}>
                                       <div className="toolToggleItemHead">
@@ -1732,7 +3861,9 @@ export default function App() {
                                       )}
                                     </div>
                                   );
-                                })}
+                                    })}
+                                  </section>
+                                ))}
                               </div>
                             </details>
                           );
@@ -1744,7 +3875,8 @@ export default function App() {
                         const showFinalBadge = message.status === "completed" && !message.isStreaming && !isEmpty;
 
                         return (
-                          <article className={`message ${message.role} ${isEmpty && message.isStreaming ? "streamingOnly" : ""}`} key={message.id}>
+                          <Fragment key={message.id}>
+                          <article className={`message ${message.role} ${isEmpty && message.isStreaming ? "streamingOnly" : ""}`}>
                             {message.role !== "user" && (
                               <div className="messageMeta">
                                 <span>{modelName}</span>
@@ -1762,10 +3894,20 @@ export default function App() {
                             )}
                             {isEmpty && message.isStreaming && (
                               <div className="messageBubble assistantBubble streamingPlaceholder">
-                                <span className="thinkingFlow">正在思考</span>
+                                <span className="thinkingFlow">
+                                  正在思考
+                                  <span className="thinkingWave" aria-hidden="true">
+                                    <i />
+                                    <i />
+                                    <i />
+                                    <i />
+                                  </span>
+                                </span>
                               </div>
                             )}
                           </article>
+                          {renderArtifactCard(message)}
+                          </Fragment>
                         );
                       });
                     })()}
@@ -1794,51 +3936,6 @@ export default function App() {
                       </div>
                     )}
 
-                    {/* 变更汇总 */}
-                    {(() => {
-                      const fileDiffs = messages
-                        .filter((m) => m.role === "tool" && m.diff && m.status === "completed")
-                        .map((m) => m.diff!);
-                      if (fileDiffs.length === 0) return null;
-                      // 合并同一文件多次写入，保留最后一次
-                      const merged = new Map<string, DiffResult>();
-                      for (const d of fileDiffs) {
-                        merged.set(d.filePath, d);
-                      }
-                      const diffs = [...merged.values()];
-                      const totalAdded = diffs.reduce((s, d) => s + d.addedLines, 0);
-                      const totalRemoved = diffs.reduce((s, d) => s + d.removedLines, 0);
-
-                      return (
-                        <div className="diffSummary">
-                          <div className="diffSummaryHeader">
-                            <span className="diffSummaryTitle">变更汇总</span>
-                            <span className="diffSummaryStats">
-                              <span className="diffAdded">+{totalAdded}</span>
-                              <span className="diffRemoved">-{totalRemoved}</span>
-                            </span>
-                          </div>
-                          {diffs.map((d) => (
-                            <button
-                              key={d.filePath}
-                              type="button"
-                              className="diffSummaryFile"
-                              onClick={() => setDiffPanel(d)}
-                            >
-                              <span className="diffFileIcon">{d.oldContent === null ? "N" : "M"}</span>
-                              <span className="diffFileName">{d.filePath.split(/[\\/]/).pop()}</span>
-                              <span className="diffFileDir">{d.filePath}</span>
-                              <span className="diffFileStats">
-                                <span className="diffAdded">+{d.addedLines}</span>
-                                <span className="diffRemoved">-{d.removedLines}</span>
-                              </span>
-                            </button>
-                          ))}
-                        </div>
-                      );
-                    })()}
-
-	                    <div ref={messagesEndRef} />
 	                  </div>
 
 	                  {activeQueuedPrompts.length > 0 && activeSession && (
@@ -1949,6 +4046,9 @@ export default function App() {
                                   key={item.id}
                                   type="button"
                                   onClick={() => {
+                                    if (item.id === "full_access" && !window.confirm("完全访问会移除工作区沙箱限制。确定要启用吗？")) {
+                                      return;
+                                    }
                                     setMode(item.id);
                                     setPermissionMenuOpen(false);
                                   }}
@@ -1983,33 +4083,220 @@ export default function App() {
         </div>
         {/* 右侧 diff 对比面板 */}
         {diffPanel && (
-          <aside className="diffPanel">
+          <aside className="diffPanel" aria-label="代码审核">
             <div className="diffPanelHeader">
-              <div className="diffPanelFileInfo">
-                <span className="diffPanelFileName">{diffPanel.filePath.split(/[\\/]/).pop()}</span>
-                <span className="diffPanelPath">{diffPanel.filePath}</span>
+              <div className="diffPanelTitle">
+                <span className="diffPanelMode">
+                  <FileText size={16} />
+                  代码审核
+                </span>
+                <span className="diffPanelSummary">{reviewDiffs.length} 个文件</span>
+                <div className="diffPanelStats">
+                  <span className="diffAdded">+{reviewTotals.added}</span>
+                  <span className="diffRemoved">-{reviewTotals.removed}</span>
+                </div>
               </div>
-              <div className="diffPanelStats">
-                <span className="diffAdded">+{diffPanel.addedLines}</span>
-                <span className="diffRemoved">-{diffPanel.removedLines}</span>
+              <div className="diffPanelActions">
+                <button
+                  className={`diffPanelAction ${diffChangesOnly ? "active" : ""}`}
+                  type="button"
+                  aria-pressed={diffChangesOnly}
+                  onClick={() => setDiffChangesOnly((current) => !current)}
+                >
+                  {diffChangesOnly ? "仅显示变更" : "显示上下文"}
+                </button>
+                <div className="diffViewSwitch" role="group" aria-label="差异视图">
+                  <button
+                    className={diffView === "split" ? "active" : ""}
+                    type="button"
+                    aria-pressed={diffView === "split"}
+                    onClick={() => setDiffView("split")}
+                  >
+                    左右
+                  </button>
+                  <button
+                    className={diffView === "unified" ? "active" : ""}
+                    type="button"
+                    aria-pressed={diffView === "unified"}
+                    onClick={() => setDiffView("unified")}
+                  >
+                    统一
+                  </button>
+                </div>
+                <div className="diffPanelNavigator" aria-label="切换审核文件">
+                  <button
+                    type="button"
+                    onClick={() => selectAdjacentReviewFile(-1)}
+                    disabled={reviewDiffs.length < 2}
+                    aria-label="上一个变更文件"
+                  >
+                    <ChevronLeft size={16} />
+                  </button>
+                  <span>{activeReviewIndex + 1}/{reviewDiffs.length}</span>
+                  <button
+                    type="button"
+                    onClick={() => selectAdjacentReviewFile(1)}
+                    disabled={reviewDiffs.length < 2}
+                    aria-label="下一个变更文件"
+                  >
+                    <ChevronRight size={16} />
+                  </button>
+                </div>
+                <button
+                  className="diffPanelClose"
+                  type="button"
+                  onClick={() => {
+                    setDiffPanel(null);
+                    setReviewDiffScope(null);
+                  }}
+                  aria-label="关闭审核"
+                  title="关闭审核"
+                >
+                  <X size={17} />
+                </button>
               </div>
-              <button className="diffPanelClose" type="button" onClick={() => setDiffPanel(null)}>
-                <X size={16} />
-              </button>
             </div>
-            <div className="diffPanelContent">
-              <table className="diffTable">
-                <tbody>
-                  {diffPanel.lines.map((line, idx) => (
-                    <tr key={idx} className={`diffLine ${line.type}`}>
-                      <td className="diffLineNum">{line.oldLine ?? ""}</td>
-                      <td className="diffLineNum">{line.newLine ?? ""}</td>
-                      <td className="diffLineSign">{line.type === "add" ? "+" : line.type === "remove" ? "-" : " "}</td>
-                      <td className="diffLineContent"><pre>{line.content}</pre></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            <div className="diffPanelBody">
+              <main className="diffPanelReview">
+                <div className="diffFileHeader">
+                  <div className="diffPanelFileInfo">
+                    <div className="diffPanelFileHeading">
+                      <span className="diffPanelFileName">{getFileName(diffPanel.filePath)}</span>
+                      <button
+                        className={`diffCopyPath ${diffPathCopied ? "copied" : ""}`}
+                        type="button"
+                        onClick={() => void copyReviewFilePath()}
+                        title="复制文件路径"
+                      >
+                        <Copy size={14} />
+                        <span>{diffPathCopied ? "已复制" : "复制路径"}</span>
+                      </button>
+                    </div>
+                    <span className="diffPanelPath">{getDisplayFilePath(diffPanel.filePath, activeProject?.path)}</span>
+                  </div>
+                  <div className="diffPanelStats fileStats">
+                    <span className="diffAdded">+{diffPanel.addedLines}</span>
+                    <span className="diffRemoved">-{diffPanel.removedLines}</span>
+                  </div>
+                </div>
+                <div className="diffPanelContent">
+                  {diffView === "split" ? (
+                    <>
+                      <div className="diffCompareHeaders" aria-hidden="true">
+                        <span>原始版本</span>
+                        <span>修改后</span>
+                      </div>
+                      <table className="splitDiffTable">
+                        <tbody>
+                          {splitDiffReviewRows.map((row) => {
+                            if (row.kind === "fold") {
+                              return (
+                                <tr key={`fold-${row.key}`} className="diffSplitFold">
+                                  <td colSpan={6}>
+                                    <ChevronDown size={15} />
+                                    {row.hiddenCount} 行未修改
+                                  </td>
+                                </tr>
+                              );
+                            }
+                            const { oldLine, newLine } = row;
+                            return (
+                              <tr className="diffSplitRow" key={row.key}>
+                                <td className={`diffSplitLineNum old ${oldLine?.type ?? "empty"}`}>{oldLine?.oldLine ?? ""}</td>
+                                <td className={`diffSplitMarker old ${oldLine?.type ?? "empty"}`}>{oldLine?.type === "remove" ? "−" : ""}</td>
+                                <td className={`diffSplitContent old ${oldLine?.type ?? "empty"}`}><pre>{oldLine?.content || " "}</pre></td>
+                                <td className={`diffSplitLineNum new ${newLine?.type ?? "empty"}`}>{newLine?.newLine ?? ""}</td>
+                                <td className={`diffSplitMarker new ${newLine?.type ?? "empty"}`}>{newLine?.type === "add" ? "+" : ""}</td>
+                                <td className={`diffSplitContent new ${newLine?.type ?? "empty"}`}><pre>{newLine?.content || " "}</pre></td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </>
+                  ) : (
+                    <table className="diffTable">
+                      <tbody>
+                        {visibleDiffReviewRows.map((row) => {
+                          if (row.kind === "fold") {
+                            return (
+                              <tr key={`fold-${row.key}`} className="diffFoldRow">
+                                <td className="diffFoldToggle" colSpan={3}>
+                                  <ChevronDown size={16} />
+                                </td>
+                                <td className="diffFoldContent">{row.hiddenCount} 行未修改</td>
+                              </tr>
+                            );
+                          }
+                          const line = row.line;
+                          return (
+                            <tr key={`line-${row.index}`} className={`diffLine ${line.type}`}>
+                              <td className="diffLineNum old">{line.oldLine ?? ""}</td>
+                              <td className="diffLineNum new">{line.newLine ?? ""}</td>
+                              <td className="diffLineSign">{line.type === "add" ? "+" : line.type === "remove" ? "-" : " "}</td>
+                              <td className="diffLineContent"><pre>{line.content || " "}</pre></td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </main>
+              <aside className="diffFileSidebar" aria-label="变更文件">
+                <div className="diffSidebarHeader">
+                  <div>
+                    <span>变更文件</span>
+                    <strong>{filteredReviewDiffs.length}<small> / {reviewDiffs.length}</small></strong>
+                  </div>
+                  <span className="diffSidebarHint">按路径筛选</span>
+                </div>
+                <label className="diffFileSearch">
+                  <Search size={15} />
+                  <input
+                    aria-label="筛选变更文件"
+                    value={diffSearch}
+                    onChange={(event) => setDiffSearch(event.target.value)}
+                    placeholder="筛选文件..."
+                  />
+                  {diffSearch && (
+                    <button type="button" onClick={() => setDiffSearch("")} aria-label="清除筛选">
+                      <X size={14} />
+                    </button>
+                  )}
+                </label>
+                <div className="diffFileTreeLabel">
+                  <ChevronDown size={16} />
+                  <span>{activeProject?.path ? getFileName(activeProject.path) : "files"}</span>
+                </div>
+                <div className="diffFileTree">
+                  {filteredReviewDiffs.length === 0 && (
+                    <div className="diffFileEmpty">未找到匹配的变更文件</div>
+                  )}
+                  {filteredReviewDiffs.map((diff) => {
+                    const isActive = normalizeFilePath(diff.filePath) === normalizeFilePath(diffPanel.filePath);
+                    return (
+                      <button
+                        className={`diffFileTreeItem ${isActive ? "active" : ""}`}
+                        key={diff.filePath}
+                        type="button"
+                        onClick={() => setDiffPanel(diff)}
+                        title={diff.filePath}
+                      >
+                      <FileText size={16} />
+                        <span className="diffFileTreeCopy">
+                          <span className="diffFileTreeName">{getFileName(diff.filePath)}</span>
+                          <small>{getDisplayFilePath(diff.filePath, activeProject?.path)}</small>
+                        </span>
+                        <span className="diffFileTreeStats">
+                          {diff.addedLines > 0 && <span className="diffAdded">+{diff.addedLines}</span>}
+                          {diff.removedLines > 0 && <span className="diffRemoved">-{diff.removedLines}</span>}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </aside>
             </div>
           </aside>
         )}

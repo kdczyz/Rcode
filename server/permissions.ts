@@ -1,99 +1,50 @@
-import path from "node:path";
-import type { AgentToolName, PermissionMode, ToolCall, ToolRisk } from "./types";
+import type { AgentToolName, BuiltinToolName, LegacyPermissionMode, PermissionMode, ToolCall, ToolRisk } from "./types";
 import { getRuntimeConfig } from "./config";
+import { evaluatePermission } from "./permissionRules";
 
-const toolRisks: Record<AgentToolName, ToolRisk> = {
+const toolRisks: Record<BuiltinToolName, ToolRisk> = {
   read_file: "medium",
   write_file: "high",
+  list_files: "low",
+  search_text: "low",
+  inspect_tree: "low",
+  apply_patch: "high",
   web_fetch: "medium",
-  run_shell: "high"
+  run_shell: "high",
+  git_status: "low",
+  git_diff: "low",
+  git_branch: "medium",
+  git_stage: "medium",
+  git_commit: "high"
 };
 
 export function getToolRisk(toolName: AgentToolName): ToolRisk {
-  return getRuntimeConfig().tools.get(toolName)?.risk ?? toolRisks[toolName];
-}
-
-function getWorkspaceRoot(projectPath?: string): string {
-  return projectPath && path.isAbsolute(projectPath) ? projectPath : process.cwd();
-}
-
-function isPathOutsideWorkspace(value: unknown, projectPath?: string): boolean {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    return true;
-  }
-
-  const workspaceRoot = getWorkspaceRoot(projectPath);
-  const resolvedPath = path.isAbsolute(value) ? path.normalize(value) : path.resolve(workspaceRoot, value);
-  const relativePath = path.relative(workspaceRoot, resolvedPath);
-  return relativePath.startsWith("..") || path.isAbsolute(relativePath);
-}
-
-function commandReferencesOutsideWorkspace(value: unknown, projectPath?: string): boolean {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    return true;
-  }
-
-  const absolutePathMatches = value.matchAll(/(?:^|\s)(\/[^\s'"`;&|()]+)/g);
-  for (const match of absolutePathMatches) {
-    if (isPathOutsideWorkspace(match[1], projectPath)) {
-      return true;
-    }
-  }
-
-  return false;
+  if (toolName.startsWith("mcp__")) return "medium";
+  return getRuntimeConfig().tools.get(toolName)?.risk ?? toolRisks[toolName as BuiltinToolName] ?? "medium";
 }
 
 export function getToolCallRisk(toolCall: ToolCall): ToolRisk {
   return getToolRisk(toolCall.name);
 }
 
-export function needsApproval(mode: PermissionMode, toolCall: ToolCall, projectPath?: string): boolean {
-  const risk = getToolCallRisk(toolCall);
-
-  // 完全访问：完全控制，不需要任何审批
-  if (mode === "full_access") {
-    return false;
+export function normalizePermissionMode(value: unknown): PermissionMode {
+  if (value === "default" || value === "plan" || value === "workspace_write" || value === "full_access" || value === "custom") {
+    return value;
   }
+  const legacy = value as LegacyPermissionMode;
+  if (legacy === "request_approval" || legacy === "auto_approve") return "workspace_write";
+  return getRuntimeConfig().defaultPermissionMode;
+}
 
-  // 自动审批由 server/agent.ts 调用当前模型审核；这里保留静态兜底。
-  if (mode === "auto_approve") {
-    return risk === "high";
-  }
-
-  // 请求批准：当前项目内操作自动通过，项目外操作需要手动审批
-  if (mode === "request_approval") {
-    // 网络请求始终在项目外，需要审批
-    if (toolCall.name === "web_fetch") {
-      return true;
-    }
-
-    // 文件读写：检查目标路径是否在项目内
-    if (toolCall.name === "write_file" || toolCall.name === "read_file") {
-      return isPathOutsideWorkspace(toolCall.arguments.path, projectPath);
-    }
-
-    // Shell 命令：工作目录或显式绝对路径离开项目时需要审批。
-    if (toolCall.name === "run_shell") {
-      if (toolCall.arguments.cwd && isPathOutsideWorkspace(toolCall.arguments.cwd, projectPath)) {
-        return true;
-      }
-      return commandReferencesOutsideWorkspace(toolCall.arguments.command, projectPath);
-    }
-
-    return true;
-  }
-
-  return true;
+export async function needsApproval(mode: PermissionMode, toolCall: ToolCall, projectPath?: string): Promise<boolean> {
+  const decision = await evaluatePermission(mode, toolCall, projectPath);
+  return decision.requiresApproval;
 }
 
 export function describePermissionMode(mode: PermissionMode): string {
-  if (mode === "request_approval") {
-    return "项目内文件操作直接执行，项目外操作请求审批";
-  }
-
-  if (mode === "auto_approve") {
-    return "由当前模型自动审核工具风险并决定是否执行";
-  }
-
-  return "允许所有工具操作直接执行";
+  if (mode === "default") return "使用配置文件中的默认工作区沙箱策略";
+  if (mode === "plan") return "只读规划模式，不允许写文件、联网或执行命令";
+  if (mode === "workspace_write") return "工作区内自主执行，越界、联网和危险操作请求审批";
+  if (mode === "custom") return "按自定义权限规则执行";
+  return "允许所有工具操作直接执行，高风险";
 }

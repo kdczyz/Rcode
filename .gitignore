@@ -1,10 +1,14 @@
 node_modules
+build
 dist
 dist-server
 dist-server-bundle
 release
 data
+*.sqlite-wal
+*.sqlite-shm
 .workbuddy
+.uploads
 .env
 .env.local
 .DS_Store
