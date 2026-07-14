@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AiProviderConfig } from "./localDatabase";
+import type { AiProviderConfig } from "../storage/database";
 import {
   deleteUserAiProvider,
   getActiveAiProviderId,
@@ -7,8 +7,8 @@ import {
   listUserAiProviders,
   saveUserAiProvider,
   setActiveAiProviderId
-} from "./localDatabase";
-import { getRuntimeConfig, reloadRuntimeConfig, type ProviderEntry } from "./config";
+} from "../storage/database";
+import { getRuntimeConfig, reloadRuntimeConfig, type ProviderEntry } from "../runtime/config";
 
 export interface PublicAiProvider extends Omit<AiProviderConfig, "apiKey"> {
   active: boolean;

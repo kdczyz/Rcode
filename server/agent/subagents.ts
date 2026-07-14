@@ -2,7 +2,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { getWorkspaceRoot } from "./sandbox";
+import { getWorkspaceRoot } from "../security/sandbox";
 
 export interface SubagentDefinition {
   name: string;

@@ -1,7 +1,7 @@
 import { URL } from "node:url";
-import { listPermissionRules } from "./localDatabase";
+import { listPermissionRules } from "../storage/database";
 import { analyzeShellCommand, resolveWorkspacePath } from "./sandbox";
-import type { EnforcementDecision, PermissionEffect, PermissionMode, PermissionRule, ToolCall } from "./types";
+import type { EnforcementDecision, PermissionEffect, PermissionMode, PermissionRule, ToolCall } from "../shared/types";
 
 export interface PermissionDecision {
   effect: PermissionEffect;
@@ -55,7 +55,7 @@ async function targetValuesForToolCall(toolCall: ToolCall, projectPath?: string)
     values.push({ targetType: "path", value: resolved.input });
   }
 
-  if (toolCall.name === "run_shell") {
+  if (toolCall.name === "run_shell" || toolCall.name === "start_process") {
     const command = typeof toolCall.arguments.command === "string" ? toolCall.arguments.command : "";
     values.push({ targetType: "command", value: command });
   }
@@ -108,7 +108,7 @@ export async function evaluatePermission(
   }
 
   if (mode === "plan") {
-    const effect: PermissionEffect = toolCall.name === "read_file" || toolCall.name === "list_files" || toolCall.name === "search_text" || toolCall.name === "inspect_tree"
+    const effect: PermissionEffect = toolCall.name === "read_file" || toolCall.name === "list_files" || toolCall.name === "search_text" || toolCall.name === "inspect_tree" || toolCall.name === "git_status" || toolCall.name === "git_diff" || toolCall.name === "read_process" || toolCall.name === "list_processes"
       ? "allow"
       : "deny";
     return decision(effect, effect === "allow" ? "Plan mode allows read-only inspection." : "Plan mode blocks writes, shell commands, and network access.", {
@@ -135,7 +135,7 @@ export async function evaluatePermission(
     return decision("ask", "MCP tool calls require approval until the server and tool are explicitly trusted.");
   }
 
-  if (toolCall.name === "run_shell") {
+  if (toolCall.name === "run_shell" || toolCall.name === "start_process") {
     const command = typeof toolCall.arguments.command === "string" ? toolCall.arguments.command : "";
     const analysis = await analyzeShellCommand(command, toolCall.arguments.cwd, projectPath);
     if (analysis.blockedReason || analysis.destructive || analysis.redirectsOutsideWorkspace || analysis.leaksEnvironment || analysis.backgroundProcess || analysis.interactive) {

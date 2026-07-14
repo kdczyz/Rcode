@@ -3,19 +3,15 @@ import dotenv from "dotenv";
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { describePermissionMode, normalizePermissionMode } from "./permissions";
-import { approveToolCallStream, runAgentStream } from "./agent";
-import type { PermissionMode, StreamEvent } from "./types";
-import { getRuntimeConfig } from "./config";
-import type { ThinkingMode } from "./aiProvider";
+import { describePermissionMode, normalizePermissionMode } from "./security/permissions";
+import { approveToolCallStream, runAgentStream } from "./agent/agent";
+import type { PermissionMode, StreamEvent } from "./shared/types";
+import { getRuntimeConfig } from "./runtime/config";
+import type { ThinkingMode } from "./providers/aiProvider";
 import {
-  authenticateLocalUser,
-  deleteLocalSession,
   deleteMcpServer,
-  getLocalAuthStatus,
   getConversationById,
   getAgentUsageSummary,
-  getLocalSession,
   listAuditEvents,
   listConversations,
   listMemories,
@@ -28,7 +24,7 @@ import {
   getArtifact,
   type AiProviderConfig,
   type McpServerConfig
-} from "./localDatabase";
+} from "./storage/database";
 import {
   activateAiProvider,
   fetchModelsForDraft,
@@ -37,13 +33,14 @@ import {
   removeAiProvider,
   saveAiProvider,
   testAiProvider
-} from "./aiProviderRegistry";
-import { getRegisteredTools } from "./tools";
-import { defaultPermissionRules } from "./permissionRules";
-import { listSkills } from "./skills";
-import { listMcpTools, testMcpServer, trustMcpServer } from "./mcpClient";
-import { getProjectHookTrust } from "./hooks";
-import { listSubagents } from "./subagents";
+} from "./providers/aiProviderRegistry";
+import { getRegisteredTools } from "./runtime/tools";
+import { defaultPermissionRules } from "./security/permissionRules";
+import { listSkills } from "./agent/skills";
+import { listMcpTools, testMcpServer, trustMcpServer } from "./integrations/mcpClient";
+import { getProjectHookTrust } from "./agent/hooks";
+import { listSubagents } from "./agent/subagents";
+import { managedProcessManager } from "./runtime/processManager";
 
 dotenv.config();
 if (existsSync(".env.local")) {
@@ -130,35 +127,6 @@ app.get("/api/health", (_request, response) => {
     executor: "portable-guarded-execution",
     computerControl: runtimeConfig.computerControl
   });
-});
-
-app.get("/api/auth/session", (request, response) => {
-  response.json({
-    ...getLocalAuthStatus(),
-    user: getLocalSession(readBearerToken(request)) ?? null
-  });
-});
-
-app.post("/api/auth/login", (request, response) => {
-  const username = typeof request.body.username === "string" ? request.body.username.trim() : "";
-  const password = typeof request.body.password === "string" ? request.body.password : "";
-  if (!username || !password) {
-    response.status(400).json({ error: "username and password are required" });
-    return;
-  }
-
-  const result = authenticateLocalUser(username, password);
-  if (!result) {
-    response.status(401).json({ error: "用户名或密码不正确" });
-    return;
-  }
-
-  response.json(result);
-});
-
-app.post("/api/auth/logout", (request, response) => {
-  deleteLocalSession(readBearerToken(request));
-  response.json({ ok: true });
 });
 
 app.get("/api/permissions", (_request, response) => {
@@ -360,6 +328,41 @@ app.get("/api/artifacts/:id", requireLocalToken, (request, response) => {
 
 app.get("/api/hooks/trust", requireLocalToken, (request, response) => {
   response.json(getProjectHookTrust(parseProjectPath(typeof request.query.projectPath === "string" ? request.query.projectPath : undefined)));
+});
+
+app.get("/api/processes", requireLocalToken, (request, response) => {
+  const projectPath = parseProjectPath(typeof request.query.projectPath === "string" ? request.query.projectPath : undefined);
+  response.json({ processes: managedProcessManager.list(projectPath) });
+});
+
+app.get("/api/processes/:id", requireLocalToken, (request, response) => {
+  const tailChars = typeof request.query.tailChars === "string" ? Number(request.query.tailChars) : undefined;
+  const process = managedProcessManager.get(String(request.params.id), Number.isFinite(tailChars) ? tailChars : undefined);
+  if (!process) {
+    response.status(404).json({ error: "managed process not found" });
+    return;
+  }
+  response.json({ process });
+});
+
+app.post("/api/processes/:id/input", requireLocalToken, (request, response) => {
+  try {
+    if (typeof request.body.input !== "string") {
+      response.status(400).json({ error: "input is required" });
+      return;
+    }
+    response.json({ process: managedProcessManager.write(String(request.params.id), request.body.input) });
+  } catch (error) {
+    response.status(409).json({ error: error instanceof Error ? error.message : "failed to write process input" });
+  }
+});
+
+app.post("/api/processes/:id/stop", requireLocalToken, async (request, response) => {
+  try {
+    response.json({ process: await managedProcessManager.stop(String(request.params.id)) });
+  } catch (error) {
+    response.status(404).json({ error: error instanceof Error ? error.message : "failed to stop process" });
+  }
 });
 
 app.get("/api/models", async (_request, response) => {

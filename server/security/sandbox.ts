@@ -1,7 +1,7 @@
 import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
-import { getRuntimeConfig } from "./config";
-import type { ShellAnalysis } from "./types";
+import { getRuntimeConfig } from "../runtime/config";
+import type { ShellAnalysis } from "../shared/types";
 
 export interface ResolvedPath {
   input: string;

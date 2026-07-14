@@ -9,16 +9,16 @@
 - 桌面端、CLI 入口和本地 Express agent server。
 - 工作区路径 canonical 校验、权限规则、审批流和审计事件。
 - 内置工具注册表：文件读取、目录检查、搜索、patch、shell、web fetch、git status/diff。
-- SQLite 保存本地账号、会话、审批、审计、MCP 配置和 memory。
+- SQLite 保存会话、审批、审计、MCP 配置和 memory。
 - `AGENTS.md`、`.agent/rules/*.md`、memory 注入。
 - MCP 配置管理、Skills 扫描、`rcode` 终端入口。
 
 主要缺口：
 
-- `server/sandbox.ts` 仍是路径/命令分析，不是 OS 级沙箱；`run_shell` 仍通过 `zsh -lc` 执行。
+- `server/security/sandbox.ts` 仍是路径/命令分析，不是 OS 级沙箱；`run_shell` 仍通过 `zsh -lc` 执行。
 - MCP 只有配置存储和 UI/CLI 管理，没有 stdio/http JSON-RPC client、tools/resources/prompts 接入。
 - Skills 只扫描元数据，没有 `$skill` 显式调用、description 匹配、资源/脚本加载和工具约束。
-- Hooks、Subagents、上下文压缩、Git/PR/CI 闭环还没有实现。
+- Hooks、Subagents 已有初步入口；上下文已具备按轮次压缩、工具输出收敛和预算快照，持久化摘要与 Git/PR/CI 闭环仍需继续实现。
 - `apply_patch` 只是 `oldText -> newText` 替换，不支持多 hunk、冲突恢复和更强用户改动保护。
 
 ## 主流 Agent 基准

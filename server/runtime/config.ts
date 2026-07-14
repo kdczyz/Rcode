@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { parse as parseToml } from "smol-toml";
-import type { AgentToolName, LegacyPermissionMode, PermissionMode, ToolRisk } from "./types";
-import { getActiveAiProviderId, listUserAiProviders } from "./localDatabase";
+import type { AgentToolName, LegacyPermissionMode, PermissionMode, ToolRisk } from "../shared/types";
+import { getActiveAiProviderId, listUserAiProviders } from "../storage/database";
 
 export interface ProviderEntry {
   type: "openai-compatible";

@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { portableExecutor } from "./executor";
-import { recordAuditEvent } from "./localDatabase";
-import { getWorkspaceRoot } from "./sandbox";
+import { portableExecutor } from "../runtime/executor";
+import { recordAuditEvent } from "../storage/database";
+import { getWorkspaceRoot } from "../security/sandbox";
 
 export type HookEventName =
   | "SessionStart"

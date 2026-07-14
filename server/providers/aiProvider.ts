@@ -1,8 +1,8 @@
-import { getToolDefinitions } from "./tools";
-import type { AgentMessage, ToolCall, ToolResult, AgentToolName, ToolRisk } from "./types";
-import { getRuntimeConfig } from "./config";
+import { getToolDefinitions } from "../runtime/tools";
+import type { AgentMessage, ContextSnapshot, PermissionMode, ToolCall, ToolResult, AgentToolName, ToolRisk } from "../shared/types";
+import { getRuntimeConfig } from "../runtime/config";
 import { nanoid } from "nanoid";
-import { buildProjectContext, compactMessagesForContext } from "./contextManager";
+import { buildProjectContextBundle, compactMessagesWithSnapshot } from "../agent/contextManager";
 
 interface ChatChoice {
   message?: {
@@ -54,6 +54,12 @@ export interface AiUsage {
   prompt_tokens_details?: {
     cached_tokens?: number;
   };
+}
+
+export interface AiUsageProgress {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
 }
 
 export interface ApprovalAuditResult {
@@ -196,7 +202,29 @@ function parseToolCallsFromText(rawContent: string): { cleanContent: string; too
   return { cleanContent, toolCalls };
 }
 
-function buildSystemPrompt(modelName: string, providerDisplayName: string) {
+function getWorkflowInstruction(mode: PermissionMode = "workspace_write") {
+  if (mode === "plan") {
+    return [
+      "## Current workflow: Plan",
+      "- Investigate only what is necessary with read-only workspace tools.",
+      "- Do not edit files, run shell commands, access the network, or claim implementation is complete.",
+      "- Resolve obvious details from the project before asking questions.",
+      "- End with a concrete plan using this exact heading and checklist shape:",
+      "## 执行计划",
+      "1. [ ] A specific, verifiable step",
+      "2. [ ] A specific, verifiable step",
+      "- Keep the plan between 2 and 8 steps and mention validation in the last step."
+    ].join("\n");
+  }
+  return [
+    "## Current workflow: Execute",
+    "- Inspect, implement, validate, and then report the outcome.",
+    "- Keep the user informed when moving from investigation to edits or validation.",
+    "- If the conversation contains an approved plan, use it as the execution checklist and do not re-plan from scratch."
+  ].join("\n");
+}
+
+function buildSystemPrompt(modelName: string, providerDisplayName: string, mode: PermissionMode = "workspace_write") {
   return [
     `You are Rcode, running inside the Rcode Desktop application on macOS.`,
     `Your current AI model is "${modelName}" provided by "${providerDisplayName}".`,
@@ -208,6 +236,7 @@ function buildSystemPrompt(modelName: string, providerDisplayName: string) {
   "- read_file: Read a file's content before editing it.",
   "- write_file: Write or overwrite a file with its COMPLETE content in one call.",
   "- run_shell: Run shell commands (npm install, git, tests, build, etc.).",
+  "- start_process/read_process/write_process/stop_process/list_processes: Manage long-running dev servers and watchers without &, nohup, or shell redirection.",
   "- git_status/git_diff/git_branch/git_stage/git_commit: Inspect and manage local git workflow with approval for mutating actions.",
   "- web_fetch: Fetch documentation or API references.",
   "",
@@ -217,11 +246,15 @@ function buildSystemPrompt(modelName: string, providerDisplayName: string) {
   "- For example, if you need to create 5 files, output all 5 write_file tool calls together in one response, not one at a time.",
   "- Do NOT wait for one file to be written before writing the next. Output them all at once.",
   "- Only use run_shell for: npm install, git, running tests, building projects.",
+  "- Use start_process for commands that stay running, such as npm run dev, Vite, Python HTTP servers, and file watchers. Never start those with run_shell.",
+  "- Use read_process to verify startup output or inspect later logs, and stop_process when the user asks to stop a managed service.",
   "- NEVER use run_shell with echo/cat/sed/printf to write files. ALWAYS use write_file.",
   "- Always read_file before editing an existing file.",
   "- Use the project root as the working directory for all file paths.",
   "- When running shell commands, use non-interactive flags (e.g. --yes for npm).",
-  "- Respond in the same language the user uses."
+  "- Respond in the same language the user uses.",
+  "",
+  getWorkflowInstruction(mode)
   ].join("\n");
 }
 
@@ -254,25 +287,28 @@ async function toProviderMessages(
   thinkingMode?: ThinkingMode,
   projectPath?: string,
   modelName?: string,
-  providerDisplayName?: string
+  providerDisplayName?: string,
+  mode: PermissionMode = "workspace_write"
 ) {
   const projectInstruction = projectPath
     ? `Current project root: ${projectPath}. Resolve relative file paths and shell commands inside this project unless the user asks otherwise.`
     : "Current project type: empty project. Use relative file paths from the app workspace unless the user provides a folder path.";
   const latestUserPrompt = [...messages].reverse().find((message) => message.role === "user")?.content ?? "";
-  const projectContext = await buildProjectContext(projectPath, latestUserPrompt);
-  const compactedMessages = compactMessagesForContext(messages);
+  const projectContext = await buildProjectContextBundle(projectPath, latestUserPrompt);
+  const totalBudgetTokens = 16_000;
+  const contextOverheadTokens = Math.ceil(projectContext.content.length / 4) + 1_200;
+  const compacted = compactMessagesWithSnapshot(messages, Math.max(4_000, totalBudgetTokens - contextOverheadTokens));
   const providerMessages: Array<Record<string, unknown>> = [
     {
       role: "system",
       content: [
-        buildSystemPrompt(modelName ?? "unknown", providerDisplayName ?? "unknown"),
+        buildSystemPrompt(modelName ?? "unknown", providerDisplayName ?? "unknown", mode),
         getThinkingInstruction(thinkingMode),
         projectInstruction,
-        projectContext ? `\n## Project Context\n${projectContext}` : ""
+        projectContext.content ? `\n## Project Context\n${projectContext.content}` : ""
       ].filter(Boolean).join("\n")
     },
-    ...compactedMessages.map((message) => {
+    ...compacted.messages.map((message) => {
       if (message.role === "tool") {
         return { role: "tool", tool_call_id: message.toolCallId, content: message.content };
       }
@@ -295,7 +331,21 @@ async function toProviderMessages(
     providerMessages.push({ role: "tool", tool_call_id: result.toolCallId, content: result.content });
   }
 
-  return providerMessages;
+  const snapshot: ContextSnapshot = {
+    ...compacted.snapshot,
+    budgetTokens: totalBudgetTokens,
+    estimatedTokens: compacted.snapshot.estimatedTokens + contextOverheadTokens,
+    projectContextChars: projectContext.content.length,
+    activeSkills: projectContext.activeSkills
+  };
+  return { messages: providerMessages, snapshot };
+}
+
+async function getToolsForMode(projectPath: string | undefined, mode: PermissionMode = "workspace_write") {
+  const tools = await getToolDefinitions(projectPath);
+  if (mode !== "plan") return tools;
+  const readOnlyTools = new Set(["read_file", "list_files", "search_text", "inspect_tree", "git_status", "git_diff"]);
+  return tools.filter((tool) => readOnlyTools.has(tool.function.name));
 }
 
 function parseToolArguments(raw: string): Record<string, unknown> {
@@ -388,7 +438,7 @@ export async function auditToolCallApproval(
 export async function callAi(
   messages: AgentMessage[],
   toolResults: ToolResult[] = [],
-  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; signal?: AbortSignal } = {}
+  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; mode?: PermissionMode; signal?: AbortSignal } = {}
 ): Promise<AiTurn> {
   const config = getConfig(options.model);
 
@@ -405,8 +455,8 @@ export async function callAi(
     headers: { "content-type": "application/json", authorization: `Bearer ${config.apiKey}` },
     body: JSON.stringify({
       model: config.model,
-      messages: await toProviderMessages(messages, toolResults, options.thinkingMode, options.projectPath, config.model, config.providerDisplayName),
-      tools: await getToolDefinitions(options.projectPath),
+      messages: (await toProviderMessages(messages, toolResults, options.thinkingMode, options.projectPath, config.model, config.providerDisplayName, options.mode)).messages,
+      tools: await getToolsForMode(options.projectPath, options.mode),
       tool_choice: "auto",
       temperature: config.temperature,
       max_tokens: config.maxTokens
@@ -442,10 +492,12 @@ export async function callAi(
 /** Streaming AI call: yields text deltas token-by-token, returns tool calls at the end. */
 export async function* callAiStream(
   messages: AgentMessage[],
-  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; signal?: AbortSignal } = {}
+  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; mode?: PermissionMode; signal?: AbortSignal } = {}
 ): AsyncGenerator<
   | { type: "text_delta"; content: string }
+  | { type: "usage_progress"; usage: AiUsageProgress; model: string; provider: string }
   | { type: "usage"; usage: AiUsage; model: string; provider: string }
+  | { type: "context_snapshot"; snapshot: ContextSnapshot }
   | { type: "tool_calls"; toolCalls: ToolCall[]; cleanContent?: string }
 > {
   const config = getConfig(options.model);
@@ -456,15 +508,35 @@ export async function* callAiStream(
     return;
   }
 
+  const providerContext = await toProviderMessages(messages, [], options.thinkingMode, options.projectPath, config.model, config.providerDisplayName, options.mode);
+  yield { type: "context_snapshot", snapshot: providerContext.snapshot };
+  const tools = await getToolsForMode(options.projectPath, options.mode);
   const requestBody = {
     model: config.model,
-    messages: await toProviderMessages(messages, [], options.thinkingMode, options.projectPath, config.model, config.providerDisplayName),
-    tools: await getToolDefinitions(options.projectPath),
+    messages: providerContext.messages,
+    tools,
     tool_choice: "auto",
     temperature: config.temperature,
     max_tokens: config.maxTokens,
     stream: true,
     stream_options: { include_usage: true }
+  };
+  // Streaming APIs normally return exact usage only in their final chunk. Send a
+  // stable local estimate first so the UI can update both counters while the
+  // response is still being generated, then replace it with exact usage later.
+  const estimatedPromptTokens = Math.max(
+    1,
+    Math.ceil(JSON.stringify({ messages: providerContext.messages, tools }).length / 4)
+  );
+  yield {
+    type: "usage_progress",
+    usage: {
+      prompt_tokens: estimatedPromptTokens,
+      completion_tokens: 0,
+      total_tokens: estimatedPromptTokens
+    },
+    model: config.model,
+    provider: config.providerDisplayName
   };
 
   let response = await fetch(`${config.baseUrl.replace(/\/$/, "")}${config.chatPath}`, {
@@ -500,6 +572,7 @@ export async function* callAiStream(
   let buffer = "";
   let contentBuffer = "";
   const toolCallMap = new Map<number, { id: string; name: string; argsBuffer: string }>();
+  let lastEstimatedCompletionTokens = 0;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -540,6 +613,28 @@ export async function* callAiStream(
             if (tc.function?.name) entry.name = tc.function.name;
             if (tc.function?.arguments) entry.argsBuffer += tc.function.arguments;
           }
+        }
+
+        const streamedToolChars = [...toolCallMap.values()].reduce(
+          (total, entry) => total + entry.name.length + entry.argsBuffer.length,
+          0
+        );
+        const estimatedCompletionTokens = Math.max(
+          contentBuffer || streamedToolChars ? 1 : 0,
+          Math.ceil((contentBuffer.length + streamedToolChars) / 4)
+        );
+        if (estimatedCompletionTokens !== lastEstimatedCompletionTokens) {
+          lastEstimatedCompletionTokens = estimatedCompletionTokens;
+          yield {
+            type: "usage_progress",
+            usage: {
+              prompt_tokens: estimatedPromptTokens,
+              completion_tokens: estimatedCompletionTokens,
+              total_tokens: estimatedPromptTokens + estimatedCompletionTokens
+            },
+            model: config.model,
+            provider: config.providerDisplayName
+          };
         }
       } catch { /* ignore parse errors */ }
     }

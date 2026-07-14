@@ -2,7 +2,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { assertPathInsideWorkspace, getWorkspaceRoot } from "./sandbox";
+import { assertPathInsideWorkspace, getWorkspaceRoot } from "../security/sandbox";
 
 export interface AgentSkill {
   name: string;

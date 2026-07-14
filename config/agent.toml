@@ -52,3 +52,28 @@ enabled = true
 name = "run_shell"
 risk = "high"
 enabled = true
+
+[[tools]]
+name = "start_process"
+risk = "high"
+enabled = true
+
+[[tools]]
+name = "read_process"
+risk = "low"
+enabled = true
+
+[[tools]]
+name = "write_process"
+risk = "medium"
+enabled = true
+
+[[tools]]
+name = "stop_process"
+risk = "medium"
+enabled = true
+
+[[tools]]
+name = "list_processes"
+risk = "low"
+enabled = true

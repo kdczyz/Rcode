@@ -4,8 +4,9 @@ import { mkdtemp, mkdir, readFile, realpath, writeFile } from "node:fs/promises"
 import os from "node:os";
 import path from "node:path";
 import { analyzeShellCommand, resolveWorkspacePath } from "./sandbox";
-import { executeTool } from "./tools";
-import { portableExecutor } from "./executor";
+import { executeTool } from "../runtime/tools";
+import { portableExecutor } from "../runtime/executor";
+import { managedProcessManager } from "../runtime/processManager";
 
 test("resolveWorkspacePath marks workspace files as inside the workspace", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agent-console-"));
@@ -69,6 +70,28 @@ test("portable executor blocks unsafe cwd before spawning shell", async () => {
   const result = await portableExecutor.run({ command: "pwd", cwd: outside, projectPath: root });
   assert.equal(result.ok, false);
   assert.equal(result.blockedReason, "Command cwd is outside the workspace.");
+});
+
+test("managed process sessions capture output and can stop the process tree", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "agent-console-"));
+  const started = await managedProcessManager.start({
+    command: "node -e \"console.log('server ready'); setInterval(() => {}, 1000)\"",
+    projectPath: root,
+    startupWaitMs: 200
+  });
+
+  assert.equal(started.status, "running");
+  assert.match(started.output, /server ready/);
+  const stopped = await managedProcessManager.stop(started.id);
+  assert.equal(stopped.status, "stopped");
+});
+
+test("managed process sessions reject user-managed background syntax", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "agent-console-"));
+  await assert.rejects(
+    managedProcessManager.start({ command: "python3 -m http.server 8765 &", projectPath: root }),
+    /start_process manages the process lifecycle/
+  );
 });
 
 test("run_shell stores large output as artifact summary", async () => {

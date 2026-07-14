@@ -11,5 +11,7 @@ data
 .uploads
 .env
 .env.local
+.dev.vars
+.wrangler
 .DS_Store
 npm-debug.log*

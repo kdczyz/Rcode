@@ -1,5 +1,38 @@
 export type PermissionMode = "default" | "plan" | "workspace_write" | "full_access" | "custom";
 
+export type WorkflowPhase =
+  | "preparing"
+  | "planning"
+  | "thinking"
+  | "inspecting"
+  | "executing"
+  | "awaiting_approval"
+  | "plan_ready"
+  | "completed"
+  | "stopped"
+  | "failed";
+
+export interface ContextSnapshot {
+  budgetTokens: number;
+  estimatedTokens: number;
+  messageCount: number;
+  includedMessageCount: number;
+  compactedMessageCount: number;
+  projectContextChars: number;
+  activeSkills: string[];
+}
+
+export interface TaskPlanStep {
+  id: string;
+  title: string;
+  status: "pending" | "in_progress" | "completed";
+}
+
+export interface TaskPlan {
+  summary: string;
+  steps: TaskPlanStep[];
+}
+
 export type LegacyPermissionMode = "request_approval" | "auto_approve";
 
 export type ToolRisk = "low" | "medium" | "high";
@@ -13,6 +46,11 @@ export type BuiltinToolName =
   | "apply_patch"
   | "web_fetch"
   | "run_shell"
+  | "start_process"
+  | "read_process"
+  | "write_process"
+  | "stop_process"
+  | "list_processes"
   | "git_status"
   | "git_diff"
   | "git_branch"
@@ -67,8 +105,27 @@ export interface ToolResult {
   stderrArtifactId?: string;
   diffs?: DiffResult[];
   auditEventId?: string;
+  process?: ManagedProcessSnapshot;
   /** write_file 时包含的 diff 信息 */
   diff?: DiffResult;
+}
+
+export type ManagedProcessStatus = "running" | "exited" | "stopped" | "failed";
+
+export interface ManagedProcessSnapshot {
+  id: string;
+  command: string;
+  label?: string;
+  cwd: string;
+  projectPath: string;
+  pid?: number;
+  status: ManagedProcessStatus;
+  startedAt: string;
+  endedAt?: string;
+  exitCode?: number;
+  signal?: string;
+  output: string;
+  outputVersion: number;
 }
 
 export interface ShellAnalysis {
@@ -145,7 +202,31 @@ export interface AgentRunResponse {
 
 export type StreamEvent =
   | { type: "run_started"; conversationId: string }
+  | { type: "workflow_state"; phase: WorkflowPhase; label: string }
+  | { type: "context_snapshot"; snapshot: ContextSnapshot }
+  | { type: "task_plan"; plan: TaskPlan }
   | { type: "text_delta"; content: string }
+  | {
+      type: "usage_progress";
+      usage: {
+        promptTokens: number;
+        completionTokens: number;
+        totalTokens: number;
+      };
+      model: string;
+      provider: string;
+    }
+  | {
+      type: "usage";
+      usage: {
+        promptTokens: number;
+        completionTokens: number;
+        totalTokens: number;
+        cachedTokens?: number;
+      };
+      model: string;
+      provider: string;
+    }
   | { type: "tool_call"; toolCall: ToolCall }
   | { type: "permission_decision"; toolCallId: string; effect: PermissionEffect; reason: string }
   | { type: "tool_result"; result: ToolResult }

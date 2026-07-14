@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
+const { app, BrowserWindow, Menu, dialog, ipcMain, safeStorage, shell } = require("electron");
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
@@ -10,7 +10,55 @@ const startUrl = process.env.ELECTRON_START_URL || `file://${path.join(__dirname
 
 let serverProcess = null;
 const localApiToken = process.env.AGENT_LOCAL_TOKEN || crypto.randomBytes(32).toString("base64url");
+let volatileAuthToken;
 const preferencesPath = () => path.join(app.getPath("userData"), "preferences.json");
+const authSessionPath = () => path.join(app.getPath("userData"), "auth-session.bin");
+const authApiUrl = () => (process.env.RCODE_AUTH_API_URL || "https://rcode-auth.kdczyz0728-994.workers.dev").replace(/\/$/, "");
+
+async function readAuthToken() {
+  if (volatileAuthToken) return volatileAuthToken;
+  if (!safeStorage.isEncryptionAvailable()) return undefined;
+  try {
+    const encrypted = await fs.readFile(authSessionPath());
+    volatileAuthToken = safeStorage.decryptString(encrypted);
+    return volatileAuthToken;
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeAuthToken(token) {
+  volatileAuthToken = token;
+  if (!safeStorage.isEncryptionAvailable()) return;
+  await fs.mkdir(path.dirname(authSessionPath()), { recursive: true });
+  await fs.writeFile(authSessionPath(), safeStorage.encryptString(token), { mode: 0o600 });
+}
+
+async function clearAuthToken() {
+  volatileAuthToken = undefined;
+  try {
+    await fs.unlink(authSessionPath());
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+async function authRequest(pathname, options = {}) {
+  const headers = new Headers(options.headers);
+  headers.set("content-type", "application/json");
+  if (options.authenticated) {
+    const token = await readAuthToken();
+    if (!token) return undefined;
+    headers.set("authorization", `Bearer ${token}`);
+  }
+  const response = await fetch(`${authApiUrl()}${pathname}`, { method: options.method || "GET", headers, body: options.body ? JSON.stringify(options.body) : undefined });
+  const data = await response.json().catch(() => ({ error: "认证服务返回了无效响应" }));
+  if (!response.ok) {
+    if (response.status === 401) await clearAuthToken();
+    throw new Error(typeof data.error === "string" ? data.error : "认证请求失败");
+  }
+  return data;
+}
 
 async function migrateLegacyDatabase(databasePath) {
   const legacyPath = path.join(process.resourcesPath, "data", "agent-console.sqlite");
@@ -155,6 +203,27 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle("agent:get-local-api-token", async () => localApiToken);
+  ipcMain.handle("agent:auth-session", async () => authRequest("/v1/auth/me", { authenticated: true }));
+  ipcMain.handle("agent:auth-login", async (_event, details) => {
+    const result = await authRequest("/v1/auth/login", { method: "POST", body: details });
+    if (!result?.token) throw new Error("认证服务未返回会话 Token");
+    await writeAuthToken(result.token);
+    return { user: result.user, expiresAt: result.expiresAt };
+  });
+  ipcMain.handle("agent:auth-register", async (_event, details) => {
+    const result = await authRequest("/v1/auth/register", { method: "POST", body: details });
+    if (!result?.token) throw new Error("认证服务未返回会话 Token");
+    await writeAuthToken(result.token);
+    return { user: result.user, expiresAt: result.expiresAt };
+  });
+  ipcMain.handle("agent:auth-logout", async () => {
+    try {
+      await authRequest("/v1/auth/logout", { method: "POST", authenticated: true });
+    } finally {
+      await clearAuthToken();
+    }
+    return { ok: true };
+  });
   ipcMain.handle("agent:get-theme-preference", async () => {
     try {
       const raw = await fs.readFile(preferencesPath(), "utf8");

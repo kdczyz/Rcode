@@ -1,5 +1,5 @@
-import type { AgentToolName, BuiltinToolName, LegacyPermissionMode, PermissionMode, ToolCall, ToolRisk } from "./types";
-import { getRuntimeConfig } from "./config";
+import type { AgentToolName, BuiltinToolName, LegacyPermissionMode, PermissionMode, ToolCall, ToolRisk } from "../shared/types";
+import { getRuntimeConfig } from "../runtime/config";
 import { evaluatePermission } from "./permissionRules";
 
 const toolRisks: Record<BuiltinToolName, ToolRisk> = {
@@ -11,6 +11,11 @@ const toolRisks: Record<BuiltinToolName, ToolRisk> = {
   apply_patch: "high",
   web_fetch: "medium",
   run_shell: "high",
+  start_process: "high",
+  read_process: "low",
+  write_process: "medium",
+  stop_process: "medium",
+  list_processes: "low",
   git_status: "low",
   git_diff: "low",
   git_branch: "medium",

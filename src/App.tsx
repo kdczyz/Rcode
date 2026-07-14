@@ -10,14 +10,9 @@ import {
   FileText,
   Folder,
   FolderOpen,
-  HardDrive,
   ListFilter,
-  LogIn,
-  LogOut,
   MessageSquarePlus,
-  Monitor,
   MoreHorizontal,
-  Moon,
   PanelLeft,
   PanelRight,
   Pencil,
@@ -32,22 +27,28 @@ import {
   Send,
   SlidersHorizontal,
   Square,
-  Sun,
   Terminal,
   Trash2,
   UserRound,
   X
 } from "lucide-react";
-import { CSSProperties, FormEvent, Fragment, KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode, WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, Fragment, KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode, WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
+import { useAuth } from "./auth/AuthGate";
+import { ChatComposer } from "./components/chat/ChatComposer";
+import { ToolCallGroup, type ManagedProcessView } from "./components/chat/ToolCallGroup";
+import { TaskPlanCard, type TaskPlanView } from "./components/chat/TaskPlanCard";
+import { AppTopBar } from "./components/layout/AppTopBar";
+import { ProjectNavigator } from "./components/sidebar/ProjectNavigator";
 
 type PermissionMode = "default" | "plan" | "workspace_write" | "full_access" | "custom";
 type ThemePreference = "system" | "dark" | "light";
 type ThinkingMode = "fast" | "balanced" | "deep";
 type ProjectKind = "empty" | "folder" | "temporary";
 type MessageStatus = "completed" | "approval_required" | "error" | "running";
+type WorkflowPhase = "preparing" | "planning" | "thinking" | "inspecting" | "executing" | "awaiting_approval" | "plan_ready" | "completed" | "stopped" | "failed";
 type ActiveView = "chat" | "settings";
-type SettingsSectionId = "general" | "profile" | "usage" | "ai" | "mcp";
+type SettingsSectionId = "profile" | "general" | "usage" | "ai" | "mcp";
 type UsageActivityMode = "daily" | "weekly" | "total";
 
 interface ModelCatalog {
@@ -75,9 +76,24 @@ interface ChatMessage {
   toolCallId?: string;
   toolName?: string;
   toolArgs?: Record<string, unknown>;
-  toolResult?: { ok: boolean; content: string };
+  toolResult?: { ok: boolean; content: string; process?: ManagedProcessView };
   diff?: DiffResult;
   artifactDiffs?: DiffResult[];
+  startedAt?: number;
+  completedAt?: number;
+  durationMs?: number;
+  showResponseMeta?: boolean;
+  responseStartedAt?: number;
+  responseCompletedAt?: number;
+  usage?: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    cachedTokens?: number;
+    model?: string;
+    provider?: string;
+    estimated?: boolean;
+  };
 }
 
 interface PendingApproval {
@@ -99,6 +115,19 @@ interface ProjectSession {
   conversationId?: string;
   messages: ChatMessage[];
   pendingApprovals: PendingApproval[];
+  permissionMode?: PermissionMode;
+  workflowPhase?: WorkflowPhase;
+  workflowLabel?: string;
+  taskPlan?: TaskPlanView;
+  contextSnapshot?: {
+    budgetTokens: number;
+    estimatedTokens: number;
+    messageCount: number;
+    includedMessageCount: number;
+    compactedMessageCount: number;
+    projectContextChars: number;
+    activeSkills: string[];
+  };
 }
 
 interface AgentProject {
@@ -115,18 +144,6 @@ interface WorkspaceState {
   projects: AgentProject[];
   activeProjectId: string;
   activeSessionId: string;
-}
-
-interface AuthUser {
-  id: number;
-  username: string;
-  displayName: string;
-  lastLoginAt?: string;
-}
-
-interface AuthSessionResponse {
-  configured: boolean;
-  user: AuthUser | null;
 }
 
 interface UsageSummary {
@@ -252,15 +269,27 @@ interface TaskTimerState {
 
 /** SSE 流事件 */
 interface StreamEvent {
-  type: "run_started" | "text_delta" | "tool_call" | "permission_decision" | "tool_result" | "diff_created" | "approval_required" | "completed" | "error";
+  type: "run_started" | "workflow_state" | "context_snapshot" | "task_plan" | "text_delta" | "usage_progress" | "usage" | "tool_call" | "permission_decision" | "tool_result" | "diff_created" | "approval_required" | "completed" | "error";
   content?: string;
   toolCall?: { id: string; name: string; arguments: Record<string, unknown> };
-  result?: { toolCallId: string; name: string; ok: boolean; content: string; diff?: DiffResult; diffs?: DiffResult[]; auditEventId?: string; exitCode?: number };
+  result?: { toolCallId: string; name: string; ok: boolean; content: string; diff?: DiffResult; diffs?: DiffResult[]; auditEventId?: string; exitCode?: number; process?: ManagedProcessView };
   conversationId?: string;
   answer?: string;
   message?: string;
   approvals?: PendingApproval[];
   diffs?: DiffResult[];
+  phase?: WorkflowPhase;
+  label?: string;
+  plan?: TaskPlanView;
+  snapshot?: ProjectSession["contextSnapshot"];
+  usage?: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    cachedTokens?: number;
+  };
+  model?: string;
+  provider?: string;
 }
 
 /** 文件 diff 信息 */
@@ -299,14 +328,8 @@ const workspaceStorageKey = "agent.workspace.projects.v1";
 const sidebarCollapsedStorageKey = "agent.workspace.sidebarCollapsed.v1";
 const sidebarWidthStorageKey = "agent.workspace.sidebarWidth.v1";
 const projectSessionCollapsedStorageKey = "agent.workspace.projectSessionCollapsed.v1";
-const authTokenStorageKey = "agent.auth.token.v1";
 const temporaryProjectId = "project_unassigned";
 const temporaryProjectName = "不使用项目";
-const localModeUser: AuthUser = {
-  id: 0,
-  username: "local",
-  displayName: "本机模式"
-};
 const defaultSidebarWidth = 318;
 const minSidebarWidth = 220;
 const maxSidebarWidth = 520;
@@ -333,6 +356,11 @@ const toolActionLabels: Record<string, { running: string; completed: string; nou
   read_file: { running: "正在读取", completed: "已读取", noun: "个文件" },
   write_file: { running: "正在编辑", completed: "已编辑", noun: "个文件" },
   run_shell: { running: "正在运行", completed: "已运行", noun: "条命令" },
+  start_process: { running: "正在启动", completed: "已启动", noun: "个进程" },
+  read_process: { running: "正在读取", completed: "已读取", noun: "个进程" },
+  write_process: { running: "正在发送", completed: "已发送", noun: "次输入" },
+  stop_process: { running: "正在停止", completed: "已停止", noun: "个进程" },
+  list_processes: { running: "正在检查", completed: "已检查", noun: "次进程列表" },
   web_fetch: { running: "正在获取", completed: "已获取", noun: "个网页" }
 };
 
@@ -411,12 +439,42 @@ function createTemporaryProject(sessions: ProjectSession[] = []): AgentProject {
   };
 }
 
+function normalizeSessionRuntimeState(session: ProjectSession): ProjectSession {
+  const activePhases: WorkflowPhase[] = ["preparing", "planning", "thinking", "inspecting", "executing"];
+  const messages = session.messages
+    // A request cannot survive an app reload. Drop only the empty placeholder
+    // and retain any partial reply as a normal, non-streaming message.
+    .filter((message) => !(message.role === "assistant" && message.isStreaming && !message.content.trim()))
+    .map((message) => ({
+      ...message,
+      isStreaming: false,
+      status: message.status === "running" ? "error" as const : message.status
+    }));
+
+  if (!session.workflowPhase || !activePhases.includes(session.workflowPhase)) {
+    return { ...session, messages };
+  }
+
+  return {
+    ...session,
+    messages,
+    workflowPhase: "stopped",
+    workflowLabel: "上次任务已结束"
+  };
+}
+
 function normalizeWorkspaceState(state: WorkspaceState): WorkspaceState {
   const temporaryProjects = state.projects.filter((project) => project.kind === "temporary");
   const regularProjects = state.projects.filter((project) => project.kind !== "temporary");
-  const temporarySessions = temporaryProjects.flatMap((project) => project.sessions);
+  const temporarySessions = temporaryProjects.flatMap((project) => project.sessions).map(normalizeSessionRuntimeState);
   const temporaryProject = createTemporaryProject(temporarySessions);
-  let projects = [...regularProjects, temporaryProject];
+  let projects = [
+    ...regularProjects.map((project) => ({
+      ...project,
+      sessions: project.sessions.map(normalizeSessionRuntimeState)
+    })),
+    temporaryProject
+  ];
   const activeWasTemporary = temporaryProjects.some((project) => project.id === state.activeProjectId);
   let activeProjectId = activeWasTemporary ? temporaryProjectId : state.activeProjectId;
   let activeSessionId = state.activeSessionId;
@@ -489,13 +547,6 @@ function loadProjectSessionCollapsedState() {
   }
 }
 
-function getAccountInitials(user?: AuthUser | null) {
-  const source = user?.displayName || user?.username || "AC";
-  const parts = source.trim().split(/\s+/).filter(Boolean);
-  if (parts.length >= 2) return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
-  return source.slice(0, 2).toUpperCase();
-}
-
 function formatTaskDuration(durationMs: number) {
   const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
   const hours = Math.floor(totalSeconds / 3600);
@@ -504,6 +555,13 @@ function formatTaskDuration(durationMs: number) {
   if (hours > 0) return `${hours}h ${minutes}m`;
   if (minutes > 0) return `${minutes}m ${seconds}s`;
   return `${seconds}s`;
+}
+
+function formatResponseDuration(durationMs: number) {
+  const safeDuration = Math.max(0, durationMs);
+  if (safeDuration < 1000) return `${Math.max(0.1, safeDuration / 1000).toFixed(1)} 秒`;
+  if (safeDuration < 60_000) return `${(safeDuration / 1000).toFixed(safeDuration < 10_000 ? 1 : 0)} 秒`;
+  return formatTaskDuration(safeDuration);
 }
 
 function formatUsageNumber(value: number) {
@@ -760,6 +818,74 @@ function lineCount(text: string) {
   return text.split("\n").length;
 }
 
+interface LineChangeStats {
+  addedLines: number;
+  removedLines: number;
+  isEstimate: boolean;
+}
+
+/**
+ * Show line totals as soon as an edit tool starts. The server-provided diff is
+ * still authoritative and replaces this lightweight argument preview when the
+ * tool finishes.
+ */
+function getToolLineChangeStats(message: ChatMessage): LineChangeStats {
+  if (message.diff) {
+    return {
+      addedLines: message.diff.addedLines,
+      removedLines: message.diff.removedLines,
+      isEstimate: false
+    };
+  }
+
+  if (message.status !== "running" || !message.toolArgs || !isEditToolName(message.toolName)) {
+    return { addedLines: 0, removedLines: 0, isEstimate: false };
+  }
+
+  const patchArg = typeof message.toolArgs.patch === "string" ? message.toolArgs.patch : "";
+  if (patchArg) {
+    const patchLines = patchArg.split("\n");
+    let insideHunk = false;
+    let addedLines = 0;
+    let removedLines = 0;
+    patchLines.forEach((line) => {
+      if (line.startsWith("@@")) {
+        insideHunk = true;
+        return;
+      }
+      if (!insideHunk) return;
+      if (line.startsWith("+")) addedLines += 1;
+      if (line.startsWith("-")) removedLines += 1;
+    });
+    return {
+      addedLines,
+      removedLines,
+      isEstimate: true
+    };
+  }
+
+  const oldTextArg = typeof message.toolArgs.oldText === "string" ? message.toolArgs.oldText : "";
+  const newTextArg = typeof message.toolArgs.newText === "string" ? message.toolArgs.newText : "";
+  if (oldTextArg || newTextArg) {
+    return {
+      addedLines: lineCount(newTextArg),
+      removedLines: lineCount(oldTextArg),
+      isEstimate: true
+    };
+  }
+
+  const contentArg = typeof message.toolArgs.content === "string" ? message.toolArgs.content : "";
+  if (message.toolName === "write_file" && contentArg) {
+    return {
+      addedLines: lineCount(contentArg),
+      removedLines: 0,
+      isEstimate: true
+    };
+  }
+
+  return { addedLines: 0, removedLines: 0, isEstimate: false };
+}
+
 function trimEditPreviewLines(lines: EditPreviewLine[], limit = editPreviewLineLimit) {
   if (lines.length <= limit) return lines;
   const hiddenCount = lines.length - limit;
@@ -961,18 +1087,45 @@ function getToolDisplayTarget(message: ChatMessage) {
   const pathArg = message.toolArgs?.path as string | undefined;
   const commandArg = message.toolArgs?.command as string | undefined;
   const urlArg = message.toolArgs?.url as string | undefined;
+  const processIdArg = message.toolArgs?.processId as string | undefined;
   if (pathArg) return getFileName(pathArg);
-  const target = commandArg ?? urlArg ?? "";
+  const target = commandArg ?? processIdArg ?? urlArg ?? "";
   if (!target) return "";
   return target.length > 42 ? `...${target.slice(-39)}` : target;
 }
 
 function getToolActivityCategory(toolName?: string): ToolActivityCategory {
-  if (toolName === "run_shell") return "command";
+  if (toolName === "run_shell" || toolName === "start_process" || toolName === "read_process" || toolName === "write_process" || toolName === "stop_process" || toolName === "list_processes") return "command";
   if (toolName === "write_file" || toolName === "apply_patch") return "edit";
   if (toolName === "read_file") return "read";
   if (toolName === "list_files" || toolName === "search_text" || toolName === "inspect_tree" || toolName === "web_fetch") return "lookup";
   return "other";
+}
+
+function getRealtimeToolStatus(toolName?: string): { phase: WorkflowPhase; label: string } {
+  if (toolName === "read_file") return { phase: "inspecting", label: "正在读取文件" };
+  if (toolName === "list_files" || toolName === "inspect_tree") return { phase: "inspecting", label: "正在查看项目文件" };
+  if (toolName === "search_text") return { phase: "inspecting", label: "正在搜索代码" };
+  if (toolName === "write_file" || toolName === "apply_patch") return { phase: "executing", label: "正在编辑文件" };
+  if (toolName === "web_fetch") return { phase: "inspecting", label: "正在获取网页" };
+  if (toolName === "run_shell") return { phase: "executing", label: "正在执行操作" };
+  if (toolName === "start_process") return { phase: "executing", label: "正在启动进程" };
+  if (toolName === "read_process" || toolName === "list_processes") return { phase: "inspecting", label: "正在检查进程" };
+  if (toolName === "write_process") return { phase: "executing", label: "正在操作进程" };
+  if (toolName === "stop_process") return { phase: "executing", label: "正在停止进程" };
+  if (toolName === "git_status" || toolName === "git_diff") return { phase: "inspecting", label: "正在检查代码变更" };
+  if (toolName === "git_branch" || toolName === "git_stage" || toolName === "git_commit") return { phase: "executing", label: "正在执行 Git 操作" };
+  if (toolName?.startsWith("mcp__")) return { phase: "executing", label: "正在调用外部工具" };
+  return { phase: "executing", label: "正在调用工具" };
+}
+
+function getWorkflowActivityLabel(phase?: WorkflowPhase) {
+  if (phase === "preparing") return "准备中";
+  if (phase === "planning") return "规划中";
+  if (phase === "inspecting") return "检查中";
+  if (phase === "executing") return "执行中";
+  if (phase === "awaiting_approval") return "等待中";
+  return "思考中";
 }
 
 function getToolActivityTarget(message: ChatMessage, projectPath?: string) {
@@ -981,10 +1134,13 @@ function getToolActivityTarget(message: ChatMessage, projectPath?: string) {
   const commandArg = message.toolArgs?.command as string | undefined;
   const urlArg = message.toolArgs?.url as string | undefined;
   const queryArg = message.toolArgs?.query as string | undefined;
+  const processIdArg = message.toolArgs?.processId as string | undefined;
 
   if (category === "command" && commandArg) {
     return commandArg.length > 72 ? `${commandArg.slice(0, 69)}...` : commandArg;
   }
+
+  if (category === "command" && processIdArg) return processIdArg;
 
   if ((category === "edit" || category === "read" || category === "lookup") && pathArg) {
     const displayPath = getDisplayFilePath(pathArg, projectPath);
@@ -999,7 +1155,7 @@ function getToolActivityTarget(message: ChatMessage, projectPath?: string) {
     return urlArg.length > 72 ? `...${urlArg.slice(-69)}` : urlArg;
   }
 
-  const fallback = pathArg ?? commandArg ?? urlArg ?? message.toolName ?? "";
+  const fallback = pathArg ?? commandArg ?? processIdArg ?? urlArg ?? message.toolName ?? "";
   return fallback.length > 72 ? `...${fallback.slice(-69)}` : fallback;
 }
 
@@ -1017,6 +1173,62 @@ function getToolActivityGroups(toolMessages: ChatMessage[], projectPath?: string
     }));
 }
 
+type MessageRenderItem =
+  | { type: "single"; message: ChatMessage }
+  | { type: "toolGroup"; messages: ChatMessage[] };
+
+function getMessageRenderItems(messages: ChatMessage[]): MessageRenderItem[] {
+  const items: MessageRenderItem[] = [];
+  let currentToolGroup: ChatMessage[] = [];
+
+  const flushToolGroup = () => {
+    if (currentToolGroup.length === 0) return;
+    items.push({ type: "toolGroup", messages: currentToolGroup });
+    currentToolGroup = [];
+  };
+
+  for (const message of messages) {
+    if (message.role === "tool") {
+      const currentCategory = currentToolGroup[0]
+        ? getToolActivityCategory(currentToolGroup[0].toolName)
+        : undefined;
+      const nextCategory = getToolActivityCategory(message.toolName);
+
+      // Only truly adjacent actions of the same kind share one disclosure row.
+      // Empty assistant placeholders created between tool calls are intentionally
+      // transparent so they neither split the group nor render repeated thinking UI.
+      if (currentCategory && currentCategory !== nextCategory) flushToolGroup();
+      currentToolGroup.push(message);
+      continue;
+    }
+
+    // Keep the active assistant placeholder in the render list so the
+    // per-response progress row appears immediately, before the first token.
+    if (
+      message.role === "assistant" &&
+      !message.content.trim() &&
+      !message.isStreaming &&
+      message.showResponseMeta !== true
+    ) continue;
+
+    if (currentToolGroup.length > 0) {
+      const containsEdits = currentToolGroup.some((toolMessage) => isEditToolName(toolMessage.toolName));
+      // Keep the final written delivery ahead of its edit artifact summary.
+      if (message.role === "assistant" && containsEdits && message.status === "completed" && !message.isStreaming) {
+        items.push({ type: "single", message });
+        flushToolGroup();
+        continue;
+      }
+      flushToolGroup();
+    }
+
+    items.push({ type: "single", message });
+  }
+
+  flushToolGroup();
+  return items;
+}
+
 function formatToolActivityTargets(targets: string[]) {
   const uniqueTargets = [...new Set(targets)];
   const visibleTargets = uniqueTargets.slice(0, 2);
@@ -1025,7 +1237,8 @@ function formatToolActivityTargets(targets: string[]) {
 }
 
 function getToolGroupSummary(toolMessages: ChatMessage[], projectPath?: string) {
-  const runningCount = toolMessages.filter((m) => m.status === "running").length;
+  const isMessageRunning = (message: ChatMessage) => message.status === "running" || message.toolResult?.process?.status === "running";
+  const runningCount = toolMessages.filter(isMessageRunning).length;
   const doneCount = toolMessages.filter((m) => m.status === "completed").length;
   const hasRunning = runningCount > 0;
   const allDone = doneCount === toolMessages.length;
@@ -1034,21 +1247,23 @@ function getToolGroupSummary(toolMessages: ChatMessage[], projectPath?: string) 
   const labels = primaryTool ? toolActionLabels[primaryTool] : undefined;
   const activityGroups = getToolActivityGroups(toolMessages, projectPath);
   const diffMessages = toolMessages.filter((message) => message.diff);
-  const addedLines = diffMessages.reduce((sum, message) => sum + (message.diff?.addedLines ?? 0), 0);
-  const removedLines = diffMessages.reduce((sum, message) => sum + (message.diff?.removedLines ?? 0), 0);
+  const lineChanges = toolMessages.map(getToolLineChangeStats);
+  const addedLines = lineChanges.reduce((sum, change) => sum + change.addedLines, 0);
+  const removedLines = lineChanges.reduce((sum, change) => sum + change.removedLines, 0);
+  const isDiffEstimate = lineChanges.some((change) => change.isEstimate);
   const focusedMessage =
-    toolMessages.find((m) => m.status === "running") ??
+    toolMessages.find(isMessageRunning) ??
     diffMessages[0] ??
     toolMessages.find((m) => m.toolArgs?.path || m.toolArgs?.command || m.toolArgs?.url) ??
     toolMessages[0];
   const target = focusedMessage ? getToolDisplayTarget(focusedMessage) : "";
 
   if (hasRunning) {
-    const runningGroups = activityGroups.filter((group) => group.messages.some((message) => message.status === "running"));
+    const runningGroups = activityGroups.filter((group) => group.messages.some(isMessageRunning));
     const summaryGroups = runningGroups.length > 0 ? runningGroups : activityGroups;
     const label = summaryGroups
       .map((group) => {
-        const count = group.messages.filter((message) => message.status === "running").length || group.messages.length;
+        const count = group.messages.filter(isMessageRunning).length || group.messages.length;
         return `${group.labels.running} ${count} ${group.labels.noun}`;
       })
       .join("，");
@@ -1062,6 +1277,7 @@ function getToolGroupSummary(toolMessages: ChatMessage[], projectPath?: string) 
       detail: detail || (target ? `${labels?.running ?? "正在处理"} ${target}` : undefined),
       addedLines,
       removedLines,
+      isDiffEstimate,
       isRunning: true,
       primaryTool
     };
@@ -1081,6 +1297,7 @@ function getToolGroupSummary(toolMessages: ChatMessage[], projectPath?: string) 
       detail: detail || (target ? `${labels?.completed ?? "已处理"} ${target}` : undefined),
       addedLines,
       removedLines,
+      isDiffEstimate,
       isRunning: false,
       primaryTool
     };
@@ -1091,6 +1308,7 @@ function getToolGroupSummary(toolMessages: ChatMessage[], projectPath?: string) 
     detail: target ? `正在处理 ${target}` : undefined,
     addedLines,
     removedLines,
+    isDiffEstimate,
     isRunning: false,
     primaryTool
   };
@@ -1187,6 +1405,7 @@ async function* parseSseStream(response: Response): AsyncGenerator<StreamEvent> 
 }
 
 export default function App() {
+  const { user: authUser, logout } = useAuth();
   const [workspaceState, setWorkspaceState] = useState<WorkspaceState>(() => loadWorkspaceState());
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem(sidebarCollapsedStorageKey) === "true");
   const [sidebarWidth, setSidebarWidth] = useState(() => loadSidebarWidth());
@@ -1194,12 +1413,6 @@ export default function App() {
     () => loadProjectSessionCollapsedState()
   );
   const [isSidebarResizing, setIsSidebarResizing] = useState(false);
-  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
-  const [authConfigured, setAuthConfigured] = useState(true);
-  const [authLoading, setAuthLoading] = useState(true);
-  const [authError, setAuthError] = useState("");
-  const [loginUsername, setLoginUsername] = useState("local");
-  const [loginPassword, setLoginPassword] = useState("");
   const [activeView, setActiveView] = useState<ActiveView>("chat");
   const [selectedSettingsSection, setSelectedSettingsSection] = useState<SettingsSectionId>("general");
   const [mode, setMode] = useState<PermissionMode>("workspace_write");
@@ -1221,6 +1434,9 @@ export default function App() {
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [thinkingMode, setThinkingMode] = useState<ThinkingMode>("balanced");
   const [permissionMenuOpen, setPermissionMenuOpen] = useState(false);
+  const [managedProcessPanelOpen, setManagedProcessPanelOpen] = useState(false);
+  const [managedProcesses, setManagedProcesses] = useState<ManagedProcessView[]>([]);
+  const [managedProcessLoadError, setManagedProcessLoadError] = useState("");
   const [permissionOptions, setPermissionOptions] = useState<PermissionOption[]>(defaultPermissionOptions);
   const [usageSummary, setUsageSummary] = useState<UsageSummary | undefined>();
   const [toolCatalog, setToolCatalog] = useState<ToolCatalogItem[]>([]);
@@ -1236,7 +1452,7 @@ export default function App() {
     displayName: "",
     baseUrl: "",
     apiKey: "",
-    defaultModel: "",
+    defaultModel: "gpt-4o",
     modelsPath: "/models",
     chatCompletionsPath: "/chat/completions",
     apiKeyEnv: "AI_API_KEY",
@@ -1309,10 +1525,6 @@ export default function App() {
 
   const resolvedTheme = themePreference === "system" ? systemTheme : themePreference;
   const modelName = selectedModel || health?.model || "Agent";
-  const selectedPermission =
-    permissionOptions.find((item) => item.id === mode) ??
-    defaultPermissionOptions.find((item) => item.id === mode) ??
-    defaultPermissionOptions[0];
 
   const activeProject = useMemo(
     () => workspaceState.projects.find((project) => project.id === workspaceState.activeProjectId),
@@ -1322,22 +1534,39 @@ export default function App() {
     () => activeProject?.sessions.find((session) => session.id === workspaceState.activeSessionId),
     [activeProject, workspaceState.activeSessionId]
   );
+  const currentProjectManagedProcesses = useMemo(
+    () => activeProject?.path ? managedProcesses.filter((process) => process.projectPath === activeProject.path) : [],
+    [activeProject?.path, managedProcesses]
+  );
+  const currentMode = activeSession?.permissionMode ?? mode;
+  const selectedPermission =
+    permissionOptions.find((item) => item.id === currentMode) ??
+    defaultPermissionOptions.find((item) => item.id === currentMode) ??
+    defaultPermissionOptions[0];
 
   const messages = activeSession?.messages ?? [];
   const pendingApprovals = activeSession?.pendingApprovals ?? [];
   const conversationId = activeSession?.conversationId;
   const isActiveSessionRunning = activeSession ? runningSessionIds.has(activeSession.id) : false;
+  const activeResponseMetaId = useMemo(() => {
+    if (!isActiveSessionRunning) return undefined;
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index];
+      if (message.role === "assistant" && message.showResponseMeta === true) return message.id;
+    }
+    return undefined;
+  }, [isActiveSessionRunning, messages]);
   const activeTaskTimer = activeSession ? taskTimers[activeSession.id] : undefined;
   const activeTaskElapsedMs = activeTaskTimer
     ? activeTaskTimer.startedAt
       ? activeTaskTimer.elapsedMs + Math.max(0, timerTick - activeTaskTimer.startedAt)
       : activeTaskTimer.elapsedMs
     : 0;
-  const shouldShowTaskDuration = Boolean(activeTaskTimer && (isActiveSessionRunning || activeTaskElapsedMs > 0));
+  const shouldShowTaskDuration = Boolean(activeTaskTimer && isActiveSessionRunning);
+  const activeWorkflowActivityLabel = getWorkflowActivityLabel(activeSession?.workflowPhase);
   const hasVisibleProcess =
     isActiveSessionRunning ||
-    pendingApprovals.length > 0 ||
-    messages.some((message) => message.isStreaming || message.status === "approval_required" || message.status === "running");
+    pendingApprovals.length > 0;
   const completedViewMessageIds = useMemo(
     () => (hasVisibleProcess ? undefined : getCompletedViewMessageIds(messages)),
     [hasVisibleProcess, messages]
@@ -1486,6 +1715,34 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (isDesktopClient && !localApiToken) return;
+    let disposed = false;
+
+    const pollManagedProcesses = async () => {
+      try {
+        const response = await fetch(`${API_BASE}/api/processes`, { headers: getLocalApiHeaders() });
+        if (!response.ok) throw new Error("无法读取长期进程");
+        const data = await response.json() as { processes?: ManagedProcessView[] };
+        if (!disposed) {
+          const processes = data.processes ?? [];
+          setManagedProcesses(processes);
+          setManagedProcessLoadError("");
+          mergeManagedProcessSnapshots(processes, true);
+        }
+      } catch (error) {
+        if (!disposed) setManagedProcessLoadError(error instanceof Error ? error.message : "无法读取长期进程");
+      }
+    };
+
+    void pollManagedProcesses();
+    const intervalId = window.setInterval(() => void pollManagedProcesses(), 1_500);
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+    };
+  }, [isDesktopClient, localApiToken]);
+
+  useEffect(() => {
     fetch(`${API_BASE}/api/health`)
       .then((r) => r.json())
       .then((data) => {
@@ -1504,10 +1761,6 @@ export default function App() {
         setModelOptions([...new Set([...recommended, ...all])]);
       })
       .catch(() => setModelOptions([]));
-  }, []);
-
-  useEffect(() => {
-    void loadAuthSession();
   }, []);
 
   useEffect(() => {
@@ -1863,6 +2116,13 @@ export default function App() {
     const controller = abortControllersRef.current.get(activeSession.id);
     controller?.abort();
     abortControllersRef.current.delete(activeSession.id);
+    if (activeProject) {
+      updateSession(activeProject.id, activeSession.id, (session) => ({
+        ...session,
+        workflowPhase: "stopped",
+        workflowLabel: "已停止当前任务"
+      }));
+    }
     markSessionIdle(activeSession.id);
   }
 
@@ -1890,9 +2150,11 @@ export default function App() {
     response: Response,
     projectId: string,
     sessionId: string,
-    _initialAssistantId: string
+    _initialAssistantId: string,
+    responseStartedAt: number
   ) {
     let currentAssistantId = _initialAssistantId;
+    let modelCallStartedAt = Date.now();
     // 每次工具调用完成后，下一个 text_delta 需要新起一行
     let needNewAssistantRow = false;
     // 编辑工具会把前置说明和最终交付拆成两条 assistant 消息。只有真正
@@ -1902,6 +2164,110 @@ export default function App() {
     // 当前 Agent 运行产生的文件变更，在最终回复上作为可审核交付物展示。
     const runDiffs = new Map<string, DiffResult>();
 
+    const appendAssistantSegment = (
+      messages: ChatMessage[],
+      target: ChatMessage
+    ): ChatMessage[] => [
+      ...messages,
+      {
+        ...target,
+        // The progress header belongs to the first assistant row while a run
+        // is active. New rows created after tools must not pull it downward.
+        showResponseMeta: false,
+        responseStartedAt: undefined,
+        responseCompletedAt: undefined,
+        usage: undefined
+      }
+    ];
+
+    const moveResponseMeta = (
+      messages: ChatMessage[],
+      sourceId: string,
+      target: ChatMessage
+    ): ChatMessage[] => {
+      const source = messages.find((message) => message.showResponseMeta === true) ??
+        messages.find((message) => message.id === sourceId);
+      const usage = source?.usage ?? {
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        model: modelName,
+        estimated: true
+      };
+      return [
+        ...messages.map((message) =>
+          message.id === source?.id
+            ? {
+                ...message,
+                showResponseMeta: false,
+                responseStartedAt: undefined,
+                responseCompletedAt: undefined,
+                usage: undefined
+              }
+            : message
+        ),
+        {
+          ...target,
+          showResponseMeta: true,
+          responseStartedAt: source?.responseStartedAt ?? responseStartedAt,
+          responseCompletedAt: target.responseCompletedAt ?? source?.responseCompletedAt,
+          usage
+        }
+      ];
+    };
+
+    const moveResponseMetaToExisting = (
+      messages: ChatMessage[],
+      targetId: string,
+      responseCompletedAt: number
+    ): ChatMessage[] => {
+      const source = messages.find((message) => message.showResponseMeta === true);
+      if (!source || source.id === targetId) {
+        return messages.map((message) =>
+          message.id === targetId
+            ? { ...message, responseCompletedAt }
+            : message
+        );
+      }
+
+      return messages.map((message) => {
+        if (message.id === source.id) {
+          return {
+            ...message,
+            showResponseMeta: false,
+            responseStartedAt: undefined,
+            responseCompletedAt: undefined,
+            usage: undefined
+          };
+        }
+        if (message.id === targetId) {
+          return {
+            ...message,
+            showResponseMeta: true,
+            responseStartedAt: source.responseStartedAt ?? responseStartedAt,
+            responseCompletedAt,
+            usage: source.usage
+          };
+        }
+        return message;
+      });
+    };
+
+    const finalizeAssistantMessage = (message: ChatMessage, now = Date.now()): ChatMessage => {
+      const startedAt = message.startedAt ?? modelCallStartedAt;
+      return {
+        ...message,
+        // Models often emit several line breaks immediately before a tool call.
+        // They are transport padding, not visible message content, and would be
+        // preserved by the bubble's `white-space: pre-wrap` styling.
+        content: message.content.trimEnd(),
+        isStreaming: false,
+        startedAt,
+        completedAt: message.completedAt ?? now,
+        durationMs: message.durationMs ?? Math.max(0, now - startedAt)
+      };
+    };
+
     const attachCompletion = (
       status: Extract<MessageStatus, "completed" | "error">,
       fallbackContent: string,
@@ -1909,45 +2275,51 @@ export default function App() {
     ) => {
       const artifactDiffs = runDiffs.size > 0 ? [...runDiffs.values()] : undefined;
       const completionContent = fallbackContent || (status === "error" ? "任务执行时发生错误。" : "任务已完成。");
+      const completedAt = Date.now();
 
       updateSession(projectId, sessionId, (session) => {
         // 一旦有成功编辑，最终交付必须位于工具调用之后。这样工具日志的
         // 展开/折叠和模型是否补充结语，都不会影响“审核”卡片的可见性。
         if (artifactDiffs?.length && !hasPostToolAssistantResponse) {
+          const finalAssistantId = createId("message");
+          const finalMessage: ChatMessage = {
+            id: finalAssistantId,
+            role: "assistant",
+            content: completionContent,
+            status,
+            artifactDiffs,
+            startedAt: modelCallStartedAt,
+            completedAt,
+            durationMs: Math.max(0, completedAt - modelCallStartedAt),
+            responseCompletedAt: completedAt
+          };
+          const finalizedMessages = session.messages.map((message) =>
+            message.id === currentAssistantId ? finalizeAssistantMessage(message, completedAt) : message
+          );
           return {
             ...session,
             conversationId: serverConversationId || session.conversationId,
             pendingApprovals: [],
-            messages: [
-              ...session.messages.map((message) =>
-                message.id === currentAssistantId ? { ...message, isStreaming: false } : message
-              ),
-              {
-                id: createId("message"),
-                role: "assistant" as const,
-                content: completionContent,
-                status,
-                artifactDiffs
-              }
-            ]
+            messages: moveResponseMeta(finalizedMessages, currentAssistantId, finalMessage)
           };
         }
+
+        const finalizedMessages = session.messages.map((message) =>
+          message.id === currentAssistantId
+            ? {
+                ...finalizeAssistantMessage(message, completedAt),
+                status,
+                content: message.content || completionContent,
+                artifactDiffs
+              }
+            : message
+        );
 
         return {
           ...session,
           conversationId: serverConversationId || session.conversationId,
           pendingApprovals: [],
-          messages: session.messages.map((message) =>
-            message.id === currentAssistantId
-              ? {
-                  ...message,
-                  isStreaming: false,
-                  status,
-                  content: message.content || completionContent,
-                  artifactDiffs
-                }
-              : message
-          )
+          messages: moveResponseMetaToExisting(finalizedMessages, currentAssistantId, completedAt)
         };
       });
     };
@@ -1961,16 +2333,79 @@ export default function App() {
           }));
           break;
 
+        case "workflow_state":
+          if (event.phase) {
+            const isModelCallPhase = event.phase === "thinking" || event.phase === "planning";
+            if (isModelCallPhase) {
+              modelCallStartedAt = Date.now();
+              if (needNewAssistantRow) {
+                const newId = createId("message");
+                currentAssistantId = newId;
+                needNewAssistantRow = false;
+                hasPostToolAssistantResponse = true;
+                updateSession(projectId, sessionId, (s) => ({
+                  ...s,
+                  messages: appendAssistantSegment(
+                    s.messages,
+                    {
+                      id: newId,
+                      role: "assistant" as const,
+                      content: "",
+                      isStreaming: true,
+                      startedAt: modelCallStartedAt
+                    }
+                  )
+                }));
+              } else {
+                updateSession(projectId, sessionId, (s) => ({
+                  ...s,
+                  messages: s.messages.map((message) =>
+                    message.id === currentAssistantId && !message.content.trim()
+                      ? { ...message, isStreaming: true, startedAt: modelCallStartedAt }
+                      : message
+                  )
+                }));
+              }
+            }
+            updateSession(projectId, sessionId, (s) => ({
+              ...s,
+              workflowPhase: event.phase,
+              workflowLabel: event.label ?? s.workflowLabel
+            }));
+          }
+          break;
+
+        case "context_snapshot":
+          if (event.snapshot) {
+            updateSession(projectId, sessionId, (s) => ({ ...s, contextSnapshot: event.snapshot }));
+          }
+          break;
+
+        case "task_plan":
+          if (event.plan) {
+            updateSession(projectId, sessionId, (s) => ({
+              ...s,
+              taskPlan: event.plan,
+              workflowPhase: "plan_ready",
+              workflowLabel: `计划已就绪，共 ${event.plan!.steps.length} 步`
+            }));
+          }
+          break;
+
         case "text_delta": {
           if (needNewAssistantRow) {
             // 新起一行 assistant 消息
             const newId = createId("message");
             currentAssistantId = newId;
+            modelCallStartedAt = Date.now();
             needNewAssistantRow = false;
             hasPostToolAssistantResponse = true;
             updateSession(projectId, sessionId, (s) => ({
               ...s,
-              messages: [...s.messages, { id: newId, role: "assistant" as const, content: event.content ?? "", isStreaming: true }]
+              messages: appendAssistantSegment(
+                s.messages,
+                { id: newId, role: "assistant" as const, content: event.content ?? "", isStreaming: true, startedAt: modelCallStartedAt }
+              )
             }));
           } else {
             updateSession(projectId, sessionId, (s) => ({
@@ -1983,17 +2418,43 @@ export default function App() {
           break;
         }
 
+        case "usage_progress":
+        case "usage":
+          if (event.usage) {
+            const isEstimated = event.type === "usage_progress";
+            updateSession(projectId, sessionId, (s) => ({
+              ...s,
+              messages: s.messages.map((message) =>
+                message.showResponseMeta
+                  ? {
+                      ...message,
+                      usage: {
+                        ...event.usage!,
+                        model: event.model,
+                        provider: event.provider,
+                        estimated: isEstimated
+                      }
+                    }
+                  : message
+              )
+            }));
+          }
+          break;
+
         case "tool_call":
           if (event.toolCall) {
+            const toolStatus = getRealtimeToolStatus(event.toolCall.name);
             // 标记当前 assistant 消息不再流式
             updateSession(projectId, sessionId, (s) => ({
               ...s,
               messages: s.messages.map((m) =>
-                m.id === currentAssistantId ? { ...m, isStreaming: false } : m
+                m.id === currentAssistantId ? finalizeAssistantMessage(m) : m
               )
             }));
             updateSession(projectId, sessionId, (s) => ({
               ...s,
+              workflowPhase: toolStatus.phase,
+              workflowLabel: toolStatus.label,
               messages: [
                 ...s.messages,
                 {
@@ -2033,7 +2494,7 @@ export default function App() {
                   return {
                     ...m,
                     content: event.result!.content,
-                    toolResult: { ok: event.result!.ok, content: event.result!.content },
+                    toolResult: { ok: event.result!.ok, content: event.result!.content, process: event.result!.process },
                     diff: resultDiff,
                     status: "completed" as const
                   };
@@ -2061,17 +2522,25 @@ export default function App() {
           break;
 
         case "approval_required":
+          {
+          const responseCompletedAt = Date.now();
           updateSession(projectId, sessionId, (s) => ({
             ...s,
             conversationId: event.conversationId || s.conversationId,
             pendingApprovals: event.approvals ?? [],
             messages: s.messages.map((m) =>
               m.id === currentAssistantId
-                ? { ...m, isStreaming: false, status: "approval_required" as const, content: m.content || "需要你批准后才能继续执行。" }
+                ? {
+                    ...finalizeAssistantMessage(m, responseCompletedAt),
+                    status: "approval_required" as const,
+                    content: m.content || "需要你批准后才能继续执行。",
+                    responseCompletedAt: m.showResponseMeta ? responseCompletedAt : m.responseCompletedAt
+                  }
                 : m
             )
           }));
           break;
+          }
 
         case "completed":
           attachCompletion("completed", event.answer || "任务已完成。", event.conversationId);
@@ -2089,7 +2558,8 @@ export default function App() {
     sessionId: string,
     content: string,
     addUserMessage = true,
-    displayContent = content
+    displayContent = content,
+    modeOverride?: PermissionMode
   ) {
     const context = getSessionContext(projectId, sessionId);
     if (!context) return;
@@ -2097,10 +2567,22 @@ export default function App() {
     if (addUserMessage) appendUserMessage(projectId, sessionId, displayContent);
 
     const assistantMessageId = createId("message");
+    const requestStartedAt = Date.now();
     updateSession(projectId, sessionId, (s) => ({
       ...s,
       updatedAt: new Date().toISOString(),
-      messages: [...s.messages, { id: assistantMessageId, role: "assistant", content: "", isStreaming: true }]
+      workflowPhase: "preparing",
+      workflowLabel: "正在准备上下文",
+      messages: [...s.messages, {
+        id: assistantMessageId,
+        role: "assistant",
+        content: "",
+        isStreaming: true,
+        startedAt: requestStartedAt,
+        showResponseMeta: true,
+        responseStartedAt: requestStartedAt,
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, model: modelName, estimated: true }
+      }]
     }));
 
     const abortController = new AbortController();
@@ -2114,7 +2596,7 @@ export default function App() {
         headers: getJsonHeaders(),
         body: JSON.stringify({
           prompt: content,
-          mode,
+          mode: modeOverride ?? context.session.permissionMode ?? mode,
           conversationId: context.session.conversationId,
           model: modelName,
           thinkingMode,
@@ -2122,26 +2604,63 @@ export default function App() {
         })
       });
 
-      await consumeSseStream(result, projectId, sessionId, assistantMessageId);
+      await consumeSseStream(result, projectId, sessionId, assistantMessageId, requestStartedAt);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         updateSession(projectId, sessionId, (s) => ({
           ...s,
           messages: s.messages.map((m) =>
-            m.id === assistantMessageId ? { ...m, isStreaming: false, content: m.content + "\n\n已停止当前回复。" } : m
+            m.role === "assistant" && m.isStreaming
+              ? {
+                  ...m,
+                  isStreaming: false,
+                  status: "error" as const,
+                  content: m.content ? `${m.content}\n\n已停止当前回复。` : "已停止当前回复。",
+                  completedAt: Date.now(),
+                  durationMs: Math.max(0, Date.now() - (m.startedAt ?? requestStartedAt))
+                }
+              : m
           )
         }));
       } else {
         updateSession(projectId, sessionId, (s) => ({
           ...s,
+          workflowPhase: "failed",
+          workflowLabel: "请求失败",
           messages: s.messages.map((m) =>
-            m.id === assistantMessageId
-              ? { ...m, isStreaming: false, status: "error" as const, content: error instanceof Error ? error.message : "请求失败" }
+            m.role === "assistant" && m.isStreaming
+              ? {
+                  ...m,
+                  isStreaming: false,
+                  status: "error" as const,
+                  content: m.content || (error instanceof Error ? error.message : "请求失败"),
+                  completedAt: Date.now(),
+                  durationMs: Math.max(0, Date.now() - (m.startedAt ?? requestStartedAt))
+                }
               : m
           )
         }));
       }
     } finally {
+      const settledAt = Date.now();
+      updateSession(projectId, sessionId, (s) => ({
+        ...s,
+        messages: s.messages
+          .filter((message) => !(message.role === "assistant" && message.isStreaming && !message.content.trim()))
+          .map((message) => {
+            const settledMessage = message.isStreaming
+              ? {
+                  ...message,
+                  isStreaming: false,
+                  completedAt: message.completedAt ?? settledAt,
+                  durationMs: message.durationMs ?? Math.max(0, settledAt - (message.startedAt ?? requestStartedAt))
+                }
+              : message;
+            return settledMessage.showResponseMeta
+              ? { ...settledMessage, responseCompletedAt: settledMessage.responseCompletedAt ?? settledAt }
+              : settledMessage;
+          })
+      }));
       if (abortControllersRef.current.get(sessionId) === abortController) abortControllersRef.current.delete(sessionId);
       markSessionIdle(sessionId);
       void reloadPlatformData();
@@ -2169,10 +2688,22 @@ export default function App() {
     const projectId = activeProject.id;
     const sessionId = activeSession.id;
     const assistantMessageId = createId("message");
+    const requestStartedAt = Date.now();
     updateSession(projectId, sessionId, (s) => ({
       ...s,
       pendingApprovals: [],
-      messages: [...s.messages, { id: assistantMessageId, role: "assistant", content: "", isStreaming: true }]
+      workflowPhase: "preparing",
+      workflowLabel: "正在准备上下文",
+      messages: [...s.messages, {
+        id: assistantMessageId,
+        role: "assistant",
+        content: "",
+        isStreaming: true,
+        startedAt: requestStartedAt,
+        showResponseMeta: true,
+        responseStartedAt: requestStartedAt,
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, model: modelName, estimated: true }
+      }]
     }));
 
     const abortController = new AbortController();
@@ -2187,26 +2718,52 @@ export default function App() {
         body: JSON.stringify({
           approvalId,
           allow,
-          mode,
+          mode: activeSession.permissionMode ?? mode,
           model: modelName,
           thinkingMode,
           projectPath: activeProject.path
         })
       });
 
-      await consumeSseStream(result, projectId, sessionId, assistantMessageId);
+      await consumeSseStream(result, projectId, sessionId, assistantMessageId, requestStartedAt);
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")) {
         updateSession(projectId, sessionId, (s) => ({
           ...s,
           messages: s.messages.map((m) =>
-            m.id === assistantMessageId
-              ? { ...m, isStreaming: false, status: "error" as const, content: error instanceof Error ? error.message : "请求失败" }
+            m.role === "assistant" && m.isStreaming
+              ? {
+                  ...m,
+                  isStreaming: false,
+                  status: "error" as const,
+                  content: m.content || (error instanceof Error ? error.message : "请求失败"),
+                  completedAt: Date.now(),
+                  durationMs: Math.max(0, Date.now() - (m.startedAt ?? requestStartedAt))
+                }
               : m
           )
         }));
       }
     } finally {
+      const settledAt = Date.now();
+      updateSession(projectId, sessionId, (s) => ({
+        ...s,
+        messages: s.messages
+          .filter((message) => !(message.role === "assistant" && message.isStreaming && !message.content.trim()))
+          .map((message) => {
+            const settledMessage = message.isStreaming
+              ? {
+                  ...message,
+                  isStreaming: false,
+                  completedAt: message.completedAt ?? settledAt,
+                  durationMs: message.durationMs ?? Math.max(0, settledAt - (message.startedAt ?? requestStartedAt))
+                }
+              : message;
+            return settledMessage.showResponseMeta
+              ? { ...settledMessage, responseCompletedAt: settledMessage.responseCompletedAt ?? settledAt }
+              : settledMessage;
+          })
+      }));
       if (abortControllersRef.current.get(sessionId) === abortController) abortControllersRef.current.delete(sessionId);
       markSessionIdle(sessionId);
       void processNextQueuedPrompt(sessionId);
@@ -2225,6 +2782,35 @@ export default function App() {
       return;
     }
     void runAgent();
+  }
+
+  function changeSessionMode(nextMode: PermissionMode) {
+    setMode(nextMode);
+    if (activeProject && activeSession) {
+      updateSession(activeProject.id, activeSession.id, (session) => ({ ...session, permissionMode: nextMode }));
+    }
+  }
+
+  function startPlannedExecution() {
+    if (!activeProject || !activeSession || !activeSession.taskPlan || isActiveSessionRunning) return;
+    const projectId = activeProject.id;
+    const sessionId = activeSession.id;
+    const planText = activeSession.taskPlan.steps.map((step, index) => `${index + 1}. ${step.title}`).join("\n");
+    changeSessionMode("workspace_write");
+    updateSession(projectId, sessionId, (session) => ({
+      ...session,
+      permissionMode: "workspace_write",
+      workflowPhase: "preparing",
+      workflowLabel: "已确认计划，准备执行"
+    }));
+    void runAgentForSession(
+      projectId,
+      sessionId,
+      `请开始执行刚刚确认的计划。按顺序实施并完成验证；如项目实际情况与计划冲突，请说明后做最小必要调整。\n\n${planText}`,
+      true,
+      "确认计划并开始执行",
+      "workspace_write"
+    );
   }
 
   function toggleSidebar() {
@@ -2312,11 +2898,6 @@ export default function App() {
     setThemePreferenceWithTransition(targetTheme, e.currentTarget);
   }
 
-  function getAuthHeaders() {
-    const token = localStorage.getItem(authTokenStorageKey);
-    return token ? { authorization: `Bearer ${token}` } : undefined;
-  }
-
   function getLocalApiHeaders(): HeadersInit {
     return localApiToken ? { "x-agent-token": localApiToken } : {};
   }
@@ -2325,69 +2906,62 @@ export default function App() {
     return { "content-type": "application/json", ...getLocalApiHeaders() };
   }
 
-  async function loadAuthSession() {
-    setAuthLoading(true);
+  async function refreshManagedProcesses() {
     try {
-      const response = await fetch(`${API_BASE}/api/auth/session`, { headers: getAuthHeaders() });
-      const data = (await response.json()) as AuthSessionResponse;
-      setAuthConfigured(data.configured);
-      if (data.configured) {
-        setAuthUser(data.user);
-        if (!data.user) localStorage.removeItem(authTokenStorageKey);
-      } else {
-        localStorage.removeItem(authTokenStorageKey);
-        setAuthUser(localModeUser);
-      }
-    } catch {
-      setAuthConfigured(false);
-      setAuthUser(localModeUser);
-    } finally {
-      setAuthLoading(false);
-    }
-  }
-
-  async function handleLogin(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setAuthError("");
-    if (!loginUsername.trim() || !loginPassword) {
-      setAuthError("请输入账号和密码");
-      return;
-    }
-
-    setAuthLoading(true);
-    try {
-      const response = await fetch(`${API_BASE}/api/auth/login`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ username: loginUsername.trim(), password: loginPassword })
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(typeof data.error === "string" ? data.error : "登录失败");
-      }
-      localStorage.setItem(authTokenStorageKey, data.token);
-      setAuthUser(data.user);
-      setLoginPassword("");
+      const response = await fetch(`${API_BASE}/api/processes`, { headers: getLocalApiHeaders() });
+      if (!response.ok) throw new Error("无法读取长期进程");
+      const data = await response.json() as { processes?: ManagedProcessView[] };
+      const processes = data.processes ?? [];
+      setManagedProcesses(processes);
+      setManagedProcessLoadError("");
+      mergeManagedProcessSnapshots(processes, true);
     } catch (error) {
-      setAuthUser(null);
-      setAuthError(error instanceof Error ? error.message : "登录失败");
-    } finally {
-      setAuthLoading(false);
+      const message = error instanceof Error ? error.message : "无法读取长期进程";
+      setManagedProcessLoadError(message);
+      throw error;
     }
   }
 
-  async function logout() {
-    const headers = getAuthHeaders();
-    localStorage.removeItem(authTokenStorageKey);
-    setAuthUser(authConfigured ? null : localModeUser);
-    setLoginPassword("");
-    if (headers) {
-      try {
-        await fetch(`${API_BASE}/api/auth/logout`, { method: "POST", headers });
-      } catch {
-        /* ignore */
-      }
-    }
+  function mergeManagedProcessSnapshots(processes: ManagedProcessView[], markMissing = false) {
+    const snapshots = new Map(processes.map((process) => [process.id, process]));
+    setWorkspaceState((current) => {
+      let changed = false;
+      const projects = current.projects.map((project) => ({
+        ...project,
+        sessions: project.sessions.map((session) => ({
+          ...session,
+          messages: session.messages.map((message) => {
+            const existing = message.toolResult?.process;
+            if (!existing) return message;
+            let next = snapshots.get(existing.id);
+            if (!next && markMissing && existing.status === "running") {
+              next = {
+                ...existing,
+                status: "failed",
+                endedAt: new Date().toISOString(),
+                outputVersion: existing.outputVersion + 1,
+                output: `${existing.output}${existing.output.endsWith("\n") || !existing.output ? "" : "\n"}进程会话不可用；Rcode 服务可能已重启。\n`
+              };
+            }
+            if (!next || (next.status === existing.status && next.outputVersion === existing.outputVersion && next.endedAt === existing.endedAt)) return message;
+            changed = true;
+            return { ...message, toolResult: { ...message.toolResult!, process: next } };
+          })
+        }))
+      }));
+      return changed ? { ...current, projects } : current;
+    });
+  }
+
+  async function stopManagedProcess(processId: string) {
+    const response = await fetch(`${API_BASE}/api/processes/${encodeURIComponent(processId)}/stop`, {
+      method: "POST",
+      headers: getJsonHeaders()
+    });
+    const data = await response.json().catch(() => ({})) as { process?: ManagedProcessView; error?: string };
+    if (!response.ok || !data.process) throw new Error(data.error ?? "停止进程失败");
+    setManagedProcesses((current) => current.map((process) => process.id === data.process!.id ? data.process! : process));
+    mergeManagedProcessSnapshots([data.process]);
   }
 
   async function reloadPlatformData() {
@@ -2520,7 +3094,7 @@ export default function App() {
           headers: getLocalApiHeaders()
         });
       }
-      setAiDraft({ id: "", displayName: "", baseUrl: "", apiKey: "", defaultModel: "", modelsPath: "/models", chatCompletionsPath: "/chat/completions", apiKeyEnv: "AI_API_KEY", protocol: "openai-compatible" });
+      setAiDraft({ id: "", displayName: "", baseUrl: "", apiKey: "", defaultModel: "gpt-4o", modelsPath: "/models", chatCompletionsPath: "/chat/completions", apiKeyEnv: "AI_API_KEY", protocol: "openai-compatible" });
       setAiDraftModels([]);
       setAiDraftModelStatus("");
       setShowAddProviderModal(false);
@@ -2535,7 +3109,7 @@ export default function App() {
 
   function openNewAiProvider() {
     setEditingAiProviderId(undefined);
-    setAiDraft({ id: "", displayName: "", baseUrl: "", apiKey: "", defaultModel: "", modelsPath: "/models", chatCompletionsPath: "/chat/completions", apiKeyEnv: "AI_API_KEY", protocol: "openai-compatible" });
+    setAiDraft({ id: "", displayName: "", baseUrl: "", apiKey: "", defaultModel: "gpt-4o", modelsPath: "/models", chatCompletionsPath: "/chat/completions", apiKeyEnv: "AI_API_KEY", protocol: "openai-compatible" });
     setAiDraftModels([]);
     setAiDraftModelStatus("");
     setAiDraftError("");
@@ -2703,8 +3277,8 @@ export default function App() {
     {
       title: "个人",
       items: [
+        { id: "profile", label: "用户主页" },
         { id: "general", label: "常规" },
-        { id: "profile", label: "个人资料" },
         { id: "usage", label: "使用情况和计费" }
       ]
     },
@@ -2723,8 +3297,8 @@ export default function App() {
 
   function renderSettingsIcon(section: SettingsSectionId) {
     const size = 18;
-    if (section === "general") return <Settings size={size} />;
     if (section === "profile") return <UserRound size={size} />;
+    if (section === "general") return <Settings size={size} />;
     if (section === "usage") return <Brain size={size} />;
     if (section === "ai") return <SlidersHorizontal size={size} />;
     return <Puzzle size={size} />;
@@ -2781,51 +3355,28 @@ export default function App() {
 
   function renderSettingsContent() {
     if (activeSettingsSection === "profile") {
-      const usage = usageSummary ?? {
-        totals: { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0 },
-        prompts: { total: 0, sessionHits: 0, hitRate: 0 },
-        aiCalls: 0,
-        byModel: [],
-        daily: [],
-        recent: []
-      };
       return (
         <div className="settingsContentStack">
-          <section className="settingsPaneSection aiProviderSection">
+          <section className="settingsPaneSection profileSection">
             <div className="settingsPaneHeader">
-              <h3>个人资料</h3>
-              <p>当前登录身份与本机账号信息。</p>
+              <h3>用户主页</h3>
+              <p>查看你的 Rcode 账号与登录身份。</p>
             </div>
-            <div className="settingsProfileCard">
-              <div className="accountAvatar" aria-hidden="true">{getAccountInitials(authUser)}</div>
-              <span>
-                <strong>{authUser?.displayName ?? "本机账号"}</strong>
-                <small>{authUser?.username ?? "local"}</small>
-              </span>
-            </div>
-            <div className="usageOverviewGrid">
-              <div className="usageMetric">
-                <span>总 Token</span>
-                <strong>{formatUsageNumber(usage.totals.totalTokens)}</strong>
-                <small>输入 {formatUsageNumber(usage.totals.promptTokens)} · 输出 {formatUsageNumber(usage.totals.completionTokens)}</small>
+            <div className="profileHero">
+              <div className="accountAvatar profileHeroAvatar" aria-hidden="true">
+                {authUser.displayName.slice(0, 2).toUpperCase()}
               </div>
-              <div className="usageMetric">
-                <span>会话命中率</span>
-                <strong>{formatPercent(usage.prompts.hitRate)}</strong>
-                <small>{formatUsageNumber(usage.prompts.sessionHits)} / {formatUsageNumber(usage.prompts.total)} 次继续已有会话</small>
-              </div>
-              <div className="usageMetric">
-                <span>AI 调用</span>
-                <strong>{formatUsageNumber(usage.aiCalls)}</strong>
-                <small>已记录的模型请求次数</small>
-              </div>
-              <div className="usageMetric">
-                <span>缓存 Token</span>
-                <strong>{formatUsageNumber(usage.totals.cachedTokens)}</strong>
-                <small>由上游返回的 cached_tokens</small>
+              <div className="profileHeroIdentity">
+                <strong>{authUser.displayName}</strong>
+                <span>@{authUser.username}</span>
               </div>
             </div>
-            {renderUsageActivityPanel(usage)}
+            <dl className="profileDetails">
+              <div><dt>邮箱</dt><dd>{authUser.email}</dd></div>
+              <div><dt>用户名</dt><dd>@{authUser.username}</dd></div>
+              <div><dt>加入时间</dt><dd>{new Date(authUser.createdAt).toLocaleDateString("zh-CN")}</dd></div>
+            </dl>
+            <button className="profileSignOutButton" type="button" onClick={() => void logout()}>退出当前账号</button>
           </section>
         </div>
       );
@@ -3225,59 +3776,16 @@ export default function App() {
     >
       <section className="clientWindow">
         {isDesktopClient && (
-          <div className="appTopBar">
-            <div className="topBarSidebarZone">
-              <div className="appTopBarTrafficSpace" />
-              <button
-                className="topBarIconButton"
-                type="button"
-                aria-label={sidebarCollapsed ? "展开项目栏" : "折叠项目栏"}
-                aria-pressed={sidebarCollapsed}
-                title={sidebarCollapsed ? "展开项目栏" : "折叠项目栏"}
-                onClick={toggleSidebar}
-              >
-                <PanelLeft size={16} />
-              </button>
-              <button
-                className="topBarIconButton themeToggleBtn"
-                type="button"
-                aria-label={resolvedTheme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
-                title={resolvedTheme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
-                onClick={handleThemeToggle}
-              >
-                {resolvedTheme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
-              </button>
-              <button className="topBarIconButton muted" type="button" aria-label="返回">
-                <SquareChevronLeft size={16} />
-              </button>
-              <button className="topBarIconButton muted" type="button" aria-label="前进">
-                <SquareChevronRight size={16} />
-              </button>
-            </div>
-            <div className="topBarMainZone">
-              <div className="topBarTitle">
-                {activeView === "settings" ? <Settings size={17} /> : <MessageSquarePlus size={17} />}
-                <span>{activeView === "settings" ? selectedSettingsItem.label : activeSession?.title ?? "Rcode"}</span>
-                <button className="topBarGhostButton" type="button" aria-label="更多">
-                  <MoreHorizontal size={18} />
-                </button>
-              </div>
-              <div className="topBarSpacer" />
-              <button className="topBarModelButton" type="button" title={modelName}>
-                <span>{modelName}</span>
-                <ChevronDown size={15} />
-              </button>
-              <button className="topBarIconButton" type="button" aria-label="视图选项">
-                <ListFilter size={17} />
-              </button>
-              <button className="topBarIconButton" type="button" aria-label="布局选项">
-                <SlidersHorizontal size={17} />
-              </button>
-              <button className="topBarIconButton" type="button" aria-label="右侧面板">
-                <PanelRight size={17} />
-              </button>
-            </div>
-          </div>
+          <AppTopBar
+            isSettings={activeView === "settings"}
+            title={activeView === "settings" ? selectedSettingsItem.label : activeSession?.title ?? "Rcode"}
+            modelName={modelName}
+            sidebarCollapsed={sidebarCollapsed}
+            theme={resolvedTheme}
+            onToggleSidebar={toggleSidebar}
+            onToggleTheme={handleThemeToggle}
+            onOpenSettings={() => openSettingsPage("general")}
+          />
         )}
         <div className={`appLayout ${diffPanel ? "hasDiffPanel" : ""}`}>
           <aside
@@ -3286,247 +3794,43 @@ export default function App() {
             inert={sidebarCollapsed ? true : undefined}
             aria-label="项目与会话"
           >
-            <section className={`accountPanel ${authUser ? "signedIn" : ""}`} aria-label="登录账号">
-              {authUser ? (
-                <>
-                  <div className="accountMenuCard" role="menu" aria-label="账号菜单">
-                    <div className="accountMenuIdentity">
-                      <UserRound size={17} />
-                      <span>{authUser.username}</span>
-                    </div>
-                    <button className="accountMenuItem muted" type="button" onClick={() => openSettingsPage("general")}>
-                      <Settings size={17} />
-                      <span>个人账户</span>
-                    </button>
-                    <div className="accountMenuDivider" />
-                    <button
-                      className={`accountMenuItem ${activeView === "settings" && selectedSettingsSection === "profile" ? "active" : ""}`}
-                      type="button"
-                      onClick={() => openSettingsPage("profile")}
-                    >
-                      <UserRound size={17} />
-                      <span>个人资料</span>
-                    </button>
-                    <button
-                      className={`accountMenuItem ${activeView === "settings" && selectedSettingsSection === "general" ? "active" : ""}`}
-                      type="button"
-                      onClick={() => openSettingsPage("general")}
-                    >
-                      <Settings size={17} />
-                      <span>设置</span>
-                      <kbd>⌘,</kbd>
-                    </button>
-                    <div className="accountMenuDivider" />
-                    <div className="accountThemePanel" role="radiogroup" aria-label="外观主题">
-                      <button
-                        className={themePreference === "light" ? "active" : ""}
-                        type="button"
-                        role="radio"
-                        aria-checked={themePreference === "light"}
-                        onClick={(event) => setThemePreferenceWithTransition("light", event.currentTarget)}
-                      >
-                        <Sun size={14} />
-                        <span>浅色</span>
-                        {themePreference === "light" && <Check size={13} />}
-                      </button>
-                      <button
-                        className={themePreference === "dark" ? "active" : ""}
-                        type="button"
-                        role="radio"
-                        aria-checked={themePreference === "dark"}
-                        onClick={(event) => setThemePreferenceWithTransition("dark", event.currentTarget)}
-                      >
-                        <Moon size={14} />
-                        <span>深色</span>
-                        {themePreference === "dark" && <Check size={13} />}
-                      </button>
-                      <button
-                        className={themePreference === "system" ? "active" : ""}
-                        type="button"
-                        role="radio"
-                        aria-checked={themePreference === "system"}
-                        onClick={(event) => setThemePreferenceWithTransition("system", event.currentTarget)}
-                      >
-                        <Monitor size={14} />
-                        <span>跟随系统</span>
-                        {themePreference === "system" && <Check size={13} />}
-                      </button>
-                    </div>
-                    <div className="accountMenuDivider" />
-                    <button className="accountMenuItem" type="button" onClick={() => openSettingsPage("usage")}>
-                      <Brain size={17} />
-                      <span>剩余用量</span>
-                      <ChevronDown className="accountMenuChevron" size={17} />
-                    </button>
-                    <button className="accountMenuItem" type="button" onClick={() => void logout()}>
-                      <LogOut size={17} />
-                      <span>退出登录</span>
-                    </button>
-                  </div>
-                  <div className="accountFooter">
-                    <div className="accountAvatar" aria-hidden="true">{getAccountInitials(authUser)}</div>
-                    <div className="accountCopy">
-                      <strong>{authUser.displayName}</strong>
-                      <span>本机账号</span>
-                    </div>
-                  </div>
-                </>
-              ) : (
-                <form className="accountLoginForm" onSubmit={handleLogin}>
-                  <div className="accountLoginTitle">
-                    <span>
-                      <LogIn size={15} />
-                      {authConfigured ? "登录账号" : "本机模式"}
-                    </span>
-                    <button
-                      className={`accountIconButton ${activeView === "settings" ? "active" : ""}`}
-                      type="button"
-                      onClick={() => openSettingsPage("general")}
-                      aria-label="设置"
-                    >
-                      <Settings size={15} />
-                    </button>
-                  </div>
-                  <input
-                    aria-label="账号"
-                    autoComplete="username"
-                    value={loginUsername}
-                    onChange={(event) => setLoginUsername(event.target.value)}
-                    placeholder="账号"
-                  />
-                  <input
-                    aria-label="密码"
-                    autoComplete="current-password"
-                    type="password"
-                    value={loginPassword}
-                    onChange={(event) => setLoginPassword(event.target.value)}
-                    placeholder="密码"
-                  />
-                  <button type="submit" disabled={authLoading || !authConfigured}>
-                    {authConfigured ? "登录" : "已进入本机模式"}
-                  </button>
-                  {authError && <span className="accountError">{authError}</span>}
-                </form>
-              )}
-            </section>
-
-            <div className="projectSidebarHeader">
-              <div>
-                <span>项目</span>
-                <strong>{workspaceState.projects.length}</strong>
-              </div>
-              <button className="iconButton" type="button" onClick={() => addSession()} aria-label="新会话">
-                <MessageSquarePlus size={16} />
-              </button>
-            </div>
-
-            <div className="projectActions" aria-label="项目操作">
-              <button type="button" onClick={() => void createNewProject()}>
-                <Plus size={15} />
-                新项目
-              </button>
-              <button type="button" onClick={() => void addFolderProject()}>
-                <FolderOpen size={15} />
-                电脑文件夹
-              </button>
-              <button type="button" onClick={startTemporarySession}>
-                <MessageSquarePlus size={15} />
-                不使用项目
-              </button>
-            </div>
-
-            <div className="projectList">
-              {workspaceState.projects.map((project) => {
-                const isActiveProject = project.id === activeProject?.id;
-                const visibleSessions = project.sessions.filter((session) => !session.archivedAt);
-                const isSessionListCollapsed = Boolean(projectSessionCollapsed[project.id]);
-                const sessionListId = `project-session-list-${project.id}`;
-                return (
-                  <section className={`projectGroup ${isSessionListCollapsed ? "collapsed" : ""}`} key={project.id}>
-                    <div
-                      className={`projectRow ${isActiveProject ? "active" : ""}`}
-                      title={`${project.name}${project.path ? ` · ${project.path}` : project.kind === "temporary" ? " · 临时会话" : " · 空项目"}`}
-                    >
-                      <button className="projectSelectButton" type="button" onClick={() => selectProject(project)}>
-                        {project.kind === "folder" ? (
-                          <Folder size={18} />
-                        ) : project.kind === "temporary" ? (
-                          <MessageSquarePlus size={18} />
-                        ) : (
-                          <HardDrive size={18} />
-                        )}
-                        <span>
-                          <strong>{project.name}</strong>
-                          <small>{project.path ?? (project.kind === "temporary" ? "临时会话" : "空项目")}</small>
-                        </span>
-                      </button>
-                      <button
-                        className="projectFoldButton"
-                        type="button"
-                        aria-label={isSessionListCollapsed ? `展开 ${project.name} 的会话` : `收起 ${project.name} 的会话`}
-                        aria-controls={sessionListId}
-                        aria-expanded={!isSessionListCollapsed}
-                        onClick={() => toggleProjectSessions(project.id)}
-                        title={isSessionListCollapsed ? "展开会话" : "收起会话"}
-                      >
-                        <ChevronDown size={15} />
-                      </button>
-                    </div>
-
-                    <div
-                      className="sessionListShell"
-                      id={sessionListId}
-                      aria-hidden={isSessionListCollapsed}
-                      inert={isSessionListCollapsed ? true : undefined}
-                    >
-                      <div className="sessionList">
-                        {visibleSessions.length === 0 && <div className="emptySession">暂无对话</div>}
-                        {visibleSessions.map((session) => (
-                          <div
-                            className={`sessionSwipeRow ${(sessionSwipeOffsets[session.id] ?? 0) > 0 ? "swiping" : ""} ${(sessionSwipeOffsets[session.id] ?? 0) >= sessionArchiveSwipeThreshold ? "ready" : ""}`}
-                            key={session.id}
-                            onWheel={(event) => handleSessionWheel(project.id, session.id, event)}
-                            style={{ "--session-swipe-offset": `${sessionSwipeOffsets[session.id] ?? 0}px` } as CSSProperties}
-                          >
-                            <button
-                              className="sessionArchiveAction"
-                              type="button"
-                              onClick={() => archiveSession(project.id, session.id)}
-                            >
-                              <Archive size={14} />
-                              归档
-                            </button>
-                            <button
-                              className={`sessionRow ${
-                                project.id === activeProject?.id && session.id === activeSession?.id ? "active" : ""
-                              } ${runningSessionIds.has(session.id) ? "running" : ""}`}
-                              type="button"
-                              onClick={() => {
-                                if ((sessionSwipeOffsets[session.id] ?? 0) > 0) {
-                                  resetSessionSwipe(session.id);
-                                  return;
-                                }
-                                selectSession(project.id, session.id);
-                              }}
-                              onContextMenu={(event) => {
-                                event.preventDefault();
-                                archiveSession(project.id, session.id);
-                              }}
-                            >
-                              <span className="sessionTitle">
-                                {runningSessionIds.has(session.id) && <span className="sessionRunningDot" aria-hidden="true" />}
-                                <span className="sessionTitleText">{session.title}</span>
-                              </span>
-                              <time>{getRelativeTime(session.updatedAt)}</time>
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </section>
-                );
-              })}
-            </div>
+            <ProjectNavigator
+              projects={workspaceState.projects}
+              activeProjectId={activeProject?.id}
+              activeSessionId={activeSession?.id}
+              collapsedProjects={projectSessionCollapsed}
+              swipeOffsets={sessionSwipeOffsets}
+              runningSessionIds={runningSessionIds}
+              archiveThreshold={sessionArchiveSwipeThreshold}
+              onNewSession={() => addSession()}
+              onNewProject={() => void createNewProject()}
+              onOpenFolder={() => void addFolderProject()}
+              onTemporarySession={startTemporarySession}
+              onSelectProject={(projectId) => {
+                const project = workspaceState.projects.find((item) => item.id === projectId);
+                if (project) selectProject(project);
+              }}
+              onToggleProject={toggleProjectSessions}
+              onSelectSession={selectSession}
+              onArchiveSession={archiveSession}
+              onResetSwipe={resetSessionSwipe}
+              onSessionWheel={handleSessionWheel}
+            />
+            <button
+              className={`sidebarProfileButton ${activeView === "settings" && activeSettingsSection === "profile" ? "active" : ""}`}
+              type="button"
+              onClick={() => openSettingsPage("profile")}
+              aria-label={`打开 ${authUser.displayName} 的用户主页`}
+            >
+              <span className="accountAvatar sidebarProfileAvatar" aria-hidden="true">
+                {authUser.displayName.slice(0, 2).toUpperCase()}
+              </span>
+              <span className="sidebarProfileIdentity">
+                <strong>{authUser.displayName}</strong>
+                <small>用户主页</small>
+              </span>
+              <ChevronRight size={16} aria-hidden="true" />
+            </button>
           </aside>
 
           <div
@@ -3567,11 +3871,12 @@ export default function App() {
                         </section>
                       ))}
                       <div className="settingsNavFooter">
-                        <div className="accountAvatar" aria-hidden="true">{getAccountInitials(authUser)}</div>
+                        <div className="accountAvatar" aria-hidden="true">{authUser.displayName.slice(0, 2).toUpperCase()}</div>
                         <span>
-                          <strong>{authUser?.displayName ?? "本机账号"}</strong>
-                          <small>{authUser ? "本机账号" : "未登录"}</small>
+                          <strong>{authUser.displayName}</strong>
+                          <small>@{authUser.username}</small>
                         </span>
+                        <button className="settingsSignOut" type="button" onClick={() => void logout()}>退出</button>
                       </div>
                     </aside>
                     <section className="settingsMainPane">
@@ -3590,76 +3895,9 @@ export default function App() {
                   </section>
                 ) : (
                 <section className="chatPanel">
-                  <div className="composerHeader chatHeader">
-                    <div className="chatHeaderTitle">
-                      <h2>{activeSession?.title ?? "上下文会话"}</h2>
-                      <p>
-                        {activeProject?.name ?? "未选择项目"}
-                        {conversationId ? ` · Conversation ${conversationId.slice(0, 8)}` : " · 新会话"}
-                      </p>
-                    </div>
-                    <div className="chatHeaderActions">
-                      {!isDesktopClient && sidebarCollapsed && (
-                        <button className="newChatButton" type="button" onClick={toggleSidebar}>
-                          <PanelLeft size={16} />
-                          项目
-                        </button>
-                      )}
-                      <button className="newChatButton" type="button" onClick={() => addSession()}>
-                        <MessageSquarePlus size={16} />
-                        新会话
-                      </button>
-                    </div>
-                  </div>
-
                   <div className="messageList" aria-live="polite" ref={messageListRef}>
-                    {shouldShowTaskDuration && (
-                      <div className={`taskDurationBar ${isActiveSessionRunning ? "running" : ""}`}>
-                        <span className="taskDurationSpinner" aria-hidden="true" />
-                        <span className="taskDurationText">
-                          任务耗时 {formatTaskDuration(activeTaskElapsedMs)}
-                        </span>
-                        {isActiveSessionRunning && (
-                          <span className="thinkingWave" aria-hidden="true">
-                            <i />
-                            <i />
-                            <i />
-                            <i />
-                          </span>
-                        )}
-                        <ChevronDown size={17} strokeWidth={2.1} />
-                      </div>
-                    )}
                     {(() => {
-                      // 把连续的 tool 消息合并成一个折叠行
-                      type RenderItem =
-                        | { type: "single"; message: ChatMessage }
-                        | { type: "toolGroup"; messages: ChatMessage[] };
-                      const renderItems: RenderItem[] = [];
-                      let currentToolGroup: ChatMessage[] = [];
-                      for (const message of visibleMessages) {
-                        if (message.role === "tool") {
-                          currentToolGroup.push(message);
-                        } else {
-                          if (currentToolGroup.length > 0) {
-                            const containsEdits = currentToolGroup.some((toolMessage) => isEditToolName(toolMessage.toolName));
-                            // 编辑产物属于这次 Agent 的最终交付：放在最终回复之后，
-                            // 让用户先读结论，再决定是否进入完整 diff 审核。
-                            if (message.role === "assistant" && containsEdits && message.status === "completed" && !message.isStreaming) {
-                              renderItems.push({ type: "single", message });
-                              renderItems.push({ type: "toolGroup", messages: currentToolGroup });
-                              currentToolGroup = [];
-                              continue;
-                            }
-                            renderItems.push({ type: "toolGroup", messages: currentToolGroup });
-                            currentToolGroup = [];
-                          }
-                          renderItems.push({ type: "single", message });
-                        }
-                      }
-                      if (currentToolGroup.length > 0) {
-                        renderItems.push({ type: "toolGroup", messages: currentToolGroup });
-                      }
+                      const renderItems = getMessageRenderItems(visibleMessages);
 
                       const renderArtifactCard = (message: ChatMessage) => {
                         if (!message.artifactDiffs?.length) return null;
@@ -3755,147 +3993,100 @@ export default function App() {
                       return renderItems.map((item) => {
                         if (item.type === "toolGroup") {
                           const toolMessages = item.messages;
-                          const runningCount = toolMessages.filter((m) => m.status === "running").length;
-                          const failCount = toolMessages.filter((m) => m.status === "completed" && m.toolResult && !m.toolResult.ok).length;
+                          const runningCount = toolMessages.filter((m) => m.status === "running" || m.toolResult?.process?.status === "running").length;
+                          const failCount = toolMessages.filter((m) =>
+                            m.status === "completed" && m.toolResult && (
+                              !m.toolResult.ok ||
+                              m.toolResult.process?.status === "failed" ||
+                              (m.toolResult.process?.status === "exited" && (m.toolResult.process.exitCode ?? 0) !== 0)
+                            )
+                          ).length;
                           const hasRunning = runningCount > 0;
                           const groupSummary = getToolGroupSummary(toolMessages, activeProject?.path);
                           const activityGroups = getToolActivityGroups(toolMessages, activeProject?.path);
                           const groupId = `group-${toolMessages[0].id}`;
                           const isManuallyClosed = manualClosedGroupsRef.current.has(groupId);
                           const isEditToolGroup = toolMessages.some((message) => isEditToolName(message.toolName));
+                          const isCommandToolGroup = getToolActivityCategory(toolMessages[0]?.toolName) === "command";
                           // 编辑状态保持为紧凑提示，避免补丁内容在执行期间占满聊天流。
-                          // 用户仍可展开查看每一步工具详情；完成后会显示完整的差异交付卡。
-                          const isOpen = !isManuallyClosed && hasRunning && !isEditToolGroup;
-                          if (isEditToolGroup && !hasRunning) return null;
-
+                          // 执行指令也默认收起，避免长命令和实时输出挤占会话空间；
+                          // 用户仍可按需展开查看每一步工具详情。
+                          const isOpen = !isManuallyClosed && hasRunning && !isEditToolGroup && !isCommandToolGroup;
                           return (
-                            <details
-                              className={`toolToggle ${groupSummary.isRunning ? "running" : ""}`}
+                            <ToolCallGroup
                               key={groupId}
-                              open={isOpen}
-                              onToggle={(e) => {
-                                // 用户手动关闭时记录，避免后续重渲染自动展开
-                                if (!(e.currentTarget as HTMLDetailsElement).open) {
-                                  manualClosedGroupsRef.current.add(groupId);
-                                }
-                              }}
-                            >
-                              <summary className="toolToggleSummary">
-                                <span className="toolToggleIcon" aria-hidden="true">
-                                  {isEditToolGroup ? (
-                                    <Pencil size={15} strokeWidth={2.15} />
-                                  ) : groupSummary.primaryTool === "read_file" ? (
-                                    <FileText size={15} strokeWidth={2.15} />
-                                  ) : (
-                                    <Terminal size={15} strokeWidth={2.15} />
-                                  )}
-                                </span>
-                                <span className="toolToggleCopy">
-                                  <span className="toolToggleText">{groupSummary.label}</span>
-                                  {groupSummary.detail && (
-                                    <span className="toolToggleDetail">
-                                      {groupSummary.detail}
-                                      {(groupSummary.addedLines > 0 || groupSummary.removedLines > 0) && (
-                                        <span className="toolDiffInline">
-                                          {groupSummary.addedLines > 0 && <span className="toolDiffAdd">+{groupSummary.addedLines}</span>}
-                                          {groupSummary.removedLines > 0 && <span className="toolDiffRemove">-{groupSummary.removedLines}</span>}
-                                        </span>
-                                      )}
-                                    </span>
-                                  )}
-                                </span>
-                                {groupSummary.isRunning && (
-                                  <span className="thinkingWave toolWave" aria-hidden="true">
-                                    <i />
-                                    <i />
-                                    <i />
-                                    <i />
-                                  </span>
-                                )}
-                                <ChevronDown className="toolToggleArrow" size={18} strokeWidth={2.1} />
-                                {failCount > 0 && <span className="toolToggleFail">{failCount} 失败</span>}
-                              </summary>
-                              <div className="toolToggleBody">
-                                {activityGroups.map((activityGroup) => (
-                                  <section className="toolActivitySection" key={activityGroup.category}>
-                                    <div className="toolActivityHeading">
-                                      <span>{activityGroup.labels.title}</span>
-                                      <small>{activityGroup.messages.length}</small>
-                                    </div>
-                                    {activityGroup.messages.map((message) => {
-                                      const isRunning = message.status === "running";
-                                      const summary = getToolActivityTarget(message, activeProject?.path) || getToolDisplayTarget(message);
-                                      const addedLines = message.diff?.addedLines ?? 0;
-                                      const removedLines = message.diff?.removedLines ?? 0;
-                                  return (
-                                    <div className={`toolToggleItem ${isRunning ? "running" : ""}`} key={message.id}>
-                                      <div className="toolToggleItemHead">
-                                        <span className={`toolCardDot ${isRunning ? "running" : message.toolResult?.ok ? "ok" : "fail"}`} />
-                                        <span className="toolCardName">{message.toolName}</span>
-                                        {summary && <span className="toolCardDesc">{summary}</span>}
-                                        {(addedLines > 0 || removedLines > 0) && (
-                                          <span className="toolDiffInline compact">
-                                            {addedLines > 0 && <span className="toolDiffAdd">+{addedLines}</span>}
-                                            {removedLines > 0 && <span className="toolDiffRemove">-{removedLines}</span>}
-                                          </span>
-                                        )}
-                                        <span className={`toolCardStatus ${isRunning ? "running" : message.toolResult?.ok ? "ok" : "fail"}`}>
-                                          {isRunning ? "运行中" : message.toolResult?.ok ? "完成" : "失败"}
-                                        </span>
-                                      </div>
-                                      {(message.toolArgs || message.toolResult) && (
-                                        <div className="toolCardBody">
-                                          {message.toolArgs && (
-                                            <div className="toolCardSection">
-                                              <div className="toolCardLabel">参数</div>
-                                              <pre className="toolCardPre">{summarizeArguments(message.toolArgs)}</pre>
-                                            </div>
-                                          )}
-                                          {message.toolResult && (
-                                            <div className="toolCardSection">
-                                              <div className="toolCardLabel">结果</div>
-                                              <pre className="toolCardPre">{message.toolResult.content.slice(0, 1500)}</pre>
-                                            </div>
-                                          )}
-                                        </div>
-                                      )}
-                                    </div>
-                                  );
-                                    })}
-                                  </section>
-                                ))}
-                              </div>
-                            </details>
+                              groupId={groupId}
+                              label={groupSummary.label}
+                              detail={groupSummary.detail}
+                              isRunning={groupSummary.isRunning}
+                              isEditGroup={isEditToolGroup}
+                              defaultOpen={isOpen}
+                              failedCount={failCount}
+                              addedLines={groupSummary.addedLines}
+                              removedLines={groupSummary.removedLines}
+                              isDiffEstimate={groupSummary.isDiffEstimate}
+                              activityGroups={activityGroups.map((activityGroup) => ({
+                                category: activityGroup.category,
+                                title: activityGroup.labels.title,
+                                items: activityGroup.messages.map((message) => {
+                                  const lineChanges = getToolLineChangeStats(message);
+                                  return {
+                                    id: message.id,
+                                    name: message.toolName ?? "unknown_tool",
+                                    target: getToolActivityTarget(message, activeProject?.path) || getToolDisplayTarget(message),
+                                    status: message.status === "running" || message.toolResult?.process?.status === "running"
+                                      ? "running"
+                                      : message.toolResult?.ok === false || message.toolResult?.process?.status === "failed" || (message.toolResult?.process?.status === "exited" && (message.toolResult.process.exitCode ?? 0) !== 0)
+                                        ? "fail"
+                                        : "ok",
+                                    args: message.toolArgs ? summarizeArguments(message.toolArgs) : undefined,
+                                    result: message.toolResult?.process ? undefined : message.toolResult?.content.slice(0, 1500),
+                                    process: message.toolResult?.process,
+                                    ...lineChanges
+                                  };
+                                })
+                              }))}
+                              onClosed={(id) => manualClosedGroupsRef.current.add(id)}
+                              onStopProcess={stopManagedProcess}
+                            />
                           );
                         }
 
                         const message = item.message;
                         const isAssistant = message.role === "assistant";
                         const isEmpty = !message.content?.trim();
-                        const showFinalBadge = message.status === "completed" && !message.isStreaming && !isEmpty;
+                        const isActivelyStreaming = isActiveSessionRunning && Boolean(message.isStreaming);
+                        const isResponseRunning = message.id === activeResponseMetaId;
+                        const responseDurationMs = message.responseStartedAt
+                          ? Math.max(
+                              0,
+                              (
+                                message.responseCompletedAt ??
+                                (isResponseRunning ? timerTick : message.completedAt ?? message.responseStartedAt)
+                              ) - message.responseStartedAt
+                            )
+                          : message.durationMs ?? (
+                              isActivelyStreaming && message.startedAt
+                                ? Math.max(0, timerTick - message.startedAt)
+                                : undefined
+                            );
+                        const showResponseMeta = isAssistant && message.showResponseMeta !== false && (
+                          message.showResponseMeta === true || responseDurationMs !== undefined || Boolean(message.usage) || message.status !== undefined
+                        );
+                        const showTaskProgress = isAssistant && message.id === activeResponseMetaId && shouldShowTaskDuration;
+                        const showFinalBadge = message.status === "completed" && !isActivelyStreaming;
 
                         return (
                           <Fragment key={message.id}>
-                          <article className={`message ${message.role} ${isEmpty && message.isStreaming ? "streamingOnly" : ""}`}>
-                            {message.role !== "user" && (
-                              <div className="messageMeta">
-                                <span>{modelName}</span>
-                                {message.isStreaming && <strong className="streaming">typing</strong>}
-                                {message.status === "error" && <strong className="toolFail">error</strong>}
-                                {message.status === "approval_required" && <strong>approval_required</strong>}
-                                {showFinalBadge && <strong className="finalBadge">最终回复</strong>}
-                              </div>
-                            )}
-                            {!isEmpty && (
-                              <div className={`messageBubble ${isAssistant ? "assistantBubble" : ""}`}>
-                                {renderMessageContent(message.content)}
-                                {message.isStreaming && <span className="streamingCursor">▊</span>}
-                              </div>
-                            )}
-                            {isEmpty && message.isStreaming && (
-                              <div className="messageBubble assistantBubble streamingPlaceholder">
-                                <span className="thinkingFlow">
-                                  正在思考
+                          <article className={`message ${message.role} ${isEmpty && isActivelyStreaming ? "streamingOnly" : ""}`}>
+                            {showTaskProgress && (
+                              <div className="taskDurationBar running" aria-label="本次回复进度">
+                                <span className="taskDurationText">
+                                  {activeSession?.workflowLabel ?? "正在思考"}
+                                </span>
+                                <span className="taskDurationElapsed">{formatTaskDuration(activeTaskElapsedMs)}</span>
+                                <span className="taskThinkingState" aria-label={activeWorkflowActivityLabel}>
+                                  <span>{activeWorkflowActivityLabel}</span>
                                   <span className="thinkingWave" aria-hidden="true">
                                     <i />
                                     <i />
@@ -3903,6 +4094,37 @@ export default function App() {
                                     <i />
                                   </span>
                                 </span>
+                                {activeSession?.contextSnapshot && (
+                                  <span className="contextBudgetBadge" title={`上下文预算 ${activeSession.contextSnapshot.budgetTokens.toLocaleString()} tokens`}>
+                                    上下文 {Math.round(activeSession.contextSnapshot.estimatedTokens / 100) / 10}k
+                                    {activeSession.contextSnapshot.compactedMessageCount > 0 ? ` · 已压缩 ${activeSession.contextSnapshot.compactedMessageCount}` : ""}
+                                  </span>
+                                )}
+                                <ChevronDown size={17} strokeWidth={2.1} />
+                              </div>
+                            )}
+                            {showResponseMeta && (
+                              <div className="messageMeta" aria-label="本次回复统计">
+                                <span className="responseModel">{message.usage?.model ?? modelName}</span>
+                                {responseDurationMs !== undefined && (
+                                  <span className="responseMetric">耗时 {formatResponseDuration(responseDurationMs)}</span>
+                                )}
+                                <span className="responseMetric" title={message.usage?.estimated ? "生成期间为实时估算，完成后由上游精确用量校准" : undefined}>
+                                  上传 {formatUsageNumber(message.usage?.promptTokens ?? 0)} token
+                                </span>
+                                <span className="responseMetric" title={message.usage?.estimated ? "生成期间为实时估算，完成后由上游精确用量校准" : undefined}>
+                                  下传 {formatUsageNumber(message.usage?.completionTokens ?? 0)} token
+                                </span>
+                                {isResponseRunning && <strong className="streaming">生成中</strong>}
+                                {message.status === "error" && <strong className="toolFail">error</strong>}
+                                {message.status === "approval_required" && <strong>approval_required</strong>}
+                                {showFinalBadge && <strong className="finalBadge">最终回复</strong>}
+                              </div>
+                            )}
+                            {!isEmpty && (
+                              <div className={`messageBubble ${isAssistant ? "assistantBubble" : ""}`}>
+                                {renderMessageContent(isAssistant ? message.content.trimEnd() : message.content)}
+                                {isActivelyStreaming && <span className="streamingCursor">▊</span>}
                               </div>
                             )}
                           </article>
@@ -3937,6 +4159,10 @@ export default function App() {
                     )}
 
 	                  </div>
+
+                      {activeSession?.taskPlan && activeSession.workflowPhase === "plan_ready" && (
+                        <TaskPlanCard plan={activeSession.taskPlan} disabled={isActiveSessionRunning} onStart={startPlannedExecution} />
+                      )}
 
 	                  {activeQueuedPrompts.length > 0 && activeSession && (
 	                    <div className="queuePanel" aria-label="排队中的后续请求">
@@ -3973,108 +4199,46 @@ export default function App() {
 	                    </div>
 	                  )}
 
-	                  <div className="chatComposer">
-	                    <textarea
-	                      aria-label="聊天输入框"
-                      value={prompt}
-                      onChange={(event) => setPrompt(event.target.value)}
-                      onKeyDown={handleComposerKeyDown}
-                      placeholder="输入任务，Enter 发送，Shift + Enter 换行"
-                      rows={1}
-                    />
-                    <div className="composerFooter">
-                      <div className="composerControls">
-                        <div className="modelPicker">
-                          <button
-                            className="modelPickerButton"
-                            type="button"
-                            onClick={() => setModelMenuOpen((open) => !open)}
-                          >
-                            <span>{modelName}</span>
-                            <ChevronDown size={14} />
-                          </button>
-                          {modelMenuOpen && (
-                            <div className="modelMenu">
-                              {(modelOptions.length > 0 ? modelOptions : [modelName]).map((model) => (
-                                <button
-                                  className={model === modelName ? "active" : ""}
-                                  key={model}
-                                  type="button"
-                                  onClick={() => {
-                                    setSelectedModel(model);
-                                    setModelMenuOpen(false);
-                                  }}
-                                >
-                                  {model}
-                                </button>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-
-                        <label className="thinkingMode">
-                          <Brain size={14} />
-                          <select
-                            value={thinkingMode}
-                            onChange={(event) => setThinkingMode(event.target.value as ThinkingMode)}
-                          >
-                            {thinkingOptions.map((item) => (
-                              <option key={item.id} value={item.id}>
-                                {item.label}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                        {activeQueueLength > 0 && <span className="queueBadge">队列 {activeQueueLength}</span>}
-                      </div>
-                      <div className="composerActions">
-                        <div className="permissionPicker">
-                          <button
-                            className="permissionModeButton"
-                            type="button"
-                            title={selectedPermission.description}
-                            onClick={() => setPermissionMenuOpen((open) => !open)}
-                          >
-                            <span>{selectedPermission.label}</span>
-                            <ChevronDown size={14} />
-                          </button>
-                          {permissionMenuOpen && (
-                            <div className="permissionMenu">
-                              {permissionOptions.map((item) => (
-                                <button
-                                  className={item.id === mode ? "active" : ""}
-                                  key={item.id}
-                                  type="button"
-                                  onClick={() => {
-                                    if (item.id === "full_access" && !window.confirm("完全访问会移除工作区沙箱限制。确定要启用吗？")) {
-                                      return;
-                                    }
-                                    setMode(item.id);
-                                    setPermissionMenuOpen(false);
-                                  }}
-                                >
-                                  <span>
-                                    <strong>{item.label}</strong>
-                                    <small>{item.description}</small>
-                                  </span>
-                                  {item.id === mode && <Check size={16} />}
-                                </button>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                        <button
-                          className={`sendButton ${isActiveSessionRunning ? "stopping" : ""}`}
-                          type="button"
-                          onClick={handleSendButtonClick}
-                          disabled={!isActiveSessionRunning && !prompt.trim()}
-                          aria-label={isActiveSessionRunning ? "停止回复" : "发送"}
-                        >
-                          {isActiveSessionRunning ? <Square size={15} /> : <Send size={17} />}
-                        </button>
-                      </div>
-                    </div>
-                  </div>
+                  <ChatComposer
+                    prompt={prompt}
+                    modelName={modelName}
+                    modelOptions={modelOptions}
+                    modelMenuOpen={modelMenuOpen}
+                    thinkingMode={thinkingMode}
+                    permissionMode={currentMode}
+                    permissionOptions={permissionOptions}
+                    selectedPermission={selectedPermission}
+                    permissionMenuOpen={permissionMenuOpen}
+                    queueLength={activeQueueLength}
+                    isRunning={isActiveSessionRunning}
+                    projectName={activeProject?.name}
+                    projectPath={activeProject?.path}
+                    managedProcesses={currentProjectManagedProcesses}
+                    managedProcessPanelOpen={managedProcessPanelOpen}
+                    managedProcessLoadError={managedProcessLoadError}
+                    onPromptChange={setPrompt}
+                    onKeyDown={handleComposerKeyDown}
+                    onToggleModelMenu={() => setModelMenuOpen((open) => !open)}
+                    onSelectModel={(model) => {
+                      setSelectedModel(model);
+                      setModelMenuOpen(false);
+                    }}
+                    onThinkingModeChange={setThinkingMode}
+                    onTogglePermissionMenu={() => setPermissionMenuOpen((open) => !open)}
+                    onSelectPermission={(nextMode) => {
+                      if (nextMode === "full_access" && !window.confirm("完全访问会移除工作区沙箱限制。确定要启用吗？")) return;
+                      changeSessionMode(nextMode);
+                      setPermissionMenuOpen(false);
+                    }}
+                    onSend={handleSendButtonClick}
+                    onToggleManagedProcessPanel={() => {
+                      const nextOpen = !managedProcessPanelOpen;
+                      setManagedProcessPanelOpen(nextOpen);
+                      if (nextOpen) void refreshManagedProcesses().catch(() => undefined);
+                    }}
+                    onRefreshManagedProcesses={refreshManagedProcesses}
+                    onStopManagedProcess={stopManagedProcess}
+                  />
                 </section>
                 )}
               </div>

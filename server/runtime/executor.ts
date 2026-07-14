@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { analyzeShellCommand } from "./sandbox";
-import type { ExecutorResult, ShellAnalysis } from "./types";
+import { analyzeShellCommand } from "../security/sandbox";
+import type { ExecutorResult, ShellAnalysis } from "../shared/types";
 
 const execFileAsync = promisify(execFile);
 

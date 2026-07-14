@@ -12,6 +12,7 @@
   "author": "Rcode",
   "scripts": {
     "dev": "concurrently \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:auth": "wrangler dev --config cloudflare/auth-worker/wrangler.jsonc --port 8788",
     "dev:server": "tsx watch server/index.ts",
     "dev:web": "vite --host 0.0.0.0",
     "client": "concurrently -k \"npm:dev:server\" \"npm:dev:web\" \"npm:client:electron\"",
@@ -22,6 +23,12 @@
     "build:app": "npm run build && npm run build:server && electron-builder --mac",
     "preview": "vite preview --host 0.0.0.0",
     "typecheck": "tsc --noEmit",
+    "typecheck:auth": "tsc -p cloudflare/auth-worker/tsconfig.json",
+    "auth:types": "wrangler types --config cloudflare/auth-worker/wrangler.jsonc cloudflare/auth-worker/worker-configuration.d.ts",
+    "auth:migrate:local": "wrangler d1 migrations apply rcode-auth --local --config cloudflare/auth-worker/wrangler.jsonc",
+    "auth:migrate:remote": "wrangler d1 migrations apply rcode-auth --remote --config cloudflare/auth-worker/wrangler.jsonc",
+    "auth:deploy:dry": "wrangler deploy --dry-run --config cloudflare/auth-worker/wrangler.jsonc",
+    "auth:deploy": "wrangler deploy --config cloudflare/auth-worker/wrangler.jsonc",
     "test": "npm run build:server && node scripts/run-server-tests.cjs"
   },
   "build": {
@@ -80,6 +87,7 @@
     "@types/react": "^19.1.16",
     "@types/react-dom": "^19.1.9",
     "electron": "^43.0.0",
-    "electron-builder": "^26.15.3"
+    "electron-builder": "^26.15.3",
+    "wrangler": "^4.110.0"
   }
 }

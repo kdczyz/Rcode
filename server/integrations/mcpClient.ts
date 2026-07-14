@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { listMcpServers, saveMcpServer } from "./localDatabase";
-import type { ToolCall, ToolDefinition } from "./types";
+import { listMcpServers, saveMcpServer } from "../storage/database";
+import type { ToolCall, ToolDefinition } from "../shared/types";
 
 interface JsonRpcResponse {
   id?: string | number;

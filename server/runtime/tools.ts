@@ -2,11 +2,12 @@ import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { getRuntimeConfig } from "./config";
-import { recordAuditEvent, saveArtifact } from "./localDatabase";
+import { recordAuditEvent, saveArtifact } from "../storage/database";
 import { portableExecutor } from "./executor";
-import { executeMcpTool, listMcpToolDefinitions } from "./mcpClient";
-import { analyzeShellCommand, assertNotSymlinkEscape, assertPathInsideWorkspace, getWorkspaceRoot, sandboxPolicyName } from "./sandbox";
-import type { AgentToolName, BuiltinToolName, DiffResult, ExecutorResult, ToolCall, ToolDefinition, ToolResult } from "./types";
+import { managedProcessManager } from "./processManager";
+import { executeMcpTool, listMcpToolDefinitions } from "../integrations/mcpClient";
+import { analyzeShellCommand, assertNotSymlinkEscape, assertPathInsideWorkspace, getWorkspaceRoot, sandboxPolicyName } from "../security/sandbox";
+import type { AgentToolName, BuiltinToolName, DiffResult, ExecutorResult, ManagedProcessSnapshot, ToolCall, ToolDefinition, ToolResult } from "../shared/types";
 
 const ignoredWorkspaceEntries = new Set([
   ".DS_Store",
@@ -82,6 +83,41 @@ const inputSchemas: Record<BuiltinToolName, Record<string, unknown>> = {
     },
     required: ["command"]
   },
+  start_process: {
+    type: "object",
+    properties: {
+      command: { type: "string", description: "Long-running command to start. Do not add &, nohup, or output redirection." },
+      cwd: { type: "string", description: "Optional working directory. Defaults to project root." },
+      label: { type: "string", description: "Short user-facing label, such as Vue dev server." },
+      startupWaitMs: { type: "number", description: "Milliseconds to collect startup output before returning (0-3000)." }
+    },
+    required: ["command"]
+  },
+  read_process: {
+    type: "object",
+    properties: {
+      processId: { type: "string", description: "Managed process session ID." },
+      tailChars: { type: "number", description: "Number of recent output characters to return." }
+    },
+    required: ["processId"]
+  },
+  write_process: {
+    type: "object",
+    properties: {
+      processId: { type: "string", description: "Managed process session ID." },
+      input: { type: "string", description: "Input to write to the process stdin. Include a newline when needed." }
+    },
+    required: ["processId", "input"]
+  },
+  stop_process: {
+    type: "object",
+    properties: { processId: { type: "string", description: "Managed process session ID." } },
+    required: ["processId"]
+  },
+  list_processes: {
+    type: "object",
+    properties: {}
+  },
   git_status: {
     type: "object",
     properties: { cwd: { type: "string", description: "Optional git worktree path. Defaults to project root." } }
@@ -129,6 +165,11 @@ export const registeredTools: ToolDefinition[] = [
   { id: "apply_patch", name: "apply_patch", description: "Patch an existing file using unified diff or exact oldText/newText replacement.", inputSchema: inputSchemas.apply_patch, source: "builtin", risk: "high", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "web_fetch", name: "web_fetch", description: "Fetch documentation or API references from a URL.", inputSchema: inputSchemas.web_fetch, source: "builtin", risk: "medium", requiresSandbox: false, defaultApproval: "ask", approvalMode: "ask" },
   { id: "run_shell", name: "run_shell", description: "Run a shell command through portable guarded execution.", inputSchema: inputSchemas.run_shell, source: "builtin", risk: "high", requiresSandbox: true, requiresExecutor: true, defaultApproval: "ask", approvalMode: "ask" },
+  { id: "start_process", name: "start_process", description: "Start a guarded long-running process session for dev servers, watchers, and similar commands. Returns immediately with a process ID and startup output.", inputSchema: inputSchemas.start_process, source: "builtin", risk: "high", requiresSandbox: true, requiresExecutor: true, defaultApproval: "ask", approvalMode: "ask" },
+  { id: "read_process", name: "read_process", description: "Read the current state and recent output of a managed process session.", inputSchema: inputSchemas.read_process, source: "builtin", risk: "low", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
+  { id: "write_process", name: "write_process", description: "Write input to a running managed process session.", inputSchema: inputSchemas.write_process, source: "builtin", risk: "medium", requiresSandbox: true, defaultApproval: "ask", approvalMode: "ask" },
+  { id: "stop_process", name: "stop_process", description: "Stop a managed process session and its child process tree.", inputSchema: inputSchemas.stop_process, source: "builtin", risk: "medium", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
+  { id: "list_processes", name: "list_processes", description: "List managed process sessions for the current project.", inputSchema: inputSchemas.list_processes, source: "builtin", risk: "low", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "git_status", name: "git_status", description: "Show git status for the workspace.", inputSchema: inputSchemas.git_status, source: "builtin", risk: "low", requiresSandbox: true, requiresExecutor: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "git_diff", name: "git_diff", description: "Show git diff for the workspace.", inputSchema: inputSchemas.git_diff, source: "builtin", risk: "low", requiresSandbox: true, requiresExecutor: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "git_branch", name: "git_branch", description: "Create or switch a git branch in the workspace.", inputSchema: inputSchemas.git_branch, source: "builtin", risk: "medium", requiresSandbox: true, requiresExecutor: true, defaultApproval: "ask", approvalMode: "ask" },
@@ -159,6 +200,18 @@ function getString(value: unknown, field: string): string {
 
 function getNumber(value: unknown, fallback: number) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function formatProcess(process: ManagedProcessSnapshot) {
+  const lifecycle = [
+    `Process: ${process.label ?? process.id}`,
+    `ID: ${process.id}`,
+    `Status: ${process.status}`,
+    process.pid ? `PID: ${process.pid}` : "",
+    process.exitCode !== undefined ? `Exit code: ${process.exitCode}` : "",
+    `CWD: ${process.cwd}`
+  ].filter(Boolean).join("\n");
+  return process.output ? `${lifecycle}\n\nOutput:\n${process.output}` : lifecycle;
 }
 
 async function walkFiles(root: string, maxResults: number, includeContentSearch?: { query: RegExp }) {
@@ -368,6 +421,53 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
       executorResult = await portableExecutor.run({ command, cwd: analysis.cwd, projectPath });
       exitCode = executorResult.exitCode;
       result = buildExecutorToolResult(call, executorResult, context);
+    } else if (call.name === "start_process") {
+      if (!runtimeConfig.computerControl.enabled || !runtimeConfig.computerControl.shell) {
+        throw new Error("Computer control shell is disabled by config/agent.toml");
+      }
+      const command = getString(call.arguments.command, "command");
+      const process = await managedProcessManager.start({
+        command,
+        cwd: call.arguments.cwd,
+        projectPath,
+        label: typeof call.arguments.label === "string" ? call.arguments.label : undefined,
+        startupWaitMs: getNumber(call.arguments.startupWaitMs, 700)
+      });
+      result = {
+        toolCallId: call.id,
+        name: call.name,
+        ok: process.status === "running" || (process.status === "exited" && process.exitCode === 0),
+        exitCode: process.exitCode,
+        content: formatProcess(process),
+        process
+      };
+    } else if (call.name === "read_process") {
+      const process = managedProcessManager.get(
+        getString(call.arguments.processId, "processId"),
+        getNumber(call.arguments.tailChars, 20_000)
+      );
+      if (!process) throw new Error(`Managed process not found: ${String(call.arguments.processId ?? "")}`);
+      result = { toolCallId: call.id, name: call.name, ok: true, content: formatProcess(process), process };
+    } else if (call.name === "write_process") {
+      if (!runtimeConfig.computerControl.enabled || !runtimeConfig.computerControl.shell) {
+        throw new Error("Computer control shell is disabled by config/agent.toml");
+      }
+      const process = managedProcessManager.write(
+        getString(call.arguments.processId, "processId"),
+        getString(call.arguments.input, "input")
+      );
+      result = { toolCallId: call.id, name: call.name, ok: true, content: formatProcess(process), process };
+    } else if (call.name === "stop_process") {
+      const process = await managedProcessManager.stop(getString(call.arguments.processId, "processId"));
+      result = { toolCallId: call.id, name: call.name, ok: true, content: formatProcess(process), process };
+    } else if (call.name === "list_processes") {
+      const processes = managedProcessManager.list(projectPath);
+      result = {
+        toolCallId: call.id,
+        name: call.name,
+        ok: true,
+        content: processes.length ? processes.map((process) => formatProcess({ ...process, output: process.output.slice(-2_000) })).join("\n\n---\n\n") : "No managed processes for this project."
+      };
     } else if (call.name === "git_status" || call.name === "git_diff") {
       const cwd = call.arguments.cwd ? (await assertPathInsideWorkspace(call.arguments.cwd, projectPath)).canonicalPath : getWorkspaceRoot(projectPath);
       const command = call.name === "git_status" ? "git status --short --branch" : `git diff ${call.arguments.staged ? "--staged" : ""}`;
