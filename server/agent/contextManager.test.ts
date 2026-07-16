@@ -36,3 +36,19 @@ test("message token estimate includes structured tool arguments", () => {
   });
   assert.ok(withTool > plain);
 });
+
+test("message token estimate accounts for text and image attachments", () => {
+  const plain = estimateMessageTokens({ role: "user", content: "review" });
+  const withText = estimateMessageTokens({
+    role: "user",
+    content: "review",
+    attachments: [{ id: "text", name: "notes.txt", mimeType: "text/plain", size: 1_600, kind: "file", text: "a".repeat(1_600) }]
+  });
+  const withImage = estimateMessageTokens({
+    role: "user",
+    content: "review",
+    attachments: [{ id: "image", name: "screen.png", mimeType: "image/png", size: 2_048, kind: "image", dataUrl: "data:image/png;base64,AA==" }]
+  });
+  assert.ok(withText > plain);
+  assert.ok(withImage > withText);
+});

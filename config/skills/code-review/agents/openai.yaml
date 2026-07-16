@@ -1,0 +1,4 @@
+interface:
+  display_name: "代码审查"
+  short_description: "系统化审查代码正确性、回归风险、可维护性和测试覆盖"
+  default_prompt: "使用 $code-review 审查当前代码变更，并按严重程度报告可验证的问题。"

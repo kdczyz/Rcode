@@ -18,8 +18,10 @@ require_approval_for_shell = true
 [computer_control]
 enabled = true
 shell = true
-open_app = false
-screenshot = false
+open_app = true
+screenshot = true
+keyboard_mouse = true
+accessibility = true
 dangerous_commands_require_approval = true
 
 [computer_control.command_policy]

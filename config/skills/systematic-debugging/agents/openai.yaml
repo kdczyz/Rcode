@@ -1,0 +1,4 @@
+interface:
+  display_name: "系统化调试"
+  short_description: "用复现、证据和可证伪假设定位真实问题根因并验证修复"
+  default_prompt: "使用 $systematic-debugging 复现这个问题并定位最早出现的错误状态。"

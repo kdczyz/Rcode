@@ -1,5 +1,7 @@
 export type PermissionMode = "default" | "plan" | "workspace_write" | "full_access" | "custom";
 
+export type LearningRunStatus = "saved" | "no_candidate" | "skipped" | "failed";
+
 export type WorkflowPhase =
   | "preparing"
   | "planning"
@@ -43,6 +45,7 @@ export type BuiltinToolName =
   | "list_files"
   | "search_text"
   | "inspect_tree"
+  | "record_learning"
   | "apply_patch"
   | "web_fetch"
   | "run_shell"
@@ -98,6 +101,7 @@ export interface ToolResult {
   name: AgentToolName;
   ok: boolean;
   content: string;
+  attachments?: AgentAttachment[];
   summary?: string;
   exitCode?: number;
   artifacts?: Array<{ id: string; label: string; kind: string }>;
@@ -184,9 +188,20 @@ export interface PendingApproval {
   };
 }
 
+export interface AgentAttachment {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  kind: "image" | "file";
+  dataUrl?: string;
+  text?: string;
+}
+
 export interface AgentMessage {
   role: "user" | "assistant" | "tool" | "system";
   content: string;
+  attachments?: AgentAttachment[];
   toolCallId?: string;
   toolCalls?: ToolCall[];
 }
@@ -212,6 +227,7 @@ export type StreamEvent =
         promptTokens: number;
         completionTokens: number;
         totalTokens: number;
+        estimated?: boolean;
       };
       model: string;
       provider: string;
@@ -223,6 +239,20 @@ export type StreamEvent =
         completionTokens: number;
         totalTokens: number;
         cachedTokens?: number;
+        estimated?: boolean;
+      };
+      model: string;
+      provider: string;
+    }
+  | {
+      type: "billing_usage";
+      usage: {
+        promptTokens: number;
+        completionTokens: number;
+        totalTokens: number;
+        cachedTokens?: number;
+        cacheReadTokens?: number;
+        cacheCreationTokens?: number;
       };
       model: string;
       provider: string;
@@ -231,6 +261,7 @@ export type StreamEvent =
   | { type: "permission_decision"; toolCallId: string; effect: PermissionEffect; reason: string }
   | { type: "tool_result"; result: ToolResult }
   | { type: "diff_created"; diffs: DiffResult[]; auditEventId?: string }
+  | { type: "learning_result"; status: LearningRunStatus; recordsSaved: number; reason: string; createdAt: string }
   | { type: "approval_required"; conversationId: string; answer: string; approvals: PendingApproval[] }
   | { type: "completed"; conversationId: string; answer: string }
   | { type: "error"; conversationId: string; message: string };

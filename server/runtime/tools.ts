@@ -2,7 +2,7 @@ import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { getRuntimeConfig } from "./config";
-import { recordAuditEvent, saveArtifact } from "../storage/database";
+import { recordAuditEvent, saveArtifact, saveLearningRecord, type LearningRecordCategory } from "../storage/database";
 import { portableExecutor } from "./executor";
 import { managedProcessManager } from "./processManager";
 import { executeMcpTool, listMcpToolDefinitions } from "../integrations/mcpClient";
@@ -60,6 +60,18 @@ const inputSchemas: Record<BuiltinToolName, Record<string, unknown>> = {
       path: { type: "string", description: "Directory to inspect. Defaults to project root." },
       depth: { type: "number", description: "Maximum depth. Defaults to 2." }
     }
+  },
+  record_learning: {
+    type: "object",
+    properties: {
+      title: { type: "string", description: "Specific, concise title for the reusable lesson." },
+      insight: { type: "string", description: "Self-contained and actionable lesson for future work." },
+      category: { type: "string", enum: ["preference", "project", "pattern", "bugfix", "workflow"], description: "Type of learned knowledge." },
+      evidence: { type: "string", description: "How the lesson was verified, such as a test, file, or observed behavior." },
+      importance: { type: "number", minimum: 1, maximum: 5, description: "Future impact from 1 (minor) to 5 (critical)." },
+      dedupeKey: { type: "string", description: "Stable concept key used to update an equivalent lesson instead of creating a duplicate." }
+    },
+    required: ["title", "insight", "category"]
   },
   apply_patch: {
     type: "object",
@@ -162,6 +174,7 @@ export const registeredTools: ToolDefinition[] = [
   { id: "list_files", name: "list_files", description: "List files under a workspace directory while ignoring build artifacts.", inputSchema: inputSchemas.list_files, source: "builtin", risk: "low", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "search_text", name: "search_text", description: "Search text in workspace files while ignoring build artifacts.", inputSchema: inputSchemas.search_text, source: "builtin", risk: "low", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "inspect_tree", name: "inspect_tree", description: "Inspect the workspace directory tree.", inputSchema: inputSchemas.inspect_tree, source: "builtin", risk: "low", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
+  { id: "record_learning", name: "record_learning", description: "Save a verified reusable lesson to this project's learning records. Never store credentials, personal data, raw logs, or unverified guesses.", inputSchema: inputSchemas.record_learning, source: "builtin", risk: "low", requiresSandbox: false, defaultApproval: "allow", approvalMode: "allow" },
   { id: "apply_patch", name: "apply_patch", description: "Patch an existing file using unified diff or exact oldText/newText replacement.", inputSchema: inputSchemas.apply_patch, source: "builtin", risk: "high", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "web_fetch", name: "web_fetch", description: "Fetch documentation or API references from a URL.", inputSchema: inputSchemas.web_fetch, source: "builtin", risk: "medium", requiresSandbox: false, defaultApproval: "ask", approvalMode: "ask" },
   { id: "run_shell", name: "run_shell", description: "Run a shell command through portable guarded execution.", inputSchema: inputSchemas.run_shell, source: "builtin", risk: "high", requiresSandbox: true, requiresExecutor: true, defaultApproval: "ask", approvalMode: "ask" },
@@ -342,6 +355,19 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
 
     let executorResult: ExecutorResult | undefined;
 
+    if (call.name.startsWith("mcp__native-devtools__")) {
+      if (!runtimeConfig.computerControl.enabled) throw new Error("Computer control is disabled by config/agent.toml");
+      const nativeToolName = call.name.slice("mcp__native-devtools__".length);
+      const screenshotTools = new Set(["take_screenshot", "find_text", "find_image", "load_image", "start_recording"]);
+      const accessibilityTools = new Set(["take_ax_snapshot", "probe_app", "element_at_point", "ax_click", "ax_set_value", "ax_select"]);
+      const inputTools = new Set(["click", "move_mouse", "drag", "scroll", "type_text", "press_key"]);
+      const appTools = new Set(["list_windows", "list_apps", "focus_window", "launch_app", "quit_app"]);
+      if (screenshotTools.has(nativeToolName) && !runtimeConfig.computerControl.screenshot) throw new Error("Computer screenshots are disabled by config/agent.toml");
+      if (accessibilityTools.has(nativeToolName) && !runtimeConfig.computerControl.accessibility) throw new Error("Accessibility control is disabled by config/agent.toml");
+      if (inputTools.has(nativeToolName) && !runtimeConfig.computerControl.keyboardMouse) throw new Error("Mouse and keyboard control is disabled by config/agent.toml");
+      if (appTools.has(nativeToolName) && !runtimeConfig.computerControl.openApp) throw new Error("Application control is disabled by config/agent.toml");
+    }
+
     if (call.name.startsWith("mcp__")) {
       const mcpResult = await executeMcpTool(call);
       const summarized = summarizeWithArtifacts(mcpResult.content, context);
@@ -351,7 +377,8 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         ok: mcpResult.ok,
         content: summarized.content,
         summary: summarized.summary,
-        artifacts: summarized.artifacts
+        artifacts: summarized.artifacts,
+        attachments: mcpResult.attachments
       };
     } else if (call.name === "read_file") {
       const filePath = await assertPathInsideWorkspace(call.arguments.path, projectPath);
@@ -406,6 +433,24 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
       const dir = await assertPathInsideWorkspace(call.arguments.path ?? ".", projectPath);
       const tree = await inspectTree(dir.canonicalPath, Math.min(getNumber(call.arguments.depth, 2), 5));
       result = { toolCallId: call.id, name: call.name, ok: true, content: tree.slice(0, 12000) };
+    } else if (call.name === "record_learning") {
+      const record = saveLearningRecord({
+        projectPath: getWorkspaceRoot(projectPath),
+        conversationId: context?.conversationId,
+        title: getString(call.arguments.title, "title"),
+        insight: getString(call.arguments.insight, "insight"),
+        category: getString(call.arguments.category, "category") as LearningRecordCategory,
+        evidence: typeof call.arguments.evidence === "string" ? call.arguments.evidence : undefined,
+        importance: getNumber(call.arguments.importance, 2),
+        dedupeKey: typeof call.arguments.dedupeKey === "string" ? call.arguments.dedupeKey : undefined,
+        source: "agent"
+      });
+      result = {
+        toolCallId: call.id,
+        name: call.name,
+        ok: true,
+        content: `Learning recorded: ${record.title}`
+      };
     } else if (call.name === "web_fetch") {
       const url = getString(call.arguments.url, "url");
       const response = await fetch(url);

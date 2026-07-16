@@ -7,6 +7,7 @@ interface RcodeAuthUser {
   displayName: string;
   createdAt: string;
   lastLoginAt?: string;
+  isGuest?: boolean;
 }
 
 interface RcodeAuthSession {
@@ -19,6 +20,9 @@ interface Window {
     platform: string;
     isDesktopClient: boolean;
     getLocalApiToken?: () => Promise<string | undefined>;
+    githubMcpAuthStatus?: (details: { apiBase: string }) => Promise<{ authorized: boolean }>;
+    githubMcpAuthorize?: (details: { clientId: string; clientSecret: string; apiBase: string }) => Promise<{ ok: boolean; login?: string; scope?: string }>;
+    githubMcpLogout?: (details: { apiBase: string }) => Promise<{ ok: boolean }>;
     authSession?: () => Promise<RcodeAuthSession | undefined>;
     authLogin?: (details: { identifier: string; password: string }) => Promise<RcodeAuthSession>;
     authRegister?: (details: { email: string; username: string; displayName: string; password: string }) => Promise<RcodeAuthSession>;
@@ -27,5 +31,7 @@ interface Window {
     setThemePreference?: (themePreference: "system" | "dark" | "light") => Promise<"system" | "dark" | "light">;
     selectProjectFolder?: () => Promise<string | undefined>;
     createFolderProject?: (name: string) => Promise<string | undefined>;
+    openExternalUrl?: (url: string) => Promise<{ ok: boolean; error?: string }>;
+    openLocalPath?: (details: { path: string; basePath?: string }) => Promise<{ ok: boolean; error?: string }>;
   };
 }

@@ -1,0 +1,4 @@
+interface:
+  display_name: "测试驱动开发"
+  short_description: "通过失败测试、最小实现和安全重构交付可验证的软件行为"
+  default_prompt: "使用 $test-driven-development 先写失败测试，再实现这个功能。"

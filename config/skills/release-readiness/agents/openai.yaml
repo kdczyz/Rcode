@@ -1,0 +1,4 @@
+interface:
+  display_name: "发布就绪检查"
+  short_description: "基于构建测试、迁移、监控与回滚证据判断软件是否可以发布"
+  default_prompt: "使用 $release-readiness 检查当前版本是否具备发布条件并列出剩余风险。"

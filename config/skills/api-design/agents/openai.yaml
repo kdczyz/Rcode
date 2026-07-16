@@ -1,0 +1,4 @@
+interface:
+  display_name: "API 设计"
+  short_description: "设计资源、数据结构、错误、兼容性与重试语义清晰的接口契约"
+  default_prompt: "使用 $api-design 为这个业务流程设计稳定且可演进的 API 契约。"

@@ -1,3 +1,5 @@
+export { RemoteSession } from "./remoteSession";
+
 const encoder = new TextEncoder();
 // workerd enforces a maximum of 100,000 iterations for one PBKDF2 operation.
 const PASSWORD_ITERATIONS = 100_000;
@@ -367,6 +369,56 @@ async function logout(request: Request, env: Env): Promise<Response> {
   return json(request, env, { ok: true });
 }
 
+async function remoteTicket(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const user = await authenticatedUser(request, env);
+  const body = await readObject(request);
+  const role = body.role === "agent" || body.role === "controller" ? body.role : undefined;
+  if (!role) throw new HttpError(400, "远程连接角色不正确", "validation_error");
+
+  let device: { id: string; name: string; platform: string; appVersion?: string; projectName?: string; ready?: boolean } | undefined;
+  if (role === "agent") {
+    if (!body.device || typeof body.device !== "object" || Array.isArray(body.device)) {
+      throw new HttpError(400, "受控端缺少设备信息", "validation_error");
+    }
+    const raw = body.device as Record<string, unknown>;
+    const id = requiredString(raw.id, "设备 ID").slice(0, 128);
+    const name = requiredString(raw.name, "设备名称").slice(0, 100);
+    const platform = requiredString(raw.platform, "设备平台").slice(0, 40);
+    if (!/^[a-zA-Z0-9._:-]+$/.test(id)) throw new HttpError(400, "设备 ID 格式不正确", "validation_error");
+    device = {
+      id,
+      name,
+      platform,
+      ...(typeof raw.appVersion === "string" && raw.appVersion.trim() ? { appVersion: raw.appVersion.trim().slice(0, 40) } : {}),
+      ...(typeof raw.projectName === "string" && raw.projectName.trim() ? { projectName: raw.projectName.trim().slice(0, 160) } : {}),
+      ready: raw.ready === true
+    };
+  }
+
+  const session = env.REMOTE_SESSIONS.getByName(user.id);
+  const issued = await session.issueTicket({ role, device });
+  const url = new URL(request.url);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.pathname = "/v1/remote/connect";
+  url.search = new URLSearchParams({ account: user.id, ticket: issued.ticket }).toString();
+  const now = Math.floor(Date.now() / 1000);
+  ctx.waitUntil(env.DB.prepare("UPDATE sessions SET last_seen_at = ?1 WHERE id = ?2").bind(now, user.session_id).run());
+  return json(request, env, { url: url.toString(), expiresAt: new Date(issued.expiresAt).toISOString() });
+}
+
+async function remoteSnapshot(request: Request, env: Env): Promise<Response> {
+  const user = await authenticatedUser(request, env);
+  return json(request, env, await env.REMOTE_SESSIONS.getByName(user.id).snapshot());
+}
+
+async function remoteConnect(request: Request, env: Env): Promise<Response> {
+  const account = new URL(request.url).searchParams.get("account") ?? "";
+  if (!account || account.length > 128 || !/^[a-zA-Z0-9-]+$/.test(account)) {
+    throw new HttpError(401, "远程连接票据无效", "unauthorized");
+  }
+  return env.REMOTE_SESSIONS.getByName(account).fetch(request);
+}
+
 async function pruneSecurityState(db: D1Database, now: number): Promise<void> {
   await db.batch([
     db.prepare("DELETE FROM sessions WHERE expires_at <= ?1 OR (revoked_at IS NOT NULL AND revoked_at <= ?2)").bind(now, now - 7 * 86400),
@@ -381,12 +433,15 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   }
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: responseHeaders(request, env) });
   if (request.method === "GET" && url.pathname === "/health") {
-    return json(request, env, { ok: true, service: "rcode-auth", version: "1" });
+    return json(request, env, { ok: true, service: "rcode-auth", version: "2", remote: true });
   }
   if (request.method === "POST" && url.pathname === "/v1/auth/register") return register(request, env, ctx);
   if (request.method === "POST" && url.pathname === "/v1/auth/login") return login(request, env, ctx);
   if (request.method === "GET" && url.pathname === "/v1/auth/me") return me(request, env, ctx);
   if (request.method === "POST" && url.pathname === "/v1/auth/logout") return logout(request, env);
+  if (request.method === "POST" && url.pathname === "/v1/remote/ticket") return remoteTicket(request, env, ctx);
+  if (request.method === "GET" && url.pathname === "/v1/remote/snapshot") return remoteSnapshot(request, env);
+  if (request.method === "GET" && url.pathname === "/v1/remote/connect") return remoteConnect(request, env);
   throw new HttpError(404, "接口不存在", "not_found");
 }
 

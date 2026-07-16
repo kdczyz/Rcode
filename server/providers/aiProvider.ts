@@ -3,6 +3,7 @@ import type { AgentMessage, ContextSnapshot, PermissionMode, ToolCall, ToolResul
 import { getRuntimeConfig } from "../runtime/config";
 import { nanoid } from "nanoid";
 import { buildProjectContextBundle, compactMessagesWithSnapshot } from "../agent/contextManager";
+import type { ProviderUsagePayload } from "./providerUsage";
 
 interface ChatChoice {
   message?: {
@@ -47,14 +48,7 @@ export interface AiTurn {
   toolCalls: ToolCall[];
 }
 
-export interface AiUsage {
-  prompt_tokens?: number;
-  completion_tokens?: number;
-  total_tokens?: number;
-  prompt_tokens_details?: {
-    cached_tokens?: number;
-  };
-}
+export type AiUsage = ProviderUsagePayload;
 
 export interface AiUsageProgress {
   prompt_tokens: number;
@@ -66,6 +60,25 @@ export interface ApprovalAuditResult {
   allow: boolean;
   risk: ToolRisk;
   reason: string;
+}
+
+export type LearningCandidateCategory = "preference" | "project" | "pattern" | "bugfix" | "workflow";
+
+export interface LearningCandidate {
+  dedupeKey: string;
+  title: string;
+  insight: string;
+  category: LearningCandidateCategory;
+  evidence: string;
+  importance: number;
+  confidence: number;
+}
+
+export interface LearningExtractionResult {
+  records: LearningCandidate[];
+  usage?: AiUsage;
+  model: string;
+  provider: string;
 }
 
 export type ThinkingMode = "fast" | "balanced" | "deep";
@@ -109,6 +122,58 @@ function extractFirstJson(text: string, startIdx: number): string | null {
     }
   }
   return null;
+}
+
+const learningCandidateCategories = new Set<LearningCandidateCategory>([
+  "preference",
+  "project",
+  "pattern",
+  "bugfix",
+  "workflow"
+]);
+
+function normalizeCandidateKey(value: string) {
+  return value
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 160);
+}
+
+export function parseLearningExtractionContent(rawContent: string): LearningCandidate[] {
+  const jsonStart = rawContent.indexOf("{");
+  const jsonText = jsonStart >= 0 ? extractFirstJson(rawContent, jsonStart) : null;
+  if (!jsonText) return [];
+
+  try {
+    const parsed = JSON.parse(jsonText) as { records?: Array<Record<string, unknown>> };
+    if (!Array.isArray(parsed.records)) return [];
+    const records: LearningCandidate[] = [];
+    for (const candidate of parsed.records.slice(0, 3)) {
+      const category = typeof candidate.category === "string" ? candidate.category as LearningCandidateCategory : undefined;
+      const title = typeof candidate.title === "string" ? candidate.title.trim().replace(/\s+/g, " ").slice(0, 120) : "";
+      const insight = typeof candidate.insight === "string" ? candidate.insight.trim().replace(/\s+/g, " ").slice(0, 1200) : "";
+      const evidence = typeof candidate.evidence === "string" ? candidate.evidence.trim().replace(/\s+/g, " ").slice(0, 600) : "";
+      const dedupeKey = normalizeCandidateKey(typeof candidate.dedupeKey === "string" ? candidate.dedupeKey : "");
+      const confidence = typeof candidate.confidence === "number" ? candidate.confidence : 0;
+      const importance = typeof candidate.importance === "number" ? Math.max(1, Math.min(5, Math.round(candidate.importance))) : 2;
+      if (
+        candidate.reusable !== true ||
+        !category ||
+        !learningCandidateCategories.has(category) ||
+        !dedupeKey ||
+        title.length < 4 ||
+        insight.length < 16 ||
+        evidence.length < 8 ||
+        confidence < 0.8
+      ) continue;
+      records.push({ dedupeKey, title, insight, category, evidence, importance, confidence: Math.min(1, confidence) });
+    }
+    return records.slice(0, 2);
+  } catch {
+    return [];
+  }
 }
 
 /** Extract tool calls from text when the model does not support standard function calling. */
@@ -271,7 +336,11 @@ function getThinkingInstruction(mode: ThinkingMode = "balanced") {
 function getConfig(modelOverride?: string) {
   const runtimeConfig = getRuntimeConfig();
   return {
-    apiKey: runtimeConfig.provider.apiKey ?? process.env[runtimeConfig.provider.apiKeyEnv] ?? process.env.AI_API_KEY,
+    apiKey: runtimeConfig.provider.apiKey ?? (
+      runtimeConfig.provider.apiKeyEnv
+        ? process.env[runtimeConfig.provider.apiKeyEnv]
+        : process.env.AI_API_KEY
+    ),
     baseUrl: runtimeConfig.provider.baseUrl ?? process.env.AI_BASE_URL ?? "",
     chatPath: runtimeConfig.provider.chatCompletionsPath ?? "/chat/completions",
     model: modelOverride || runtimeConfig.provider.defaultModel || process.env.AI_MODEL || "",
@@ -279,6 +348,39 @@ function getConfig(modelOverride?: string) {
     temperature: runtimeConfig.temperature,
     maxTokens: runtimeConfig.maxTokens
   };
+}
+
+function escapeAttachmentName(value: string) {
+  return value.replace(/[<>&"']/g, (character) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "\"": "&quot;", "'": "&#39;" })[character] ?? character);
+}
+
+function toProviderMessageContent(message: AgentMessage): string | Array<Record<string, unknown>> {
+  if (message.role !== "user" || !message.attachments?.length) return message.content;
+
+  const textAttachments = message.attachments.filter((attachment) => attachment.text !== undefined);
+  const textContent = [
+    message.content,
+    ...textAttachments.map((attachment) => [
+      `<attached_file name="${escapeAttachmentName(attachment.name)}" mime_type="${escapeAttachmentName(attachment.mimeType)}">`,
+      attachment.text,
+      "</attached_file>"
+    ].join("\n"))
+  ].filter(Boolean).join("\n\n");
+  const content: Array<Record<string, unknown>> = [];
+  if (textContent) content.push({ type: "text", text: textContent });
+
+  for (const attachment of message.attachments) {
+    if (!attachment.dataUrl) continue;
+    if (attachment.kind === "image") {
+      content.push({ type: "image_url", image_url: { url: attachment.dataUrl, detail: "auto" } });
+    } else {
+      content.push({
+        type: "file",
+        file: { filename: attachment.name, file_data: attachment.dataUrl }
+      });
+    }
+  }
+  return content.length > 0 ? content : message.content;
 }
 
 async function toProviderMessages(
@@ -293,7 +395,9 @@ async function toProviderMessages(
   const projectInstruction = projectPath
     ? `Current project root: ${projectPath}. Resolve relative file paths and shell commands inside this project unless the user asks otherwise.`
     : "Current project type: empty project. Use relative file paths from the app workspace unless the user provides a folder path.";
-  const latestUserPrompt = [...messages].reverse().find((message) => message.role === "user")?.content ?? "";
+  const latestUserPrompt = [...messages].reverse().find((message) =>
+    message.role === "user" && !message.content.startsWith("Visual result returned by tool ")
+  )?.content ?? "";
   const projectContext = await buildProjectContextBundle(projectPath, latestUserPrompt);
   const totalBudgetTokens = 16_000;
   const contextOverheadTokens = Math.ceil(projectContext.content.length / 4) + 1_200;
@@ -323,7 +427,7 @@ async function toProviderMessages(
           }))
         };
       }
-      return { role: message.role, content: message.content };
+      return { role: message.role, content: toProviderMessageContent(message) };
     })
   ];
 
@@ -432,6 +536,82 @@ export async function auditToolCallApproval(
   const data = (await response.json()) as ChatResponse;
   const content = data.choices?.[0]?.message?.content ?? "";
   return parseApprovalAudit(content);
+}
+
+export async function extractLearningCandidates(
+  transcript: string,
+  options: { model?: string; projectPath?: string; signal?: AbortSignal; timeoutMs?: number } = {}
+): Promise<LearningExtractionResult> {
+  const config = getConfig(options.model);
+  if (!config.apiKey) throw new Error("AI provider is not configured for automatic learning");
+
+  const controller = new AbortController();
+  const abortFromParent = () => controller.abort(options.signal?.reason);
+  options.signal?.addEventListener("abort", abortFromParent, { once: true });
+  const timeout = setTimeout(() => controller.abort(new Error("Automatic learning extraction timed out")), options.timeoutMs ?? 20_000);
+
+  try {
+    const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}${config.chatPath}`, {
+      method: "POST",
+      signal: controller.signal,
+      headers: { "content-type": "application/json", authorization: `Bearer ${config.apiKey}` },
+      body: JSON.stringify({
+        model: config.model,
+        messages: [
+          {
+            role: "system",
+            content: [
+              "You are Rcode's post-task learning verifier.",
+              "Extract at most two durable lessons from the completed turn. Return ONLY one compact JSON object with a records array.",
+              "A record is allowed only when the transcript contains concrete evidence and the lesson is likely to change future work in the same project.",
+              "Reject routine progress, generic software advice, one-off commands, guessed causes, raw logs, secrets, credentials, personal data, and facts already obvious from source files.",
+              "Use an empty records array when nothing qualifies. Never invent missing verification.",
+              "Each record must contain: dedupeKey, title, insight, category, evidence, importance, confidence, reusable.",
+              "dedupeKey must be a short stable concept key; category must be preference, project, pattern, bugfix, or workflow; confidence is 0 to 1; reusable must be true.",
+              "Evidence must summarize the exact observed command, test, file, or user instruction that verified the lesson without copying sensitive or lengthy output.",
+              "Schema: {\"records\":[{\"dedupeKey\":\"...\",\"title\":\"...\",\"insight\":\"...\",\"category\":\"workflow\",\"evidence\":\"...\",\"importance\":2,\"confidence\":0.9,\"reusable\":true}]}"
+            ].join("\n")
+          },
+          {
+            role: "user",
+            content: [
+              options.projectPath ? `Project root: ${options.projectPath}` : "",
+              "Completed turn evidence:",
+              transcript.slice(0, 12_000)
+            ].filter(Boolean).join("\n")
+          }
+        ],
+        temperature: 0,
+        max_tokens: Math.min(1_000, config.maxTokens)
+      })
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Automatic learning provider error ${response.status}: ${body.slice(0, 300)}`);
+    }
+    const data = (await response.json()) as ChatResponse;
+    const content = data.choices?.[0]?.message?.content ?? "";
+    const jsonStart = content.indexOf("{");
+    const jsonText = jsonStart >= 0 ? extractFirstJson(content, jsonStart) : null;
+    let hasStructuredEnvelope = false;
+    if (jsonText) {
+      try {
+        hasStructuredEnvelope = Array.isArray((JSON.parse(jsonText) as { records?: unknown }).records);
+      } catch {
+        hasStructuredEnvelope = false;
+      }
+    }
+    if (!hasStructuredEnvelope) throw new Error("Automatic learning verifier returned invalid structured output");
+    return {
+      records: parseLearningExtractionContent(content),
+      usage: data.usage,
+      model: config.model,
+      provider: config.providerDisplayName
+    };
+  } finally {
+    clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", abortFromParent);
+  }
 }
 
 /** Non-streaming AI call (kept for fallback). */
@@ -573,6 +753,7 @@ export async function* callAiStream(
   let contentBuffer = "";
   const toolCallMap = new Map<number, { id: string; name: string; argsBuffer: string }>();
   let lastEstimatedCompletionTokens = 0;
+  let finalUsage: AiUsage | undefined;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -592,7 +773,9 @@ export async function* callAiStream(
       try {
         const chunk = JSON.parse(data) as StreamChunk;
         if (chunk.usage) {
-          yield { type: "usage", usage: chunk.usage, model: config.model, provider: config.providerDisplayName };
+          // Compatible providers may repeat usage across terminal chunks. Keep
+          // only the last payload and emit one request-level record at EOF.
+          finalUsage = chunk.usage;
         }
         const delta = chunk.choices?.[0]?.delta;
         if (!delta) continue;
@@ -638,6 +821,10 @@ export async function* callAiStream(
         }
       } catch { /* ignore parse errors */ }
     }
+  }
+
+  if (finalUsage) {
+    yield { type: "usage", usage: finalUsage, model: config.model, provider: config.providerDisplayName };
   }
 
   // Build final tool call list from accumulated deltas

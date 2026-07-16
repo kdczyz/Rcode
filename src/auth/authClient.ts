@@ -5,6 +5,7 @@ export interface AuthUser {
   displayName: string;
   createdAt: string;
   lastLoginAt?: string;
+  isGuest?: boolean;
 }
 
 export interface AuthSession {
@@ -27,6 +28,7 @@ export interface RegistrationDetails {
 type AuthResponse = AuthSession & { token?: string };
 
 const webTokenKey = "rcode.auth.session.v1";
+const guestSessionKey = "rcode.auth.guest-session.v1";
 const defaultAuthApiUrl = "https://rcode-auth.kdczyz0728-994.workers.dev";
 
 function authApiUrl() {
@@ -40,6 +42,23 @@ function readWebToken() {
 function writeWebToken(token?: string) {
   if (token) localStorage.setItem(webTokenKey, token);
   else localStorage.removeItem(webTokenKey);
+}
+
+function readGuestSession(): AuthSession | undefined {
+  try {
+    const value = localStorage.getItem(guestSessionKey);
+    if (!value) return undefined;
+    const session = JSON.parse(value) as AuthSession;
+    return session.user?.isGuest ? session : undefined;
+  } catch {
+    localStorage.removeItem(guestSessionKey);
+    return undefined;
+  }
+}
+
+function writeGuestSession(session?: AuthSession) {
+  if (session) localStorage.setItem(guestSessionKey, JSON.stringify(session));
+  else localStorage.removeItem(guestSessionKey);
 }
 
 function canUseWebFallback() {
@@ -65,6 +84,8 @@ async function webRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 export async function restoreAuthSession(): Promise<AuthSession | undefined> {
+  const guestSession = readGuestSession();
+  if (guestSession) return guestSession;
   if (window.agentDesktop?.authSession) {
     try {
       const desktopSession = await window.agentDesktop.authSession();
@@ -85,7 +106,27 @@ export async function restoreAuthSession(): Promise<AuthSession | undefined> {
   }
 }
 
+export function continueAsGuest(): AuthSession {
+  const now = new Date();
+  const session: AuthSession = {
+    user: {
+      id: "local-guest",
+      email: "仅本机使用",
+      username: "guest",
+      displayName: "本地游客",
+      createdAt: now.toISOString(),
+      lastLoginAt: now.toISOString(),
+      isGuest: true
+    },
+    expiresAt: "9999-12-31T23:59:59.999Z"
+  };
+  writeWebToken();
+  writeGuestSession(session);
+  return session;
+}
+
 export async function signIn(details: AuthCredentials): Promise<AuthSession> {
+  writeGuestSession();
   if (window.agentDesktop?.authLogin) {
     try {
       const session = await window.agentDesktop.authLogin(details);
@@ -101,6 +142,7 @@ export async function signIn(details: AuthCredentials): Promise<AuthSession> {
 }
 
 export async function signUp(details: RegistrationDetails): Promise<AuthSession> {
+  writeGuestSession();
   if (window.agentDesktop?.authRegister) {
     try {
       const session = await window.agentDesktop.authRegister(details);
@@ -116,6 +158,11 @@ export async function signUp(details: RegistrationDetails): Promise<AuthSession>
 }
 
 export async function signOut(): Promise<void> {
+  if (readGuestSession()) {
+    writeGuestSession();
+    writeWebToken();
+    return;
+  }
   const hasWebToken = Boolean(readWebToken());
   if (window.agentDesktop?.authLogout) {
     try {

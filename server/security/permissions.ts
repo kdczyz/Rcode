@@ -8,6 +8,7 @@ const toolRisks: Record<BuiltinToolName, ToolRisk> = {
   list_files: "low",
   search_text: "low",
   inspect_tree: "low",
+  record_learning: "low",
   apply_patch: "high",
   web_fetch: "medium",
   run_shell: "high",

@@ -37,6 +37,22 @@ npm run dev
 
 聊天输入框底栏的“终端”按钮可查看当前项目的全部长期进程，包含状态、PID、命令、输出和停止操作；聊天中的进程卡片也会同步刷新。Rcode 服务退出时会清理仍在运行的托管进程，重启后不会自动恢复或重新执行旧命令。
 
+## macOS 桌面控制
+
+Rcode 可以通过本地 `native-devtools-mcp` 服务读取和操作 macOS 应用界面，支持 Accessibility 快照、截图与 OCR、鼠标点击/拖动/滚动、键盘输入与快捷键、窗口管理，以及 Chrome/Electron CDP。服务在本机运行，不需要额外 API Key。
+
+```bash
+npm install -g native-devtools-mcp@0.10.1
+native-devtools-mcp setup
+```
+
+在 Rcode 的 MCP 设置中添加 stdio 服务，命令使用 `native-devtools-mcp` 的绝对路径，并保持默认审批策略为 `ask`。macOS 还需要在“系统设置 → 隐私与安全性”中授权：
+
+- 屏幕录制：用于截图和 OCR。
+- 辅助功能：用于点击、输入、滚动、拖动和 Accessibility 元素操作。
+
+用户级 skill 位于 `~/.agent/skills/macos-computer-use`。它会优先使用不移动鼠标的 Accessibility 操作，每次界面变化后重新观察；只读观察自动允许，修改界面的操作仍需审批。
+
 ## AI 配置
 
 后端使用 OpenAI-compatible Chat Completions 接口。你可以在 `.env` 中配置：
@@ -60,6 +76,27 @@ AI_API_KEY=你的 MiMo API Key
 ```
 
 如果没有配置 `AI_API_KEY`，应用仍可启动，并会提示框架已就绪。
+
+## GitHub MCP
+
+Rcode 预置了 GitHub 官方远程 MCP 服务器，默认停用，支持两种认证方式。
+
+推荐使用桌面端浏览器授权：
+
+1. 在 GitHub Developer Settings 创建 OAuth App。
+2. 将 Authorization callback URL 设为 `http://127.0.0.1/oauth/github/callback`。Rcode 会按 GitHub 的 loopback 规则在运行时附加随机本地端口。
+3. 在“设置 → MCP 服务器”填写 OAuth App 的 Client ID 和 Client Secret。
+4. 点击“浏览器授权”。GitHub 确认后会回调本机 Rcode；Rcode 验证 `state`、PKCE 和 GitHub 用户身份后自动聚焦应用并测试连接。
+
+Client Secret 只在本次 token 交换期间保存在内存中，不会写入配置或磁盘。OAuth access token 使用 Electron `safeStorage` 加密保存在系统安全存储中，只会同步到本机 MCP 进程内存。默认请求 `repo read:org` scope；组织可能还需要管理员批准或 SSO 授权。
+
+也可以继续使用环境变量 PAT。在 `.env.local` 中配置后重启 Rcode：
+
+```bash
+GITHUB_PERSONAL_ACCESS_TOKEN=你的_GitHub_PAT
+```
+
+PAT 只通过环境变量绑定，不会写入 MCP 配置或 SQLite。按实际任务授予最小仓库权限；MCP 工具默认仍需审批。
 
 ## 架构
 

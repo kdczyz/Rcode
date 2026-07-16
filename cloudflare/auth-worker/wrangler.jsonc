@@ -2,7 +2,7 @@
   "$schema": "../../node_modules/wrangler/config-schema.json",
   "name": "rcode-auth",
   "main": "src/index.ts",
-  "compatibility_date": "2026-07-14",
+  "compatibility_date": "2026-07-15",
   "compatibility_flags": ["nodejs_compat"],
   "upload_source_maps": true,
   "observability": {
@@ -25,6 +25,20 @@
       "binding": "DB",
       "database_name": "rcode-auth",
       "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "REMOTE_SESSIONS",
+        "class_name": "RemoteSession"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1-remote-sessions",
+      "new_sqlite_classes": ["RemoteSession"]
     }
   ]
 }

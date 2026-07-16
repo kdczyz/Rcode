@@ -4,6 +4,8 @@ const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { fork } = require("node:child_process");
+const { createServer } = require("node:http");
+const { fileURLToPath } = require("node:url");
 
 const isDev = !app.isPackaged;
 const startUrl = process.env.ELECTRON_START_URL || `file://${path.join(__dirname, "../dist/index.html")}`;
@@ -11,9 +13,12 @@ const startUrl = process.env.ELECTRON_START_URL || `file://${path.join(__dirname
 let serverProcess = null;
 const localApiToken = process.env.AGENT_LOCAL_TOKEN || crypto.randomBytes(32).toString("base64url");
 let volatileAuthToken;
+let volatileGithubMcpToken;
 const preferencesPath = () => path.join(app.getPath("userData"), "preferences.json");
 const authSessionPath = () => path.join(app.getPath("userData"), "auth-session.bin");
+const githubMcpSessionPath = () => path.join(app.getPath("userData"), "github-mcp-oauth.bin");
 const authApiUrl = () => (process.env.RCODE_AUTH_API_URL || "https://rcode-auth.kdczyz0728-994.workers.dev").replace(/\/$/, "");
+const githubOauthCallbackPath = "/oauth/github/callback";
 
 async function readAuthToken() {
   if (volatileAuthToken) return volatileAuthToken;
@@ -40,6 +45,213 @@ async function clearAuthToken() {
     await fs.unlink(authSessionPath());
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+async function readGithubMcpToken() {
+  if (volatileGithubMcpToken) return volatileGithubMcpToken;
+  if (!safeStorage.isEncryptionAvailable()) return undefined;
+  try {
+    const encrypted = await fs.readFile(githubMcpSessionPath());
+    volatileGithubMcpToken = safeStorage.decryptString(encrypted);
+    return volatileGithubMcpToken;
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeGithubMcpToken(token) {
+  volatileGithubMcpToken = token;
+  if (!safeStorage.isEncryptionAvailable()) return;
+  await fs.mkdir(path.dirname(githubMcpSessionPath()), { recursive: true });
+  await fs.writeFile(githubMcpSessionPath(), safeStorage.encryptString(token), { mode: 0o600 });
+}
+
+async function clearGithubMcpToken() {
+  volatileGithubMcpToken = undefined;
+  try {
+    await fs.unlink(githubMcpSessionPath());
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+function localAgentApiBase(rawBase) {
+  const parsed = new URL(typeof rawBase === "string" && rawBase ? rawBase : "http://127.0.0.1:8787");
+  const hostname = parsed.hostname.toLowerCase();
+  if (parsed.protocol !== "http:" || !["localhost", "127.0.0.1", "::1"].includes(hostname)) {
+    throw new Error("GitHub OAuth token 只能同步到本机 Rcode 服务");
+  }
+  return parsed.origin;
+}
+
+async function syncGithubMcpToken(rawApiBase, token) {
+  const response = await fetch(`${localAgentApiBase(rawApiBase)}/api/mcp/servers/github/runtime-token`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-agent-token": localApiToken },
+    body: JSON.stringify({ token: token || "" })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "无法同步 GitHub OAuth token");
+}
+
+async function githubOAuthPost(url, values) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(values)
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(typeof data.error_description === "string" ? data.error_description : `GitHub OAuth 请求失败 (${response.status})`);
+  return data;
+}
+
+function githubOauthCallbackPage(ok) {
+  const title = ok ? "GitHub 授权完成" : "GitHub 授权失败";
+  const message = ok ? "已安全返回 Rcode，可以关闭此页面。" : "未能完成授权，请返回 Rcode 查看错误。";
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${title}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f7f5;color:#181817;font:16px system-ui,-apple-system,sans-serif}.card{max-width:420px;padding:36px;border:1px solid #ddd;border-radius:18px;background:#fff;box-shadow:0 18px 60px rgba(0,0,0,.08)}h1{margin:0 0 12px;font-size:24px}p{margin:0;color:#666;line-height:1.6}</style></head><body><main class="card"><h1>${title}</h1><p>${message}</p></main></body></html>`;
+}
+
+async function startGithubOauthCallback(expectedState) {
+  let settled = false;
+  let timeout;
+  let resolveCallback;
+  let rejectCallback;
+  const callback = new Promise((resolve, reject) => {
+    resolveCallback = resolve;
+    rejectCallback = reject;
+  });
+  const server = createServer((request, response) => {
+    const requestUrl = new URL(request.url || "/", "http://127.0.0.1");
+    if (requestUrl.pathname !== githubOauthCallbackPath) {
+      response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+      response.end("Not found");
+      return;
+    }
+    const rejectOauth = (message) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      response.writeHead(400, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+      response.end(githubOauthCallbackPage(false));
+      rejectCallback(new Error(message));
+    };
+    if (requestUrl.searchParams.get("state") !== expectedState) {
+      rejectOauth("GitHub OAuth state 校验失败，请重试");
+      return;
+    }
+    const oauthError = requestUrl.searchParams.get("error");
+    if (oauthError) {
+      rejectOauth(oauthError === "access_denied" ? "你取消了 GitHub 授权" : `GitHub OAuth 返回错误：${oauthError}`);
+      return;
+    }
+    const code = requestUrl.searchParams.get("code");
+    if (!code) {
+      rejectOauth("GitHub OAuth 回调缺少授权码");
+      return;
+    }
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeout);
+    let responded = false;
+    resolveCallback({
+      code,
+      complete(ok) {
+        if (responded) return;
+        responded = true;
+        response.writeHead(ok ? 200 : 400, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+        response.end(githubOauthCallbackPage(ok));
+      }
+    });
+  });
+  await new Promise((resolve, reject) => {
+    const onError = (error) => reject(error);
+    server.once("error", onError);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", onError);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("无法启动 GitHub OAuth 本地回调");
+  }
+  timeout = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    rejectCallback(new Error("GitHub 浏览器授权已超时，请重试"));
+    server.close();
+  }, 10 * 60 * 1000);
+  return {
+    redirectUri: `http://127.0.0.1:${address.port}${githubOauthCallbackPath}`,
+    callback,
+    close() {
+      clearTimeout(timeout);
+      server.close();
+    }
+  };
+}
+
+async function githubIdentity(accessToken) {
+  const response = await fetch("https://api.github.com/user", {
+    headers: { authorization: `Bearer ${accessToken}`, accept: "application/vnd.github+json", "user-agent": "Rcode" }
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || typeof data.login !== "string") throw new Error("GitHub OAuth token 身份验证失败");
+  return data.login;
+}
+
+function focusRcodeWindow() {
+  const window = BrowserWindow.getAllWindows()[0];
+  if (!window) return;
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+}
+
+async function authorizeGithubMcp(_event, details) {
+  const clientId = typeof details?.clientId === "string" ? details.clientId.trim() : "";
+  const clientSecret = typeof details?.clientSecret === "string" ? details.clientSecret.trim() : "";
+  if (!/^[A-Za-z0-9._-]{8,128}$/.test(clientId)) throw new Error("请输入有效的 GitHub OAuth Client ID");
+  if (clientSecret.length < 8 || clientSecret.length > 256) throw new Error("请输入有效的 GitHub OAuth Client Secret");
+  const state = crypto.randomBytes(32).toString("base64url");
+  const codeVerifier = crypto.randomBytes(32).toString("base64url");
+  const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
+  const callbackServer = await startGithubOauthCallback(state);
+  let callbackResult;
+  try {
+    const authorizeUrl = new URL("https://github.com/login/oauth/authorize");
+    authorizeUrl.searchParams.set("client_id", clientId);
+    authorizeUrl.searchParams.set("redirect_uri", callbackServer.redirectUri);
+    authorizeUrl.searchParams.set("scope", "repo read:org");
+    authorizeUrl.searchParams.set("state", state);
+    authorizeUrl.searchParams.set("code_challenge", codeChallenge);
+    authorizeUrl.searchParams.set("code_challenge_method", "S256");
+    authorizeUrl.searchParams.set("prompt", "select_account");
+    await shell.openExternal(authorizeUrl.toString());
+    callbackResult = await callbackServer.callback;
+    const result = await githubOAuthPost("https://github.com/login/oauth/access_token", {
+      client_id: clientId,
+      client_secret: clientSecret,
+      code: callbackResult.code,
+      redirect_uri: callbackServer.redirectUri,
+      code_verifier: codeVerifier
+    });
+    if (!result.access_token) throw new Error(typeof result.error_description === "string" ? result.error_description : `GitHub OAuth 失败：${result.error || "missing_access_token"}`);
+    const accessToken = String(result.access_token);
+    const login = await githubIdentity(accessToken);
+    await writeGithubMcpToken(accessToken);
+    await syncGithubMcpToken(details?.apiBase, accessToken);
+    callbackResult.complete(true);
+    focusRcodeWindow();
+    return { ok: true, login, scope: typeof result.scope === "string" ? result.scope : "" };
+  } catch (error) {
+    callbackResult?.complete(false);
+    focusRcodeWindow();
+    throw error;
+  } finally {
+    callbackServer.close();
   }
 }
 
@@ -171,7 +383,14 @@ function createWindow() {
   }
 
   window.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    try {
+      const parsedUrl = new URL(url);
+      if (parsedUrl.protocol === "http:" || parsedUrl.protocol === "https:") {
+        void shell.openExternal(parsedUrl.toString());
+      }
+    } catch {
+      // Ignore malformed and unsupported URLs from rendered model output.
+    }
     return { action: "deny" };
   });
 
@@ -202,7 +421,58 @@ app.whenReady().then(async () => {
     return targetPath;
   });
 
+  ipcMain.handle("agent:open-external-url", async (_event, rawUrl) => {
+    try {
+      const parsedUrl = new URL(typeof rawUrl === "string" ? rawUrl : "");
+      if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+        return { ok: false, error: "仅支持打开 HTTP 或 HTTPS 链接" };
+      }
+      await shell.openExternal(parsedUrl.toString());
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "链接格式无效" };
+    }
+  });
+
+  ipcMain.handle("agent:open-local-path", async (_event, details) => {
+    const rawPath = typeof details?.path === "string" ? details.path.trim() : "";
+    const basePath = typeof details?.basePath === "string" ? details.basePath.trim() : "";
+    if (!rawPath || rawPath.includes("\0")) {
+      return { ok: false, error: "文件路径无效" };
+    }
+
+    try {
+      let candidate = rawPath;
+      if (candidate.startsWith("file://")) candidate = fileURLToPath(candidate);
+      if (candidate === "~") candidate = os.homedir();
+      if (candidate.startsWith("~/")) candidate = path.join(os.homedir(), candidate.slice(2));
+      if (!path.isAbsolute(candidate)) {
+        if (!basePath || !path.isAbsolute(basePath)) {
+          return { ok: false, error: "相对路径缺少项目目录" };
+        }
+        candidate = path.resolve(basePath, candidate);
+      }
+
+      await fs.access(candidate);
+      const error = await shell.openPath(candidate);
+      return error ? { ok: false, error } : { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : "无法打开文件" };
+    }
+  });
+
   ipcMain.handle("agent:get-local-api-token", async () => localApiToken);
+  ipcMain.handle("agent:github-mcp-auth-status", async (_event, details) => {
+    const token = await readGithubMcpToken();
+    if (token) await syncGithubMcpToken(details?.apiBase, token);
+    return { authorized: Boolean(token) };
+  });
+  ipcMain.handle("agent:github-mcp-authorize", authorizeGithubMcp);
+  ipcMain.handle("agent:github-mcp-logout", async (_event, details) => {
+    await clearGithubMcpToken();
+    await syncGithubMcpToken(details?.apiBase, undefined);
+    return { ok: true };
+  });
   ipcMain.handle("agent:auth-session", async () => authRequest("/v1/auth/me", { authenticated: true }));
   ipcMain.handle("agent:auth-login", async (_event, details) => {
     const result = await authRequest("/v1/auth/login", { method: "POST", body: details });

@@ -1,0 +1,4 @@
+interface:
+  display_name: "安全审计"
+  short_description: "沿信任边界检查认证授权、输入处理和敏感操作中的安全弱点"
+  default_prompt: "使用 $security-audit 审查当前项目的可利用安全风险和修复边界。"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "自动学习"
+  short_description: "自动沉淀经过验证的可复用经验，并在设置中形成清晰的学习记录"
+  default_prompt: "使用 $auto-learning 提炼本次任务中经过验证且可复用的经验。"

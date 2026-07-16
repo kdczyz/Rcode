@@ -1,6 +1,6 @@
-import { ArrowRight, LoaderCircle, LockKeyhole, ShieldCheck } from "lucide-react";
+import { ArrowRight, Laptop, LoaderCircle, LockKeyhole, ShieldCheck } from "lucide-react";
 import { createContext, FormEvent, ReactNode, useContext, useEffect, useMemo, useState } from "react";
-import { AuthSession, AuthUser, RegistrationDetails, restoreAuthSession, signIn, signOut, signUp } from "./authClient";
+import { AuthSession, AuthUser, continueAsGuest, RegistrationDetails, restoreAuthSession, signIn, signOut, signUp } from "./authClient";
 
 interface AuthContextValue {
   user: AuthUser;
@@ -122,6 +122,16 @@ function AuthEntry({ onAuthenticated }: { onAuthenticated: (session: AuthSession
             {busy ? <LoaderCircle className="authSpinner" size={17} /> : <ArrowRight size={17} />}
             <span>{busy ? "正在验证" : mode === "login" ? "进入工作区" : "创建并登录"}</span>
           </button>
+          {mode === "login" && (
+            <>
+              <div className="authDivider"><span>或</span></div>
+              <button className="authGuestButton" type="button" disabled={busy} onClick={() => onAuthenticated(continueAsGuest())}>
+                <Laptop size={17} />
+                <span>本地使用</span>
+              </button>
+              <p className="authGuestHint">以游客身份直接进入，工作区数据仅保存在此设备</p>
+            </>
+          )}
           <button className="authModeSwitch" type="button" onClick={() => switchMode(mode === "login" ? "register" : "login")}>
             {mode === "login" ? "还没有账号？创建账号" : "已有账号？返回登录"}
           </button>

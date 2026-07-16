@@ -14,9 +14,10 @@
     "dev": "concurrently \"npm:dev:server\" \"npm:dev:web\"",
     "dev:auth": "wrangler dev --config cloudflare/auth-worker/wrangler.jsonc --port 8788",
     "dev:server": "tsx watch server/index.ts",
+    "dev:server:client": "cross-env PORT=8789 tsx watch server/index.ts",
     "dev:web": "vite --host 0.0.0.0",
-    "client": "concurrently -k \"npm:dev:server\" \"npm:dev:web\" \"npm:client:electron\"",
-    "client:electron": "wait-on http://localhost:5173 http://localhost:8787/api/health && cross-env ELECTRON_START_URL=http://localhost:5173 electron electron/main.cjs",
+    "client": "cross-env VITE_API_BASE=http://localhost:8789 concurrently -k \"npm:dev:server:client\" \"npm:dev:web\" \"npm:client:electron\"",
+    "client:electron": "wait-on http://localhost:5173 http://localhost:8789/api/health && cross-env ELECTRON_START_URL=http://localhost:5173 electron electron/main.cjs",
     "clean": "node scripts/clean.cjs",
     "build": "tsc && vite build",
     "build:server": "tsc -p tsconfig.server.json && node scripts/bundle-server.cjs",
@@ -64,6 +65,7 @@
     ]
   },
   "dependencies": {
+    "@huggingface/tokenizers": "^0.1.3",
     "@vitejs/plugin-react": "^5.0.4",
     "concurrently": "^9.2.1",
     "cors": "^2.8.5",

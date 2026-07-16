@@ -11,6 +11,7 @@ interface AppTopBarProps {
   isSettings: boolean;
   title: string;
   modelName: string;
+  projectTokenTotal?: number;
   sidebarCollapsed: boolean;
   theme: "light" | "dark";
   onToggleSidebar: () => void;
@@ -22,6 +23,7 @@ export function AppTopBar({
   isSettings,
   title,
   modelName,
+  projectTokenTotal,
   sidebarCollapsed,
   theme,
   onToggleSidebar,
@@ -50,6 +52,17 @@ export function AppTopBar({
           <span>{title}</span>
         </div>
         <div className="topBarSpacer" />
+        {projectTokenTotal !== undefined && (
+          <div
+            className="topBarProjectUsage"
+            title={`当前项目历史使用总计 ${projectTokenTotal.toLocaleString("zh-CN")} tokens`}
+            aria-label={`当前项目历史使用总计 ${projectTokenTotal.toLocaleString("zh-CN")} tokens`}
+          >
+            <span>项目累计</span>
+            <strong>{projectTokenTotal.toLocaleString("zh-CN")}</strong>
+            <span>tokens</span>
+          </div>
+        )}
         <div className="topBarModelStatus" title={modelName || "未选择模型"}>
           <span className="topBarModelDot" aria-hidden="true" />
           <span>{modelName || "未选择模型"}</span>

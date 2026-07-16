@@ -22,6 +22,23 @@ const managedRules: PermissionRule[] = [
   { id: "managed-ask-git-commit", effect: "ask", targetType: "tool", pattern: "git_commit", scope: "managed", enabled: true }
 ];
 
+const readOnlyComputerTools = new Set([
+  "take_screenshot",
+  "list_windows",
+  "list_apps",
+  "get_displays",
+  "find_text",
+  "element_at_point",
+  "take_ax_snapshot",
+  "probe_app",
+  "cdp_take_dom_snapshot",
+  "cdp_summarize_page",
+  "cdp_find_elements",
+  "cdp_get_element_context",
+  "cdp_list_pages",
+  "cdp_element_at_point"
+]);
+
 function globToRegExp(pattern: string) {
   const escaped = pattern
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
@@ -132,6 +149,15 @@ export async function evaluatePermission(
   }
 
   if (toolCall.name.startsWith("mcp__")) {
+    if (toolCall.name.startsWith("mcp__native-devtools__")) {
+      const toolName = toolCall.name.slice("mcp__native-devtools__".length);
+      if (readOnlyComputerTools.has(toolName)) {
+        return decision("allow", "Read-only computer inspection is allowed; UI mutations still require approval.", {
+          enforcement: "guarded",
+          requiresApproval: false
+        });
+      }
+    }
     return decision("ask", "MCP tool calls require approval until the server and tool are explicitly trusted.");
   }
 

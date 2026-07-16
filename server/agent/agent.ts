@@ -4,7 +4,10 @@ import { getToolCallRisk } from "../security/permissions";
 import { evaluatePermission, type PermissionDecision } from "../security/permissionRules";
 import { executeTool } from "../runtime/tools";
 import { runHooks } from "./hooks";
-import type { AgentMessage, PendingApproval, PermissionMode, StreamEvent, TaskPlan, ToolCall, ToolResult, ToolRisk } from "../shared/types";
+import { runAutoLearning } from "./autoLearning";
+import { countMessageTokens } from "../providers/messageTokenizer";
+import { hasBillableProviderUsage, normalizeProviderUsage } from "../providers/providerUsage";
+import type { AgentAttachment, AgentMessage, PendingApproval, PermissionMode, StreamEvent, TaskPlan, ToolCall, ToolResult, ToolRisk } from "../shared/types";
 import {
   appendConversationMessage,
   deletePendingApproval,
@@ -131,16 +134,34 @@ function appendToolResultMessage(conversation: Conversation, result: ToolResult)
   };
   conversation.messages.push(message);
   appendConversationMessage(conversation.id, message);
+  if (result.attachments?.length) {
+    const visualResult: AgentMessage = {
+      role: "user",
+      content: `Visual result returned by tool ${result.name}. Inspect the attached screenshot before deciding the next UI action.`,
+      attachments: result.attachments
+    };
+    conversation.messages.push(visualResult);
+    appendConversationMessage(conversation.id, visualResult);
+  }
+}
+
+function toStreamToolResult(result: ToolResult): ToolResult {
+  if (!result.attachments?.length) return result;
+  return {
+    ...result,
+    attachments: result.attachments.map(({ dataUrl: _dataUrl, text: _text, ...attachment }) => attachment)
+  };
 }
 
 async function* continueConversationStream(
   conversation: Conversation,
   mode: PermissionMode,
-  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; requestId?: string; signal?: AbortSignal }
+  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; requestId?: string; signal?: AbortSignal; messageInput?: string }
 ): AsyncGenerator<StreamEvent> {
   let step = 0;
-  let settledPromptTokens = 0;
-  let settledCompletionTokens = 0;
+  let billedPromptTokens = 0;
+  let billedCompletionTokens = 0;
+  const inputTokenCount = await countMessageTokens(options.messageInput ?? "", options.model);
   while (true) {
     if (step >= MAX_AGENT_STEPS) {
       throw new Error(`Agent reached the ${MAX_AGENT_STEPS}-step safety limit. Refine the task or continue in a new turn.`);
@@ -156,9 +177,26 @@ async function* continueConversationStream(
 
     let contentBuffer = "";
     let toolCalls: ToolCall[] = [];
-    let currentPromptTokens = 0;
-    let currentCompletionTokens = 0;
-    let currentUsageWasExact = false;
+    let currentModel = options.model ?? "";
+    let currentProvider = "";
+    let hasEmittedInitialUsage = false;
+    let lastProgressChars = 0;
+    let lastProgressAt = 0;
+
+    const messageUsageEvent = async (type: "usage_progress" | "usage"): Promise<StreamEvent> => {
+      const completionTokenCount = await countMessageTokens(contentBuffer, currentModel || options.model);
+      return {
+        type,
+        usage: {
+          promptTokens: inputTokenCount.tokens,
+          completionTokens: completionTokenCount.tokens,
+          totalTokens: inputTokenCount.tokens + completionTokenCount.tokens,
+          estimated: !(inputTokenCount.exact && completionTokenCount.exact)
+        },
+        model: currentModel,
+        provider: currentProvider
+      };
+    };
 
     // 流式调用 AI，逐 token 输出（带 429 重试）
     let aiRetries = 0;
@@ -169,55 +207,60 @@ async function* continueConversationStream(
           if (event.type === "text_delta") {
             contentBuffer += event.content;
             yield { type: "text_delta", content: event.content };
+            if (!hasEmittedInitialUsage) {
+              hasEmittedInitialUsage = true;
+              yield await messageUsageEvent("usage_progress");
+            } else if (contentBuffer.length - lastProgressChars >= 24 || Date.now() - lastProgressAt >= 120) {
+              lastProgressChars = contentBuffer.length;
+              lastProgressAt = Date.now();
+              yield await messageUsageEvent("usage_progress");
+            }
           } else if (event.type === "context_snapshot") {
             yield { type: "context_snapshot", snapshot: event.snapshot };
           } else if (event.type === "usage_progress") {
-            currentPromptTokens = event.usage.prompt_tokens;
-            currentCompletionTokens = event.usage.completion_tokens;
-            yield {
-              type: "usage_progress",
-              usage: {
-                promptTokens: settledPromptTokens + currentPromptTokens,
-                completionTokens: settledCompletionTokens + currentCompletionTokens,
-                totalTokens: settledPromptTokens + settledCompletionTokens + currentPromptTokens + currentCompletionTokens
-              },
-              model: event.model,
-              provider: event.provider
-            };
+            currentModel = event.model;
+            currentProvider = event.provider;
+            if (!hasEmittedInitialUsage) {
+              hasEmittedInitialUsage = true;
+              yield await messageUsageEvent("usage_progress");
+            }
           } else if (event.type === "usage") {
+            const providerUsage = normalizeProviderUsage(event.usage);
             const usage = {
-              promptTokens: event.usage.prompt_tokens ?? 0,
-              completionTokens: event.usage.completion_tokens ?? 0,
-              totalTokens: event.usage.total_tokens ??
-                (event.usage.prompt_tokens ?? 0) + (event.usage.completion_tokens ?? 0),
-              cachedTokens: event.usage.prompt_tokens_details?.cached_tokens
+              promptTokens: providerUsage.inputTokens,
+              completionTokens: providerUsage.outputTokens,
+              totalTokens: providerUsage.totalTokens,
+              cachedTokens: providerUsage.cacheReadTokens,
+              cacheReadTokens: providerUsage.cacheReadTokens,
+              cacheCreationTokens: providerUsage.cacheCreationTokens
             };
-            currentUsageWasExact = true;
-            currentPromptTokens = usage.promptTokens;
-            currentCompletionTokens = usage.completionTokens;
-            recordAgentUsageEvent({
-              eventType: "ai_call",
-              projectPath: options.projectPath,
-              conversationId: conversation.id,
-              requestId: options.requestId,
-              model: event.model,
-              provider: event.provider,
-              promptTokens: usage.promptTokens,
-              completionTokens: usage.completionTokens,
-              totalTokens: usage.totalTokens,
-              cachedTokens: usage.cachedTokens
-            });
-            settledPromptTokens += usage.promptTokens;
-            settledCompletionTokens += usage.completionTokens;
-            // The UI shows one cumulative counter for the whole user request,
-            // even when tool calls require multiple model turns.
+            currentModel = event.model;
+            currentProvider = event.provider;
+            if (hasBillableProviderUsage(providerUsage)) {
+              recordAgentUsageEvent({
+                eventType: "ai_call",
+                projectPath: options.projectPath,
+                conversationId: conversation.id,
+                requestId: options.requestId,
+                model: event.model,
+                provider: event.provider,
+                promptTokens: usage.promptTokens,
+                completionTokens: usage.completionTokens,
+                totalTokens: usage.totalTokens,
+                cachedTokens: usage.cachedTokens,
+                cacheReadTokens: usage.cacheReadTokens,
+                cacheCreationTokens: usage.cacheCreationTokens
+              });
+            }
+            billedPromptTokens += usage.promptTokens;
+            billedCompletionTokens += usage.completionTokens;
             yield {
-              type: "usage",
+              type: "billing_usage",
               usage: {
                 ...usage,
-                promptTokens: settledPromptTokens,
-                completionTokens: settledCompletionTokens,
-                totalTokens: settledPromptTokens + settledCompletionTokens
+                promptTokens: billedPromptTokens,
+                completionTokens: billedCompletionTokens,
+                totalTokens: billedPromptTokens + billedCompletionTokens
               },
               model: event.model,
               provider: event.provider
@@ -247,12 +290,9 @@ async function* continueConversationStream(
       }
     }
 
-    // Some compatible providers omit stream usage. Carry the last live estimate
-    // into subsequent model turns so the cumulative counters never jump back.
-    if (!currentUsageWasExact) {
-      settledPromptTokens += currentPromptTokens;
-      settledCompletionTokens += currentCompletionTokens;
-    }
+    // Always finish a model turn with the count for the visible message only.
+    // Upstream request-wide usage is emitted separately as billing_usage.
+    yield await messageUsageEvent("usage");
 
     console.log(`[Agent] AI returned: content=${contentBuffer.length}chars, toolCalls=${toolCalls.length}`);
 
@@ -273,6 +313,22 @@ async function* continueConversationStream(
         if (plan) yield { type: "task_plan", plan };
         yield workflowEvent("plan_ready", plan ? `计划已就绪，共 ${plan.steps.length} 步` : "规划完成，等待确认");
       } else {
+        yield workflowEvent("executing", "正在核验可复用经验");
+        const learning = await runAutoLearning({
+          messages: conversation.messages,
+          projectPath: options.projectPath,
+          conversationId: conversation.id,
+          requestId: options.requestId,
+          model: options.model,
+          signal: options.signal
+        });
+        yield {
+          type: "learning_result",
+          status: learning.run.status,
+          recordsSaved: learning.run.recordsSaved,
+          reason: learning.run.reason,
+          createdAt: learning.run.createdAt
+        };
         yield workflowEvent("completed", "任务已完成");
       }
       yield { type: "completed", conversationId: conversation.id, answer: contentBuffer };
@@ -311,7 +367,7 @@ async function* processToolCallQueueStream(
         ok: false,
         content: `PreToolUse hook blocked this call: ${preHook.messages.join("\n")}`
       };
-      yield { type: "tool_result", result };
+      yield { type: "tool_result", result: toStreamToolResult(result) };
       appendToolResultMessage(conversation, result);
       continue;
     }
@@ -342,7 +398,7 @@ async function* processToolCallQueueStream(
         ok: false,
         outputSummary: result.content
       });
-      yield { type: "tool_result", result };
+      yield { type: "tool_result", result: toStreamToolResult(result) };
       appendToolResultMessage(conversation, result);
       continue;
     }
@@ -399,7 +455,7 @@ async function* processToolCallQueueStream(
       payload: { toolCall, result }
     });
     console.log(`[Agent] Tool result: ok=${result.ok}, len=${result.content.length}`);
-    yield { type: "tool_result", result };
+    yield { type: "tool_result", result: toStreamToolResult(result) };
     if (result.diffs && result.diffs.length > 0) {
       yield { type: "diff_created", diffs: result.diffs, auditEventId: result.auditEventId };
     }
@@ -412,6 +468,7 @@ async function* processToolCallQueueStream(
 
 export async function* runAgentStream(input: {
   prompt: string;
+  attachments?: AgentAttachment[];
   conversationId?: string;
   mode: PermissionMode;
   model?: string;
@@ -433,10 +490,14 @@ export async function* runAgentStream(input: {
   await runHooks(input.conversationId ? "UserPromptSubmit" : "SessionStart", {
     projectPath: input.projectPath,
     conversationId: conversation.id,
-    payload: { prompt: input.prompt }
+    payload: {
+      prompt: input.prompt,
+      attachments: input.attachments?.map(({ name, mimeType, size, kind }) => ({ name, mimeType, size, kind }))
+    }
   });
-  conversation.messages.push({ role: "user", content: input.prompt });
-  appendConversationMessage(conversation.id, { role: "user", content: input.prompt });
+  const userMessage: AgentMessage = { role: "user", content: input.prompt, attachments: input.attachments };
+  conversation.messages.push(userMessage);
+  appendConversationMessage(conversation.id, userMessage);
 
   try {
     yield { type: "run_started", conversationId: conversation.id };
@@ -446,6 +507,7 @@ export async function* runAgentStream(input: {
       thinkingMode: input.thinkingMode,
       projectPath: input.projectPath,
       requestId,
+      messageInput: input.prompt,
       signal: input.signal
     });
     await runHooks("Stop", { projectPath: input.projectPath, conversationId: conversation.id });
@@ -503,7 +565,7 @@ export async function* approveToolCallStream(input: {
 
     appendToolResultMessage(conversation, result);
 
-    yield { type: "tool_result", result };
+    yield { type: "tool_result", result: toStreamToolResult(result) };
     if (result.diffs && result.diffs.length > 0) {
       yield { type: "diff_created", diffs: result.diffs, auditEventId: result.auditEventId };
     }
@@ -569,7 +631,7 @@ export async function* approveToolCallStream(input: {
       };
 
   appendToolResultMessage(conversation, result);
-  yield { type: "tool_result", result };
+  yield { type: "tool_result", result: toStreamToolResult(result) };
   if (result.diffs && result.diffs.length > 0) {
     yield { type: "diff_created", diffs: result.diffs, auditEventId: result.auditEventId };
   }

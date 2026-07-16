@@ -1,0 +1,4 @@
+interface:
+  display_name: "性能优化"
+  short_description: "通过基线、性能剖析和前后对比证据定位并改善真实瓶颈"
+  default_prompt: "使用 $performance-optimization 测量并优化这个性能问题，给出前后对比。"

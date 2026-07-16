@@ -12,6 +12,7 @@ export interface ProviderEntry {
   apiKeyEnv: string;
   chatCompletionsPath?: string;
   modelsPath?: string;
+  balancePath?: string;
   defaultModel: string;
   fallbackModels?: string[];
   enabled?: boolean;
@@ -45,6 +46,10 @@ interface AgentTomlConfig {
   computer_control?: {
     enabled?: boolean;
     shell?: boolean;
+    open_app?: boolean;
+    screenshot?: boolean;
+    keyboard_mouse?: boolean;
+    accessibility?: boolean;
     dangerous_commands_require_approval?: boolean;
     command_policy?: {
       workspace_only?: boolean;
@@ -70,6 +75,10 @@ export interface RuntimeConfig {
   computerControl: {
     enabled: boolean;
     shell: boolean;
+    openApp: boolean;
+    screenshot: boolean;
+    keyboardMouse: boolean;
+    accessibility: boolean;
     dangerousCommandsRequireApproval: boolean;
     blockedCommands: string[];
   };
@@ -110,6 +119,7 @@ function buildRuntimeConfig(): RuntimeConfig {
           apiKeyEnv: provider.apiKeyEnv || "AI_API_KEY",
           chatCompletionsPath: provider.chatCompletionsPath,
           modelsPath: provider.modelsPath,
+          balancePath: provider.balancePath,
           defaultModel: provider.defaultModel,
           fallbackModels: provider.fallbackModels,
           enabled: provider.enabled,
@@ -153,6 +163,10 @@ function buildRuntimeConfig(): RuntimeConfig {
       computerControl: {
         enabled: agentConfig.computer_control?.enabled ?? false,
         shell: agentConfig.computer_control?.shell ?? false,
+        openApp: agentConfig.computer_control?.open_app ?? false,
+        screenshot: agentConfig.computer_control?.screenshot ?? false,
+        keyboardMouse: agentConfig.computer_control?.keyboard_mouse ?? false,
+        accessibility: agentConfig.computer_control?.accessibility ?? false,
         dangerousCommandsRequireApproval:
           agentConfig.computer_control?.dangerous_commands_require_approval ?? true,
         blockedCommands: agentConfig.computer_control?.command_policy?.blocked ?? []
@@ -176,6 +190,10 @@ function buildRuntimeConfig(): RuntimeConfig {
     computerControl: {
       enabled: agentConfig.computer_control?.enabled ?? false,
       shell: agentConfig.computer_control?.shell ?? false,
+      openApp: agentConfig.computer_control?.open_app ?? false,
+      screenshot: agentConfig.computer_control?.screenshot ?? false,
+      keyboardMouse: agentConfig.computer_control?.keyboard_mouse ?? false,
+      accessibility: agentConfig.computer_control?.accessibility ?? false,
       dangerousCommandsRequireApproval:
         agentConfig.computer_control?.dangerous_commands_require_approval ?? true,
       blockedCommands: agentConfig.computer_control?.command_policy?.blocked ?? []

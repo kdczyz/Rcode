@@ -10,6 +10,7 @@ import {
   FileText,
   Folder,
   FolderOpen,
+  History,
   ListFilter,
   MessageSquarePlus,
   MoreHorizontal,
@@ -32,10 +33,10 @@ import {
   UserRound,
   X
 } from "lucide-react";
-import { CSSProperties, Fragment, KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode, WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, Fragment, KeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { useAuth } from "./auth/AuthGate";
-import { ChatComposer } from "./components/chat/ChatComposer";
+import { ChatComposer, type ComposerAttachment } from "./components/chat/ChatComposer";
 import { ToolCallGroup, type ManagedProcessView } from "./components/chat/ToolCallGroup";
 import { TaskPlanCard, type TaskPlanView } from "./components/chat/TaskPlanCard";
 import { AppTopBar } from "./components/layout/AppTopBar";
@@ -48,8 +49,9 @@ type ProjectKind = "empty" | "folder" | "temporary";
 type MessageStatus = "completed" | "approval_required" | "error" | "running";
 type WorkflowPhase = "preparing" | "planning" | "thinking" | "inspecting" | "executing" | "awaiting_approval" | "plan_ready" | "completed" | "stopped" | "failed";
 type ActiveView = "chat" | "settings";
-type SettingsSectionId = "profile" | "general" | "usage" | "ai" | "mcp";
+type SettingsSectionId = "profile" | "general" | "usage" | "skills" | "learning" | "ai" | "mcp";
 type UsageActivityMode = "daily" | "weekly" | "total";
+type AiProviderHealthState = "idle" | "checking" | "healthy" | "unhealthy";
 
 interface ModelCatalog {
   recommendedForAgent?: string[];
@@ -71,11 +73,13 @@ interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "tool";
   content: string;
+  attachments?: ComposerAttachment[];
   status?: MessageStatus;
   isStreaming?: boolean;
   toolCallId?: string;
   toolName?: string;
   toolArgs?: Record<string, unknown>;
+  activeSkills?: string[];
   toolResult?: { ok: boolean; content: string; process?: ManagedProcessView };
   diff?: DiffResult;
   artifactDiffs?: DiffResult[];
@@ -90,6 +94,9 @@ interface ChatMessage {
     completionTokens: number;
     totalTokens: number;
     cachedTokens?: number;
+    billedPromptTokens?: number;
+    billedCompletionTokens?: number;
+    billedTotalTokens?: number;
     model?: string;
     provider?: string;
     estimated?: boolean;
@@ -152,6 +159,8 @@ interface UsageSummary {
     completionTokens: number;
     totalTokens: number;
     cachedTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
   };
   prompts: {
     total: number;
@@ -183,6 +192,8 @@ interface UsageSummary {
     completionTokens: number;
     totalTokens: number;
     cachedTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
     sessionWasExisting?: boolean;
   }>;
 }
@@ -213,10 +224,12 @@ interface McpServerConfig {
   command?: string;
   args?: string[];
   url?: string;
+  bearerTokenEnvVar?: string;
+  oauthClientId?: string;
   enabled: boolean;
   defaultApproval: "allow" | "ask" | "deny";
   instructions?: string;
-  tools?: Array<{ name: string; description?: string; enabled?: boolean; approvalMode?: "allow" | "ask" | "deny" }>;
+  tools?: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown>; enabled?: boolean; approvalMode?: "allow" | "ask" | "deny" }>;
 }
 
 interface AiProviderConfig {
@@ -228,6 +241,7 @@ interface AiProviderConfig {
   apiKeyPreview?: string;
   chatCompletionsPath?: string;
   modelsPath?: string;
+  balancePath?: string;
   defaultModel: string;
   fallbackModels?: string[];
   enabled: boolean;
@@ -236,11 +250,46 @@ interface AiProviderConfig {
   configured: boolean;
 }
 
+interface AiProviderQuickConnect {
+  label: string;
+  mark: string;
+  accent: string;
+  displayName: string;
+  baseUrl: string;
+  apiKeyEnv: string;
+  defaultModel: string;
+  modelsPath: string;
+  balancePath?: string;
+  chatCompletionsPath: string;
+}
+
+interface AiProviderHealth {
+  state: AiProviderHealthState;
+  checkedAt?: number;
+}
+
+interface AiProviderBalance {
+  status: "available" | "unlimited" | "unsupported" | "unavailable";
+  source?: string;
+  balances?: Array<{
+    currency: string;
+    amount: number;
+    grantedAmount?: number;
+    toppedUpAmount?: number;
+  }>;
+  reason?: string;
+  error?: string;
+  checkedAt?: string;
+}
+
 interface AgentSkill {
   name: string;
   description: string;
   path: string;
-  scope: "project" | "user";
+  scope: "project" | "user" | "builtin";
+  displayName?: string;
+  shortDescription?: string;
+  defaultPrompt?: string;
 }
 
 interface MemoryItem {
@@ -249,6 +298,47 @@ interface MemoryItem {
   content: string;
   importance: number;
 }
+
+type LearningCategory = "preference" | "project" | "pattern" | "bugfix" | "workflow";
+
+interface LearningRecordItem {
+  id: string;
+  projectPath: string;
+  conversationId?: string;
+  title: string;
+  insight: string;
+  category: LearningCategory;
+  evidence?: string;
+  importance: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+type LearningRunStatus = "saved" | "no_candidate" | "skipped" | "failed";
+
+interface LearningRunItem {
+  id?: string;
+  projectPath?: string;
+  conversationId?: string;
+  status: LearningRunStatus;
+  reason: string;
+  recordsSaved: number;
+  createdAt: string;
+}
+
+const learningCategoryLabels: Record<LearningCategory, string> = {
+  preference: "偏好",
+  project: "项目约定",
+  pattern: "可复用模式",
+  bugfix: "问题修复",
+  workflow: "工作流"
+};
+
+const skillScopeLabels: Record<AgentSkill["scope"], string> = {
+  builtin: "内置预设",
+  user: "用户",
+  project: "当前项目"
+};
 
 interface SubagentDefinition {
   name: string;
@@ -260,6 +350,7 @@ interface QueuedPrompt {
   id: string;
   content: string;
   kind?: "prompt" | "guide";
+  attachments?: ComposerAttachment[];
 }
 
 interface TaskTimerState {
@@ -269,7 +360,7 @@ interface TaskTimerState {
 
 /** SSE 流事件 */
 interface StreamEvent {
-  type: "run_started" | "workflow_state" | "context_snapshot" | "task_plan" | "text_delta" | "usage_progress" | "usage" | "tool_call" | "permission_decision" | "tool_result" | "diff_created" | "approval_required" | "completed" | "error";
+  type: "run_started" | "workflow_state" | "context_snapshot" | "task_plan" | "text_delta" | "usage_progress" | "usage" | "billing_usage" | "tool_call" | "permission_decision" | "tool_result" | "diff_created" | "learning_result" | "approval_required" | "completed" | "error";
   content?: string;
   toolCall?: { id: string; name: string; arguments: Record<string, unknown> };
   result?: { toolCallId: string; name: string; ok: boolean; content: string; diff?: DiffResult; diffs?: DiffResult[]; auditEventId?: string; exitCode?: number; process?: ManagedProcessView };
@@ -287,9 +378,16 @@ interface StreamEvent {
     completionTokens: number;
     totalTokens: number;
     cachedTokens?: number;
+    cacheReadTokens?: number;
+    cacheCreationTokens?: number;
+    estimated?: boolean;
   };
   model?: string;
   provider?: string;
+  status?: LearningRunStatus;
+  recordsSaved?: number;
+  reason?: string;
+  createdAt?: string;
 }
 
 /** 文件 diff 信息 */
@@ -328,6 +426,18 @@ const workspaceStorageKey = "agent.workspace.projects.v1";
 const sidebarCollapsedStorageKey = "agent.workspace.sidebarCollapsed.v1";
 const sidebarWidthStorageKey = "agent.workspace.sidebarWidth.v1";
 const projectSessionCollapsedStorageKey = "agent.workspace.projectSessionCollapsed.v1";
+const aiDisabledProviderMonitoringStorageKey = "agent.ai.disabledProviderMonitoring.v1";
+const aiRealtimeMonitorIntervalMs = 15_000;
+
+function loadDisabledAiProviderMonitoringIds() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(aiDisabledProviderMonitoringStorageKey) ?? "[]");
+    return new Set(Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string" && Boolean(id)) : []);
+  } catch {
+    return new Set<string>();
+  }
+}
+
 const temporaryProjectId = "project_unassigned";
 const temporaryProjectName = "不使用项目";
 const defaultSidebarWidth = 318;
@@ -337,7 +447,34 @@ const sessionArchiveSwipeThreshold = 82;
 const sessionArchiveSwipeMax = 96;
 const editPreviewContextLines = 2;
 const editPreviewLineLimit = 90;
-const API_BASE = window.location.protocol === "file:" || window.agentDesktop?.isDesktopClient ? "http://localhost:8787" : "";
+const API_BASE = import.meta.env.VITE_API_BASE || (window.location.protocol === "file:" || window.agentDesktop?.isDesktopClient ? "http://localhost:8787" : "");
+const AI_PROVIDER_QUICK_CONNECTS: Record<string, AiProviderQuickConnect> = {
+  deepseek: {
+    label: "DeepSeek", mark: "D", accent: "#4d6bfe", displayName: "DeepSeek",
+    baseUrl: "https://api.deepseek.com", apiKeyEnv: "DEEPSEEK_API_KEY", defaultModel: "deepseek-v4-flash",
+    modelsPath: "/models", balancePath: "https://api.deepseek.com/user/balance", chatCompletionsPath: "/chat/completions"
+  },
+  zhipu: {
+    label: "智谱 GLM", mark: "G", accent: "#326bff", displayName: "Zhipu GLM",
+    baseUrl: "https://open.bigmodel.cn/api/paas/v4", apiKeyEnv: "ZHIPU_API_KEY", defaultModel: "glm-5.2",
+    modelsPath: "/models", chatCompletionsPath: "/chat/completions"
+  },
+  mimo: {
+    label: "小米 MiMo", mark: "M", accent: "#ff6900", displayName: "Xiaomi MiMo",
+    baseUrl: "https://api.xiaomimimo.com/v1", apiKeyEnv: "AI_API_KEY", defaultModel: "mimo-v2.5-pro",
+    modelsPath: "/models", chatCompletionsPath: "/chat/completions"
+  },
+  minimax: {
+    label: "MiniMax", mark: "MM", accent: "#ef476f", displayName: "MiniMax",
+    baseUrl: "https://api.minimaxi.com/v1", apiKeyEnv: "MINIMAX_API_KEY", defaultModel: "MiniMax-M2.7",
+    modelsPath: "/models", chatCompletionsPath: "/chat/completions"
+  },
+  kimi: {
+    label: "Kimi", mark: "K", accent: "#3b82f6", displayName: "Kimi",
+    baseUrl: "https://api.moonshot.cn/v1", apiKeyEnv: "MOONSHOT_API_KEY", defaultModel: "kimi-k2.6",
+    modelsPath: "/models", chatCompletionsPath: "/chat/completions"
+  }
+};
 const thinkingOptions: Array<{ id: ThinkingMode; label: string }> = [
   { id: "fast", label: "快速" },
   { id: "balanced", label: "标准" },
@@ -380,13 +517,7 @@ function createId(prefix: string) {
   return `${prefix}_${crypto.randomUUID()}`;
 }
 
-function createWelcomeMessage(): ChatMessage {
-  return {
-    id: createId("message"),
-    role: "assistant",
-    content: "你好，我是本地 Agent。你可以像聊天一样输入任务，按 Enter 发送；需要换行时按 Shift + Enter。"
-  };
-}
+const legacyWelcomeMessage = "你好，我是本地 Agent。你可以像聊天一样输入任务，按 Enter 发送；需要换行时按 Shift + Enter。";
 
 function createSession(title = "新会话"): ProjectSession {
   const now = new Date().toISOString();
@@ -395,7 +526,7 @@ function createSession(title = "新会话"): ProjectSession {
     title,
     createdAt: now,
     updatedAt: now,
-    messages: [createWelcomeMessage()],
+    messages: [],
     pendingApprovals: []
   };
 }
@@ -442,9 +573,12 @@ function createTemporaryProject(sessions: ProjectSession[] = []): AgentProject {
 function normalizeSessionRuntimeState(session: ProjectSession): ProjectSession {
   const activePhases: WorkflowPhase[] = ["preparing", "planning", "thinking", "inspecting", "executing"];
   const messages = session.messages
-    // A request cannot survive an app reload. Drop only the empty placeholder
-    // and retain any partial reply as a normal, non-streaming message.
-    .filter((message) => !(message.role === "assistant" && message.isStreaming && !message.content.trim()))
+    // A request cannot survive an app reload. Drop its empty placeholder while
+    // retaining partial replies, and migrate away the legacy welcome row.
+    .filter((message) =>
+      !(message.role === "assistant" && message.isStreaming && !message.content.trim()) &&
+      !(message.role === "assistant" && message.content === legacyWelcomeMessage)
+    )
     .map((message) => ({
       ...message,
       isStreaming: false,
@@ -518,6 +652,22 @@ function isWorkspaceState(value: unknown): value is WorkspaceState {
   return Array.isArray(state.projects) && typeof state.activeProjectId === "string" && typeof state.activeSessionId === "string";
 }
 
+function getPersistableWorkspaceState(state: WorkspaceState): WorkspaceState {
+  return {
+    ...state,
+    projects: state.projects.map((project) => ({
+      ...project,
+      sessions: project.sessions.map((session) => ({
+        ...session,
+        messages: session.messages.map((message) => ({
+          ...message,
+          attachments: message.attachments?.map(({ dataUrl: _dataUrl, text: _text, ...attachment }) => attachment)
+        }))
+      }))
+    }))
+  };
+}
+
 function loadWorkspaceState(): WorkspaceState {
   try {
     const parsed = JSON.parse(localStorage.getItem(workspaceStorageKey) ?? "null");
@@ -566,6 +716,19 @@ function formatResponseDuration(durationMs: number) {
 
 function formatUsageNumber(value: number) {
   return new Intl.NumberFormat("zh-CN").format(Math.max(0, Math.round(value)));
+}
+
+function formatBalanceAmount(currency: string, amount: number) {
+  try {
+    return new Intl.NumberFormat("zh-CN", {
+      style: "currency",
+      currency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }).format(amount);
+  } catch {
+    return `${currency} ${amount.toFixed(2)}`;
+  }
 }
 
 function formatPercent(value: number) {
@@ -727,20 +890,116 @@ function MessageCodeBlock({ code, language }: { code: string; language?: string 
   );
 }
 
-function renderInlineMessageContent(content: string, keyPrefix: string) {
-  return content.split(/(`[^`\n]+`)/g).map((part, index) => {
-    if (part.startsWith("`") && part.endsWith("`")) {
-      return (
-        <code className="inlineCode" key={`${keyPrefix}-inline-${index}`}>
-          {part.slice(1, -1)}
-        </code>
-      );
-    }
-    return part;
+type MessageLinkTarget = { kind: "url" | "file"; value: string };
+
+const commonFileExtensionPattern = "(?:tsx?|jsx?|mjs|cjs|jsonc?|mdx?|css|scss|html?|vue|svelte|py|r|rs|go|java|kt|swift|c|cc|cpp|h|hpp|sh|zsh|fish|toml|ya?ml|xml|sql|txt|pdf|docx?|xlsx?|pptx?|csv|tsv|png|jpe?g|gif|webp|svg|zip|gz|lock|env)";
+const inlineMessagePattern = new RegExp(
+  [
+    "\\[([^\\]\\n]+)\\]\\((<[^>\\n]+>|[^)\\n]+)\\)",
+    "`([^`\\n]+)`",
+    "(https?:\\/\\/[^\\s<>()]+|file:\\/\\/\\/[^\\s<>()]+|(?:~\\/|\\.\\.?\\/|\\/)[^\\s<>()]+|(?:[A-Za-z]:[\\\\/])[^\\s<>()]+|(?:[\\w@.+-]+[\\\\/])+[\\w@.+ -]+|[\\w@+-]+\\." + commonFileExtensionPattern + "(?::\\d+(?::\\d+)?)?)"
+  ].join("|"),
+  "gi"
+);
+
+function classifyMessageLink(rawTarget: string): MessageLinkTarget | undefined {
+  const target = rawTarget.trim().replace(/^<|>$/g, "");
+  if (/^https?:\/\//i.test(target)) return { kind: "url", value: target };
+  if (/^file:\/\//i.test(target)) return { kind: "file", value: target };
+  if (/^(?:~\/|\.\.?\/|\/|[A-Za-z]:[\\/])/.test(target)) return { kind: "file", value: target };
+  if (/[\\/]/.test(target) || new RegExp(`\\.${commonFileExtensionPattern}(?::\\d+(?::\\d+)?)?$`, "i").test(target)) {
+    return { kind: "file", value: target };
+  }
+  return undefined;
+}
+
+function trimAutoLinkTarget(rawTarget: string) {
+  const match = rawTarget.match(/^(.*?)([.,!?;:，。！？；：、]+)?$/);
+  return { target: match?.[1] ?? rawTarget, trailing: match?.[2] ?? "" };
+}
+
+function normalizeOpenFilePath(target: string) {
+  if (/^file:\/\//i.test(target)) return target;
+  return target.replace(/#L\d+(?:C\d+)?$/i, "").replace(/:(\d+)(?::\d+)?$/, "");
+}
+
+function handleMessageLinkClick(
+  event: ReactMouseEvent<HTMLAnchorElement>,
+  target: MessageLinkTarget,
+  projectPath?: string
+) {
+  if (target.kind === "url") {
+    if (!window.agentDesktop?.openExternalUrl) return;
+    event.preventDefault();
+    void window.agentDesktop.openExternalUrl(target.value);
+    return;
+  }
+
+  event.preventDefault();
+  void window.agentDesktop?.openLocalPath?.({
+    path: normalizeOpenFilePath(target.value),
+    basePath: projectPath
   });
 }
 
-function renderMessageContent(content: string) {
+function MessageLink({ children, target, projectPath }: { children: ReactNode; target: MessageLinkTarget; projectPath?: string }) {
+  const isFile = target.kind === "file";
+  return (
+    <a
+      className={`messageLink ${isFile ? "file" : "url"}`}
+      href={isFile ? "#" : target.value}
+      onClick={(event) => handleMessageLinkClick(event, target, projectPath)}
+      rel={isFile ? undefined : "noreferrer"}
+      target={isFile ? undefined : "_blank"}
+      title={isFile ? `打开文件：${target.value}` : `在浏览器中打开：${target.value}`}
+    >
+      {children}
+    </a>
+  );
+}
+
+function renderInlineMessageContent(content: string, keyPrefix: string, projectPath?: string) {
+  const parts: ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  inlineMessagePattern.lastIndex = 0;
+
+  while ((match = inlineMessagePattern.exec(content)) !== null) {
+    if (match.index > lastIndex) parts.push(content.slice(lastIndex, match.index));
+
+    const markdownLabel = match[1];
+    const markdownTarget = match[2];
+    const inlineCode = match[3];
+    const autoTarget = match[4];
+    const key = `${keyPrefix}-inline-${match.index}`;
+
+    if (markdownLabel !== undefined && markdownTarget !== undefined) {
+      const target = classifyMessageLink(markdownTarget);
+      parts.push(target
+        ? <MessageLink key={key} target={target} projectPath={projectPath}>{markdownLabel}</MessageLink>
+        : match[0]);
+    } else if (inlineCode !== undefined) {
+      const target = classifyMessageLink(inlineCode);
+      parts.push(
+        <code className={`inlineCode ${target ? "linked" : ""}`} key={key}>
+          {target ? <MessageLink target={target} projectPath={projectPath}>{inlineCode}</MessageLink> : inlineCode}
+        </code>
+      );
+    } else if (autoTarget !== undefined) {
+      const { target: cleanTarget, trailing } = trimAutoLinkTarget(autoTarget);
+      const target = classifyMessageLink(cleanTarget);
+      parts.push(target
+        ? <Fragment key={key}><MessageLink target={target} projectPath={projectPath}>{cleanTarget}</MessageLink>{trailing}</Fragment>
+        : match[0]);
+    }
+    lastIndex = match.index + match[0].length;
+  }
+
+  if (lastIndex < content.length) parts.push(content.slice(lastIndex));
+  return parts;
+}
+
+function renderMessageContent(content: string, projectPath?: string) {
   const parts: ReactNode[] = [];
   const codeFencePattern = /```([^\n`]*)\n?([\s\S]*?)```/g;
   let lastIndex = 0;
@@ -748,7 +1007,7 @@ function renderMessageContent(content: string) {
 
   while ((match = codeFencePattern.exec(content)) !== null) {
     if (match.index > lastIndex) {
-      parts.push(...renderInlineMessageContent(content.slice(lastIndex, match.index), `text-${lastIndex}`));
+      parts.push(...renderInlineMessageContent(content.slice(lastIndex, match.index), `text-${lastIndex}`, projectPath));
     }
     parts.push(
       <MessageCodeBlock
@@ -761,7 +1020,7 @@ function renderMessageContent(content: string) {
   }
 
   if (lastIndex < content.length) {
-    parts.push(...renderInlineMessageContent(content.slice(lastIndex), `text-${lastIndex}`));
+    parts.push(...renderInlineMessageContent(content.slice(lastIndex), `text-${lastIndex}`, projectPath));
   }
 
   return parts;
@@ -1354,6 +1613,23 @@ function getCompletedViewMessageIds(messages: ChatMessage[]) {
   return visibleIds;
 }
 
+function getResponseReplayMessages(messages: ChatMessage[], responseId: string) {
+  const responseIndex = messages.findIndex((message) => message.id === responseId);
+  if (responseIndex < 0) return [];
+
+  let turnStart = -1;
+  for (let index = responseIndex; index >= 0; index--) {
+    if (messages[index].role === "user") {
+      turnStart = index;
+      break;
+    }
+  }
+
+  const nextTurnIndex = messages.findIndex((message, index) => index > responseIndex && message.role === "user");
+  const turnEnd = nextTurnIndex < 0 ? messages.length : nextTurnIndex;
+  return messages.slice(turnStart + 1, turnEnd).filter((message) => message.role === "tool");
+}
+
 function getFolderName(folderPath: string) {
   return folderPath.split(/[\\/]/).filter(Boolean).at(-1) ?? folderPath;
 }
@@ -1418,6 +1694,7 @@ export default function App() {
   const [mode, setMode] = useState<PermissionMode>("workspace_write");
   const [localApiToken, setLocalApiToken] = useState<string | undefined>();
   const [prompt, setPrompt] = useState("");
+  const [composerAttachmentsBySession, setComposerAttachmentsBySession] = useState<Record<string, ComposerAttachment[]>>({});
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
     const saved = localStorage.getItem("agent.themePreference");
     return saved === "dark" || saved === "light" || saved === "system" ? saved : "system";
@@ -1443,9 +1720,13 @@ export default function App() {
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [aiProviders, setAiProviders] = useState<AiProviderConfig[]>([]);
   const [aiActiveProviderId, setAiActiveProviderId] = useState("");
+  const [aiProviderBalance, setAiProviderBalance] = useState<AiProviderBalance | undefined>();
+  const [aiProviderBalanceLoading, setAiProviderBalanceLoading] = useState(false);
   const [mcpServers, setMcpServers] = useState<McpServerConfig[]>([]);
   const [skills, setSkills] = useState<AgentSkill[]>([]);
   const [memories, setMemories] = useState<MemoryItem[]>([]);
+  const [learningRecords, setLearningRecords] = useState<LearningRecordItem[]>([]);
+  const [latestLearningRun, setLatestLearningRun] = useState<LearningRunItem | undefined>();
   const [subagents, setSubagents] = useState<SubagentDefinition[]>([]);
   const [aiDraft, setAiDraft] = useState({
     id: "",
@@ -1454,6 +1735,7 @@ export default function App() {
     apiKey: "",
     defaultModel: "gpt-4o",
     modelsPath: "/models",
+    balancePath: "",
     chatCompletionsPath: "/chat/completions",
     apiKeyEnv: "AI_API_KEY",
     protocol: "openai-compatible" as string
@@ -1465,16 +1747,30 @@ export default function App() {
   const [aiDraftSaving, setAiDraftSaving] = useState(false);
   const [aiProviderStatus, setAiProviderStatus] = useState<Record<string, string>>({});
   const [aiProviderBusy, setAiProviderBusy] = useState<Record<string, "activate" | "delete" | "test">>({});
+  const [aiProviderHealth, setAiProviderHealth] = useState<Record<string, AiProviderHealth>>({});
+  const [disabledAiProviderMonitoringIds, setDisabledAiProviderMonitoringIds] = useState<Set<string>>(() => loadDisabledAiProviderMonitoringIds());
   const [showAddProviderModal, setShowAddProviderModal] = useState(false);
   const [editingAiProviderId, setEditingAiProviderId] = useState<string | undefined>();
-  const [selectedProviders, setSelectedProviders] = useState<Set<string>>(new Set());
   const [mcpDraft, setMcpDraft] = useState({ name: "", command: "", url: "" });
+  const [mcpStatus, setMcpStatus] = useState<Record<string, string>>({});
+  const [mcpOauthClientIds, setMcpOauthClientIds] = useState<Record<string, string>>({});
+  const [githubOauthClientSecret, setGithubOauthClientSecret] = useState("");
+  const [githubMcpAuthorized, setGithubMcpAuthorized] = useState(false);
   const [usageActivityMode, setUsageActivityMode] = useState<UsageActivityMode>("daily");
+  const [learningSearch, setLearningSearch] = useState("");
+  const [learningCategory, setLearningCategory] = useState<LearningCategory | "all">("all");
+  const [skillSearch, setSkillSearch] = useState("");
+  const [skillScope, setSkillScope] = useState<AgentSkill["scope"] | "all">("all");
+  const [selectedSkill, setSelectedSkill] = useState<AgentSkill | undefined>();
+  const [skillDetailContent, setSkillDetailContent] = useState("");
+  const [skillDetailLoading, setSkillDetailLoading] = useState(false);
   const isDesktopClient = Boolean(window.agentDesktop?.isDesktopClient);
   const messageListRef = useRef<HTMLDivElement>(null);
   const usageActivityScrollRef = useRef<HTMLDivElement>(null);
   const workspaceStateRef = useRef(workspaceState);
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const aiProviderHealthChecksRef = useRef<Set<string>>(new Set());
+  const aiProviderBalanceRequestRef = useRef(0);
   const themeToggleRef = useRef<HTMLButtonElement>(null);
   const themeTransitionRef = useRef<{ overlay: HTMLDivElement; timeoutId: number } | null>(null);
   const queuedPromptsRef = useRef<Map<string, QueuedPrompt[]>>(new Map());
@@ -1493,6 +1789,7 @@ export default function App() {
   // 最终交付卡默认保持 Codex 式的一行摘要；完整文件清单按需展开，
   // 所有变更始终可在审核面板右侧切换。
   const [expandedArtifactCards, setExpandedArtifactCards] = useState<Set<string>>(() => new Set());
+  const [expandedResponseReplays, setExpandedResponseReplays] = useState<Set<string>>(() => new Set());
 
   function markSessionRunning(sessionId: string) {
     const now = Date.now();
@@ -1534,6 +1831,17 @@ export default function App() {
     () => activeProject?.sessions.find((session) => session.id === workspaceState.activeSessionId),
     [activeProject, workspaceState.activeSessionId]
   );
+  const activeProjectUsage = useMemo(
+    () => activeProject?.sessions.reduce(
+      (projectTotal, session) => session.messages.reduce(
+        (sessionTotal, message) => sessionTotal + (message.usage?.billedTotalTokens ?? message.usage?.totalTokens ?? 0),
+        projectTotal
+      ),
+      0
+    ) ?? 0,
+    [activeProject]
+  );
+  const composerAttachments = activeSession ? (composerAttachmentsBySession[activeSession.id] ?? []) : [];
   const currentProjectManagedProcesses = useMemo(
     () => activeProject?.path ? managedProcesses.filter((process) => process.projectPath === activeProject.path) : [],
     [activeProject?.path, managedProcesses]
@@ -1658,7 +1966,25 @@ export default function App() {
     () => aiDraft.id.trim() || aiDraft.displayName.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, ""),
     [aiDraft.displayName, aiDraft.id]
   );
-  const aiDraftCanSave = Boolean(aiDraftId && aiDraft.baseUrl.trim() && aiDraft.defaultModel.trim());
+  const aiDraftQuickConnect = AI_PROVIDER_QUICK_CONNECTS[aiDraftId];
+  const isAiQuickConnect = Boolean(aiDraftQuickConnect);
+  const aiDraftExistingProvider = aiProviders.find((provider) => provider.id === aiDraftId);
+  const aiDraftCanSave = Boolean(
+    aiDraftId &&
+    aiDraft.baseUrl.trim() &&
+    aiDraft.defaultModel.trim() &&
+    (!isAiQuickConnect || aiDraft.apiKey.trim() || aiDraftExistingProvider?.configured)
+  );
+  const monitoredAiProviderIds = useMemo(
+    () => new Set(aiProviders
+      .filter((provider) => provider.enabled && provider.configured && !disabledAiProviderMonitoringIds.has(provider.id))
+      .map((provider) => provider.id)),
+    [aiProviders, disabledAiProviderMonitoringIds]
+  );
+  const monitoredAiProviderKey = useMemo(
+    () => [...monitoredAiProviderIds].sort().join("\u0000"),
+    [monitoredAiProviderIds]
+  );
 
   useEffect(() => {
     if (selectedSettingsSection !== "usage") return;
@@ -1669,7 +1995,7 @@ export default function App() {
 
   useEffect(() => {
     workspaceStateRef.current = workspaceState;
-    localStorage.setItem(workspaceStorageKey, JSON.stringify(workspaceState));
+    localStorage.setItem(workspaceStorageKey, JSON.stringify(getPersistableWorkspaceState(workspaceState)));
   }, [workspaceState]);
 
   useEffect(() => {
@@ -1683,6 +2009,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(projectSessionCollapsedStorageKey, JSON.stringify(projectSessionCollapsed));
   }, [projectSessionCollapsed]);
+
+  useEffect(() => {
+    localStorage.setItem(aiDisabledProviderMonitoringStorageKey, JSON.stringify([...disabledAiProviderMonitoringIds]));
+  }, [disabledAiProviderMonitoringIds]);
 
   useEffect(() => {
     localStorage.setItem("agent.themePreference", themePreference);
@@ -1713,6 +2043,16 @@ export default function App() {
       if (token) setLocalApiToken(token);
     });
   }, []);
+
+  useEffect(() => {
+    if (!window.agentDesktop?.githubMcpAuthStatus || (isDesktopClient && !localApiToken)) return;
+    void window.agentDesktop.githubMcpAuthStatus({ apiBase: API_BASE }).then(({ authorized }) => {
+      setGithubMcpAuthorized(authorized);
+      if (authorized) setMcpStatus((current) => ({ ...current, github: "浏览器授权已恢复" }));
+    }).catch((error) => {
+      setMcpStatus((current) => ({ ...current, github: `授权恢复失败：${error instanceof Error ? error.message : "未知错误"}` }));
+    });
+  }, [isDesktopClient, localApiToken]);
 
   useEffect(() => {
     if (isDesktopClient && !localApiToken) return;
@@ -1792,8 +2132,9 @@ export default function App() {
       fetch(`${API_BASE}/api/mcp/servers`, { headers }).then((r) => r.ok ? r.json() : { servers: [] }),
       fetch(`${API_BASE}/api/skills${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { skills: [] }),
       fetch(`${API_BASE}/api/memory${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { memories: [] }),
+      fetch(`${API_BASE}/api/learning${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { records: [] }),
       fetch(`${API_BASE}/api/agents${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { agents: [] })
-    ]).then(([toolsData, auditData, usageData, aiData, mcpData, skillsData, memoryData, agentsData]) => {
+    ]).then(([toolsData, auditData, usageData, aiData, mcpData, skillsData, memoryData, learningData, agentsData]) => {
       setToolCatalog(toolsData.tools ?? []);
       setAuditEvents(auditData.events ?? []);
       setUsageSummary(usageData);
@@ -1802,6 +2143,8 @@ export default function App() {
       setMcpServers(mcpData.servers ?? []);
       setSkills(skillsData.skills ?? []);
       setMemories(memoryData.memories ?? []);
+      setLearningRecords(learningData.records ?? []);
+      setLatestLearningRun(learningData.lastRun);
       setSubagents(agentsData.agents ?? []);
     }).catch(() => {
       setToolCatalog([]);
@@ -1812,6 +2155,8 @@ export default function App() {
       setMcpServers([]);
       setSkills([]);
       setMemories([]);
+      setLearningRecords([]);
+      setLatestLearningRun(undefined);
       setSubagents([]);
     });
   }, [localApiToken, isDesktopClient, activeProject?.path]);
@@ -1834,6 +2179,34 @@ export default function App() {
     }, 900);
     return () => window.clearTimeout(timeoutId);
   }, [aiDraft.baseUrl, aiDraft.apiKey, aiDraft.modelsPath]);
+
+  useEffect(() => {
+    if (!monitoredAiProviderKey || (isDesktopClient && !localApiToken)) return;
+    const providerIds = monitoredAiProviderKey.split("\u0000").filter(Boolean);
+    const checkEnabledProviders = () => {
+      providerIds.forEach((id) => void checkAiProviderHealth(id));
+    };
+    const checkWhenVisible = () => {
+      if (document.visibilityState === "visible") checkEnabledProviders();
+    };
+    checkEnabledProviders();
+    const intervalId = window.setInterval(checkEnabledProviders, aiRealtimeMonitorIntervalMs);
+    window.addEventListener("focus", checkEnabledProviders);
+    window.addEventListener("online", checkEnabledProviders);
+    document.addEventListener("visibilitychange", checkWhenVisible);
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener("focus", checkEnabledProviders);
+      window.removeEventListener("online", checkEnabledProviders);
+      document.removeEventListener("visibilitychange", checkWhenVisible);
+    };
+  }, [isDesktopClient, localApiToken, monitoredAiProviderKey]);
+
+  useEffect(() => {
+    if (activeView !== "settings" || selectedSettingsSection !== "ai") return;
+    if (isDesktopClient && !localApiToken) return;
+    void loadAiProviderBalance(aiActiveProviderId);
+  }, [activeView, aiActiveProviderId, isDesktopClient, localApiToken, selectedSettingsSection]);
 
   useEffect(() => {
     const messageList = messageListRef.current;
@@ -2069,9 +2442,9 @@ export default function App() {
     setQueueVersion((v) => v + 1);
   }
 
-  function enqueuePrompt(sessionId: string, content: string) {
+  function enqueuePrompt(sessionId: string, content: string, attachments: ComposerAttachment[] = []) {
     const q = queuedPromptsRef.current.get(sessionId) ?? [];
-    queuedPromptsRef.current.set(sessionId, [...q, { id: createId("queue"), content, kind: "prompt" }]);
+    queuedPromptsRef.current.set(sessionId, [...q, { id: createId("queue"), content, kind: "prompt", attachments }]);
     updateQueueState();
   }
 
@@ -2100,12 +2473,12 @@ export default function App() {
     return next;
   }
 
-  function appendUserMessage(projectId: string, sessionId: string, content: string) {
+  function appendUserMessage(projectId: string, sessionId: string, content: string, attachments: ComposerAttachment[] = []) {
     const now = new Date().toISOString();
-    const userMessage: ChatMessage = { id: createId("message"), role: "user", content };
+    const userMessage: ChatMessage = { id: createId("message"), role: "user", content, attachments };
     updateSession(projectId, sessionId, (s) => ({
       ...s,
-      title: s.title === "新会话" ? getSessionTitle(content) : s.title,
+      title: s.title === "新会话" ? getSessionTitle(content || attachments[0]?.name || "附件") : s.title,
       updatedAt: now,
       messages: [...s.messages, userMessage]
     }));
@@ -2133,7 +2506,7 @@ export default function App() {
       next.kind === "guide"
         ? `请把下面内容作为对当前会话/当前任务的引导和补充约束，优先参考，但不要机械复述：\n\n${next.content}`
         : next.content;
-    await runAgentForSession(projectId, sessionId, content, true, next.content);
+    await runAgentForSession(projectId, sessionId, content, true, next.content, undefined, next.attachments ?? []);
     return true;
   }
 
@@ -2154,6 +2527,7 @@ export default function App() {
     responseStartedAt: number
   ) {
     let currentAssistantId = _initialAssistantId;
+    const streamProjectPath = workspaceStateRef.current.projects.find((project) => project.id === projectId)?.path ?? "";
     let modelCallStartedAt = Date.now();
     // 每次工具调用完成后，下一个 text_delta 需要新起一行
     let needNewAssistantRow = false;
@@ -2163,6 +2537,7 @@ export default function App() {
     let hasPostToolAssistantResponse = false;
     // 当前 Agent 运行产生的文件变更，在最终回复上作为可审核交付物展示。
     const runDiffs = new Map<string, DiffResult>();
+    let currentActiveSkills: string[] = [];
 
     const appendAssistantSegment = (
       messages: ChatMessage[],
@@ -2377,6 +2752,7 @@ export default function App() {
 
         case "context_snapshot":
           if (event.snapshot) {
+            currentActiveSkills = [...event.snapshot.activeSkills];
             updateSession(projectId, sessionId, (s) => ({ ...s, contextSnapshot: event.snapshot }));
           }
           break;
@@ -2421,7 +2797,7 @@ export default function App() {
         case "usage_progress":
         case "usage":
           if (event.usage) {
-            const isEstimated = event.type === "usage_progress";
+            const isEstimated = event.usage.estimated ?? false;
             updateSession(projectId, sessionId, (s) => ({
               ...s,
               messages: s.messages.map((message) =>
@@ -2429,10 +2805,39 @@ export default function App() {
                   ? {
                       ...message,
                       usage: {
+                        ...message.usage,
                         ...event.usage!,
                         model: event.model,
                         provider: event.provider,
-                        estimated: isEstimated
+                        estimated: message.usage?.billedTotalTokens !== undefined ? false : isEstimated
+                      }
+                    }
+                  : message
+              )
+            }));
+          }
+          break;
+
+        case "billing_usage":
+          if (event.usage) {
+            updateSession(projectId, sessionId, (s) => ({
+              ...s,
+              messages: s.messages.map((message) =>
+                message.showResponseMeta
+                  ? {
+                      ...message,
+                      usage: {
+                        ...(message.usage ?? {
+                          promptTokens: 0,
+                          completionTokens: 0,
+                          totalTokens: 0
+                        }),
+                        billedPromptTokens: event.usage!.promptTokens,
+                        billedCompletionTokens: event.usage!.completionTokens,
+                        billedTotalTokens: event.usage!.totalTokens,
+                        model: event.model,
+                        provider: event.provider,
+                        estimated: false
                       }
                     }
                   : message
@@ -2464,6 +2869,7 @@ export default function App() {
                   toolCallId: event.toolCall!.id,
                   toolName: event.toolCall!.name,
                   toolArgs: event.toolCall!.arguments,
+                  activeSkills: [...currentActiveSkills],
                   status: "running" as const
                 }
               ]
@@ -2542,6 +2948,31 @@ export default function App() {
           break;
           }
 
+        case "learning_result": {
+          if (event.status && event.reason && event.createdAt) {
+            setLatestLearningRun({
+              status: event.status,
+              reason: event.reason,
+              recordsSaved: event.recordsSaved ?? 0,
+              createdAt: event.createdAt,
+              projectPath: streamProjectPath,
+              conversationId: event.conversationId
+            });
+          }
+          if ((event.recordsSaved ?? 0) > 0) {
+            const headers = getLocalApiHeaders();
+            void fetch(`${API_BASE}/api/learning?projectPath=${encodeURIComponent(streamProjectPath)}`, { headers })
+              .then((result) => result.ok ? result.json() : undefined)
+              .then((data) => {
+                if (!data) return;
+                setLearningRecords(data.records ?? []);
+                setLatestLearningRun(data.lastRun);
+              })
+              .catch(() => undefined);
+          }
+          break;
+        }
+
         case "completed":
           attachCompletion("completed", event.answer || "任务已完成。", event.conversationId);
           break;
@@ -2559,12 +2990,13 @@ export default function App() {
     content: string,
     addUserMessage = true,
     displayContent = content,
-    modeOverride?: PermissionMode
+    modeOverride?: PermissionMode,
+    attachments: ComposerAttachment[] = []
   ) {
     const context = getSessionContext(projectId, sessionId);
     if (!context) return;
 
-    if (addUserMessage) appendUserMessage(projectId, sessionId, displayContent);
+    if (addUserMessage) appendUserMessage(projectId, sessionId, displayContent, attachments);
 
     const assistantMessageId = createId("message");
     const requestStartedAt = Date.now();
@@ -2600,9 +3032,15 @@ export default function App() {
           conversationId: context.session.conversationId,
           model: modelName,
           thinkingMode,
-          projectPath: context.project.path
+          projectPath: context.project.path,
+          attachments
         })
       });
+
+      if (!result.ok) {
+        const body = await result.json().catch(() => ({})) as { error?: string };
+        throw new Error(body.error || `请求失败（HTTP ${result.status}）`);
+      }
 
       await consumeSseStream(result, projectId, sessionId, assistantMessageId, requestStartedAt);
     } catch (error) {
@@ -2670,16 +3108,19 @@ export default function App() {
 
   async function runAgent(nextPrompt = prompt) {
     const content = nextPrompt.trim();
-    if (!content || !activeProject || !activeSession) return;
+    const attachments = nextPrompt === prompt ? composerAttachments : [];
+    if ((!content && attachments.length === 0) || !activeProject || !activeSession) return;
 
     if (isActiveSessionRunning) {
-      enqueuePrompt(activeSession.id, content);
+      enqueuePrompt(activeSession.id, content, attachments);
       setPrompt("");
+      setComposerAttachmentsBySession((current) => ({ ...current, [activeSession.id]: [] }));
       return;
     }
 
     setPrompt("");
-    await runAgentForSession(activeProject.id, activeSession.id, content);
+    setComposerAttachmentsBySession((current) => ({ ...current, [activeSession.id]: [] }));
+    await runAgentForSession(activeProject.id, activeSession.id, content, true, content, undefined, attachments);
   }
 
   async function decideApproval(approvalId: string, allow: boolean) {
@@ -2966,7 +3407,7 @@ export default function App() {
 
   async function reloadPlatformData() {
     const headers = getLocalApiHeaders();
-    const [mcpData, auditData, usageData, toolsData, aiData, skillsData, memoryData, agentsData] = await Promise.all([
+    const [mcpData, auditData, usageData, toolsData, aiData, skillsData, memoryData, learningData, agentsData] = await Promise.all([
       fetch(`${API_BASE}/api/mcp/servers`, { headers }).then((r) => r.ok ? r.json() : { servers: [] }),
       fetch(`${API_BASE}/api/audit`, { headers }).then((r) => r.ok ? r.json() : { events: [] }),
       fetch(`${API_BASE}/api/usage`, { headers }).then((r) => r.ok ? r.json() : undefined),
@@ -2974,6 +3415,7 @@ export default function App() {
       fetch(`${API_BASE}/api/ai/providers`, { headers }).then((r) => r.ok ? r.json() : { providers: [], activeProviderId: "" }),
       fetch(`${API_BASE}/api/skills${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { skills: [] }),
       fetch(`${API_BASE}/api/memory${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { memories: [] }),
+      fetch(`${API_BASE}/api/learning${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { records: [] }),
       fetch(`${API_BASE}/api/agents${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { agents: [] })
     ]);
     setMcpServers(mcpData.servers ?? []);
@@ -2984,6 +3426,8 @@ export default function App() {
     setAiActiveProviderId(aiData.activeProviderId ?? "");
     setSkills(skillsData.skills ?? []);
     setMemories(memoryData.memories ?? []);
+    setLearningRecords(learningData.records ?? []);
+    setLatestLearningRun(learningData.lastRun);
     setSubagents(agentsData.agents ?? []);
   }
 
@@ -3003,21 +3447,63 @@ export default function App() {
     }
   }
 
-  function applyAiPreset(provider: AiProviderConfig) {
+  async function loadAiProviderBalance(providerId = aiActiveProviderId) {
+    const requestId = aiProviderBalanceRequestRef.current + 1;
+    aiProviderBalanceRequestRef.current = requestId;
+    if (!providerId) {
+      setAiProviderBalance(undefined);
+      setAiProviderBalanceLoading(false);
+      return;
+    }
+    setAiProviderBalanceLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/ai/providers/${encodeURIComponent(providerId)}/balance`, {
+        headers: getLocalApiHeaders()
+      });
+      const data = await response.json().catch(() => ({})) as AiProviderBalance;
+      if (!response.ok) {
+        throw new Error(data.error || "余额查询失败");
+      }
+      if (aiProviderBalanceRequestRef.current === requestId) setAiProviderBalance(data);
+    } catch (error) {
+      if (aiProviderBalanceRequestRef.current === requestId) {
+        setAiProviderBalance({
+          status: "unavailable",
+          source: providerId,
+          error: error instanceof Error ? error.message : "余额查询失败",
+          checkedAt: new Date().toISOString()
+        });
+      }
+    } finally {
+      if (aiProviderBalanceRequestRef.current === requestId) setAiProviderBalanceLoading(false);
+    }
+  }
+
+  function openAiQuickConnect(id: string) {
+    const existing = aiProviders.find((provider) => provider.id === id);
+    if (existing) {
+      openEditAiProvider(existing);
+      return;
+    }
+    const quickConnect = AI_PROVIDER_QUICK_CONNECTS[id];
+    if (!quickConnect) return;
+    setEditingAiProviderId(undefined);
     setAiDraft({
-      id: provider.id,
-      displayName: provider.displayName,
-      baseUrl: provider.baseUrl,
+      id,
+      displayName: quickConnect.displayName,
+      baseUrl: quickConnect.baseUrl,
       apiKey: "",
-      defaultModel: provider.defaultModel,
-      modelsPath: provider.modelsPath || "/models",
-      chatCompletionsPath: "/chat/completions",
-      apiKeyEnv: "AI_API_KEY",
+      defaultModel: quickConnect.defaultModel,
+      modelsPath: quickConnect.modelsPath,
+      balancePath: quickConnect.balancePath ?? "",
+      chatCompletionsPath: quickConnect.chatCompletionsPath,
+      apiKeyEnv: quickConnect.apiKeyEnv,
       protocol: "openai-compatible"
     });
     setAiDraftModels([]);
     setAiDraftError("");
-    setAiDraftModelStatus(provider.configured ? "可使用环境变量中的密钥，也可以在这里填写新密钥。" : "填写密钥后会自动获取上游模型。");
+    setAiDraftModelStatus("填写密钥后即可保存并使用。");
+    setShowAddProviderModal(true);
   }
 
   async function fetchAiDraftModels(options: { silent?: boolean } = {}) {
@@ -3064,7 +3550,7 @@ export default function App() {
 
   async function saveAiProviderFromDraft() {
     if (!aiDraftCanSave) {
-      setAiDraftError("请至少填写接口 ID/名称、Base URL 和默认模型。");
+      setAiDraftError(isAiQuickConnect ? `请填写 ${aiDraftQuickConnect.label} API Key。` : "请至少填写接口 ID/名称、Base URL 和默认模型。");
       return;
     }
     setAiDraftSaving(true);
@@ -3081,6 +3567,7 @@ export default function App() {
           apiKeyEnv: aiDraft.apiKeyEnv.trim() || "AI_API_KEY",
           defaultModel: aiDraft.defaultModel.trim(),
           modelsPath: aiDraft.modelsPath.trim() || "/models",
+          balancePath: aiDraft.balancePath.trim() || undefined,
           chatCompletionsPath: aiDraft.chatCompletionsPath.trim() || "/chat/completions",
           protocol: aiDraft.protocol || "openai-compatible",
           enabled: true
@@ -3088,13 +3575,17 @@ export default function App() {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "保存接口失败");
-      if (editingAiProviderId === aiActiveProviderId) {
-        await fetch(`${API_BASE}/api/ai/providers/${encodeURIComponent(aiDraftId)}/activate`, {
+      if (editingAiProviderId === aiActiveProviderId || AI_PROVIDER_QUICK_CONNECTS[aiDraftId]) {
+        const activateResponse = await fetch(`${API_BASE}/api/ai/providers/${encodeURIComponent(aiDraftId)}/activate`, {
           method: "POST",
           headers: getLocalApiHeaders()
         });
+        if (!activateResponse.ok) {
+          const activateData = await activateResponse.json().catch(() => ({}));
+          throw new Error(typeof activateData.error === "string" ? activateData.error : "接口已保存，但启用失败");
+        }
       }
-      setAiDraft({ id: "", displayName: "", baseUrl: "", apiKey: "", defaultModel: "gpt-4o", modelsPath: "/models", chatCompletionsPath: "/chat/completions", apiKeyEnv: "AI_API_KEY", protocol: "openai-compatible" });
+      setAiDraft({ id: "", displayName: "", baseUrl: "", apiKey: "", defaultModel: "gpt-4o", modelsPath: "/models", balancePath: "", chatCompletionsPath: "/chat/completions", apiKeyEnv: "AI_API_KEY", protocol: "openai-compatible" });
       setAiDraftModels([]);
       setAiDraftModelStatus("");
       setShowAddProviderModal(false);
@@ -3109,7 +3600,7 @@ export default function App() {
 
   function openNewAiProvider() {
     setEditingAiProviderId(undefined);
-    setAiDraft({ id: "", displayName: "", baseUrl: "", apiKey: "", defaultModel: "gpt-4o", modelsPath: "/models", chatCompletionsPath: "/chat/completions", apiKeyEnv: "AI_API_KEY", protocol: "openai-compatible" });
+    setAiDraft({ id: "", displayName: "", baseUrl: "", apiKey: "", defaultModel: "gpt-4o", modelsPath: "/models", balancePath: "", chatCompletionsPath: "/chat/completions", apiKeyEnv: "AI_API_KEY", protocol: "openai-compatible" });
     setAiDraftModels([]);
     setAiDraftModelStatus("");
     setAiDraftError("");
@@ -3125,6 +3616,7 @@ export default function App() {
       apiKey: "",
       defaultModel: provider.defaultModel,
       modelsPath: provider.modelsPath || "/models",
+      balancePath: provider.balancePath || "",
       chatCompletionsPath: provider.chatCompletionsPath || "/chat/completions",
       apiKeyEnv: provider.apiKeyEnv || "AI_API_KEY",
       protocol: "openai-compatible"
@@ -3153,8 +3645,11 @@ export default function App() {
     }
   }
 
-  async function testAiProvider(id: string) {
-    setAiProviderBusyState(id, "test");
+  async function checkAiProviderHealth(id: string, showBusy = false) {
+    if (aiProviderHealthChecksRef.current.has(id)) return;
+    aiProviderHealthChecksRef.current.add(id);
+    if (showBusy) setAiProviderBusyState(id, "test");
+    setAiProviderHealth((cur) => ({ ...cur, [id]: { state: "checking" } }));
     setAiProviderStatus((cur) => ({ ...cur, [id]: "测试中..." }));
     try {
       const response = await fetch(`${API_BASE}/api/ai/providers/${encodeURIComponent(id)}/test`, {
@@ -3163,15 +3658,40 @@ export default function App() {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "测试失败");
+      const checkedAt = Date.now();
+      setAiProviderHealth((cur) => ({
+        ...cur,
+        [id]: { state: data.ok ? "healthy" : "unhealthy", checkedAt }
+      }));
       setAiProviderStatus((cur) => ({
         ...cur,
         [id]: data.ok ? `连接正常，发现 ${data.modelCount ?? 0} 个模型` : `失败：${data.error ?? "无法连接"}`
       }));
     } catch (error) {
-      setAiProviderStatus((cur) => ({ ...cur, [id]: error instanceof Error ? error.message : "测试失败" }));
+      setAiProviderHealth((cur) => ({ ...cur, [id]: { state: "unhealthy", checkedAt: Date.now() } }));
+      setAiProviderStatus((cur) => ({ ...cur, [id]: `失败：${error instanceof Error ? error.message : "测试失败"}` }));
     } finally {
-      setAiProviderBusyState(id);
+      aiProviderHealthChecksRef.current.delete(id);
+      if (showBusy) setAiProviderBusyState(id);
     }
+  }
+
+  async function testAiProvider(id: string) {
+    await checkAiProviderHealth(id, true);
+  }
+
+  function toggleAiProviderMonitoring(id: string) {
+    setDisabledAiProviderMonitoringIds((current) => {
+      const next = new Set(current);
+      if (monitoredAiProviderIds.has(id)) {
+        next.add(id);
+        setAiProviderHealth((health) => ({ ...health, [id]: { state: "idle" } }));
+      } else {
+        next.delete(id);
+        setAiProviderHealth((health) => ({ ...health, [id]: { state: "checking" } }));
+      }
+      return next;
+    });
   }
 
   async function deleteAiProvider(id: string) {
@@ -3183,7 +3703,7 @@ export default function App() {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "删除接口失败");
-      setSelectedProviders((cur) => {
+      setDisabledAiProviderMonitoringIds((cur) => {
         const next = new Set(cur);
         next.delete(id);
         return next;
@@ -3193,42 +3713,6 @@ export default function App() {
       setAiProviderStatus((cur) => ({ ...cur, [id]: error instanceof Error ? `失败：${error.message}` : "删除接口失败" }));
     } finally {
       setAiProviderBusyState(id);
-    }
-  }
-
-  async function batchDeleteAiProviders() {
-    if (selectedProviders.size === 0) return;
-    const ids = Array.from(selectedProviders);
-    ids.forEach((id) => setAiProviderBusyState(id, "delete"));
-    const response = await fetch(`${API_BASE}/api/ai/providers/batch-delete`, {
-      method: "POST",
-      headers: getJsonHeaders(),
-      body: JSON.stringify({ ids })
-    });
-    ids.forEach((id) => setAiProviderBusyState(id));
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({}));
-      setAiProviderStatus((cur) => ({ ...cur, [ids[0]]: typeof data.error === "string" ? `失败：${data.error}` : "批量删除失败" }));
-      return;
-    }
-    setSelectedProviders(new Set());
-    await Promise.all([reloadPlatformData(), reloadRuntimeData()]);
-  }
-
-  function toggleProviderSelect(id: string) {
-    setSelectedProviders((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
-      return next;
-    });
-  }
-
-  function toggleSelectAllProviders() {
-    const userProviders = aiProviders.filter((p) => p.source === "user");
-    if (selectedProviders.size === userProviders.length) {
-      setSelectedProviders(new Set());
-    } else {
-      setSelectedProviders(new Set(userProviders.map((p) => p.id)));
     }
   }
 
@@ -3265,6 +3749,90 @@ export default function App() {
     setMcpDraft({ name: "", command: "", url: "" });
   }
 
+  async function testMcpServer(id: string) {
+    setMcpStatus((current) => ({ ...current, [id]: "连接测试中..." }));
+    try {
+      const response = await fetch(`${API_BASE}/api/mcp/servers/${encodeURIComponent(id)}/test`, {
+        method: "POST",
+        headers: getLocalApiHeaders()
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "测试失败");
+      setMcpStatus((current) => ({ ...current, [id]: `连接正常，发现 ${Array.isArray(data.tools) ? data.tools.length : 0} 个工具` }));
+      await reloadPlatformData();
+    } catch (error) {
+      setMcpStatus((current) => ({ ...current, [id]: `失败：${error instanceof Error ? error.message : "测试失败"}` }));
+    }
+  }
+
+  async function authorizeGithubMcp(server: McpServerConfig) {
+    const clientId = (mcpOauthClientIds[server.id] ?? server.oauthClientId ?? "").trim();
+    const clientSecret = githubOauthClientSecret.trim();
+    if (!/^[A-Za-z0-9._-]{8,128}$/.test(clientId)) {
+      setMcpStatus((current) => ({ ...current, [server.id]: "请先填写有效的 GitHub OAuth Client ID" }));
+      return;
+    }
+    if (clientSecret.length < 8 || clientSecret.length > 256) {
+      setMcpStatus((current) => ({ ...current, [server.id]: "请填写 GitHub OAuth Client Secret；它只用于本次 token 交换，不会保存" }));
+      return;
+    }
+    if (!window.agentDesktop?.githubMcpAuthorize) {
+      setMcpStatus((current) => ({ ...current, [server.id]: "浏览器 OAuth 仅在 Rcode 桌面客户端中可用" }));
+      return;
+    }
+    setMcpStatus((current) => ({ ...current, [server.id]: "正在启动浏览器；授权完成后会自动返回 Rcode..." }));
+    try {
+      await saveMcpServer({ ...server, oauthClientId: clientId, enabled: true });
+      const result = await window.agentDesktop.githubMcpAuthorize({ clientId, clientSecret, apiBase: API_BASE });
+      setGithubMcpAuthorized(true);
+      setMcpStatus((current) => ({ ...current, [server.id]: result.login ? `已授权 GitHub 用户 ${result.login}` : "GitHub 浏览器授权完成" }));
+      await testMcpServer(server.id);
+    } catch (error) {
+      setMcpStatus((current) => ({ ...current, [server.id]: `授权失败：${error instanceof Error ? error.message : "未知错误"}` }));
+    } finally {
+      setGithubOauthClientSecret("");
+    }
+  }
+
+  async function logoutGithubMcp(server: McpServerConfig) {
+    if (!window.agentDesktop?.githubMcpLogout) return;
+    try {
+      await window.agentDesktop.githubMcpLogout({ apiBase: API_BASE });
+      setGithubMcpAuthorized(false);
+      await saveMcpServer({ ...server, enabled: false });
+      setMcpStatus((current) => ({ ...current, [server.id]: "已撤销本机浏览器授权" }));
+    } catch (error) {
+      setMcpStatus((current) => ({ ...current, [server.id]: `撤销失败：${error instanceof Error ? error.message : "未知错误"}` }));
+    }
+  }
+
+  async function removeLearningRecord(id: string) {
+    if (!window.confirm("删除这条学习记录？后续任务将不再使用它。")) return;
+    const response = await fetch(`${API_BASE}/api/learning/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: getLocalApiHeaders()
+    });
+    if (!response.ok) return;
+    setLearningRecords((current) => current.filter((record) => record.id !== id));
+  }
+
+  async function openSkillDetail(skill: AgentSkill) {
+    setSelectedSkill(skill);
+    setSkillDetailContent("");
+    setSkillDetailLoading(true);
+    const params = new URLSearchParams({ path: skill.path });
+    if (activeProject?.path) params.set("projectPath", activeProject.path);
+    try {
+      const response = await fetch(`${API_BASE}/api/skills/content?${params.toString()}`, { headers: getLocalApiHeaders() });
+      const data = await response.json().catch(() => ({})) as { content?: string; error?: string };
+      setSkillDetailContent(response.ok && data.content ? data.content : data.error ?? "无法读取 Skill 内容");
+    } catch {
+      setSkillDetailContent("无法读取 Skill 内容，请稍后重试。");
+    } finally {
+      setSkillDetailLoading(false);
+    }
+  }
+
   function openSettingsPage(section: SettingsSectionId = "general") {
     setSelectedSettingsSection(section);
     setActiveView("settings");
@@ -3288,6 +3856,13 @@ export default function App() {
         { id: "ai", label: "AI 接口" },
         { id: "mcp", label: "MCP 服务器" }
       ]
+    },
+    {
+      title: "智能",
+      items: [
+        { id: "skills", label: "Skill 库" },
+        { id: "learning", label: "学习记录" }
+      ]
     }
   ];
   const selectedSettingsItem =
@@ -3300,8 +3875,10 @@ export default function App() {
     if (section === "profile") return <UserRound size={size} />;
     if (section === "general") return <Settings size={size} />;
     if (section === "usage") return <Brain size={size} />;
+    if (section === "learning") return <Archive size={size} />;
+    if (section === "skills") return <Puzzle size={size} />;
     if (section === "ai") return <SlidersHorizontal size={size} />;
-    return <Puzzle size={size} />;
+    return <Terminal size={size} />;
   }
 
   function renderUsageActivityPanel(usage: UsageSummary) {
@@ -3413,56 +3990,326 @@ export default function App() {
       );
     }
 
+    if (activeSettingsSection === "skills") {
+      const normalizedQuery = skillSearch.trim().toLocaleLowerCase();
+      const visibleSkills = skills
+        .filter((skill) => skillScope === "all" || skill.scope === skillScope)
+        .filter((skill) => {
+          if (!normalizedQuery) return true;
+          return `${skill.name} ${skill.displayName ?? ""} ${skill.shortDescription ?? ""} ${skill.description}`
+            .toLocaleLowerCase()
+            .includes(normalizedQuery);
+        })
+        .sort((a, b) => {
+          const scopeOrder = { builtin: 0, project: 1, user: 2 };
+          return scopeOrder[a.scope] - scopeOrder[b.scope] || (a.displayName ?? a.name).localeCompare(b.displayName ?? b.name, "zh-CN");
+        });
+      const builtinCount = skills.filter((skill) => skill.scope === "builtin").length;
+      const detailBody = skillDetailContent.replace(/^---\n[\s\S]*?\n---\n?/, "").trim();
+      return (
+        <div className="settingsContentStack">
+          <section className="settingsPaneSection skillsLibrarySection">
+            <div className="settingsPaneHeader skillsLibraryHeader">
+              <div>
+                <h3>Skill 库</h3>
+                <p>预置常用开发工作流，并自动发现当前项目和用户目录中的 Skill；只在任务匹配时按需加载。</p>
+              </div>
+              <div className="skillsLibraryCount"><strong>{skills.length}</strong><span>可用</span></div>
+            </div>
+            <div className="skillsLibrarySummary">
+              <div><strong>{builtinCount}</strong><span>内置预设</span></div>
+              <div><strong>{skills.filter((skill) => skill.scope === "project").length}</strong><span>项目 Skill</span></div>
+              <div><strong>{skills.filter((skill) => skill.scope === "user").length}</strong><span>用户 Skill</span></div>
+              <p><Brain size={15} />按需触发，避免多个 Skill 同时占用上下文</p>
+            </div>
+            <div className="learningToolbar skillsLibraryToolbar">
+              <label className="learningSearchField">
+                <Search size={15} aria-hidden="true" />
+                <input
+                  aria-label="搜索 Skill"
+                  value={skillSearch}
+                  onChange={(event) => setSkillSearch(event.target.value)}
+                  placeholder="搜索名称、用途或关键词…"
+                />
+              </label>
+              <select
+                aria-label="按来源筛选 Skill"
+                value={skillScope}
+                onChange={(event) => setSkillScope(event.target.value as AgentSkill["scope"] | "all")}
+              >
+                <option value="all">全部来源</option>
+                <option value="builtin">内置预设</option>
+                <option value="project">当前项目</option>
+                <option value="user">用户</option>
+              </select>
+            </div>
+            <div className="skillsLibraryLayout">
+              <div className="skillsCatalogList" aria-label="Skill 列表">
+                {visibleSkills.length === 0 ? (
+                  <div className="skillsCatalogEmpty">没有匹配的 Skill</div>
+                ) : visibleSkills.map((skill) => (
+                  <button
+                    className={`skillsCatalogItem ${selectedSkill?.path === skill.path ? "active" : ""}`}
+                    key={skill.path}
+                    type="button"
+                    onClick={() => void openSkillDetail(skill)}
+                  >
+                    <span className="skillsCatalogIcon"><Puzzle size={16} /></span>
+                    <span className="skillsCatalogCopy">
+                      <strong>{skill.displayName ?? skill.name}</strong>
+                      <small>{skill.shortDescription ?? skill.description}</small>
+                      <span><code>${skill.name}</code><b className={skill.scope}>{skillScopeLabels[skill.scope]}</b></span>
+                    </span>
+                    <ChevronRight size={16} aria-hidden="true" />
+                  </button>
+                ))}
+              </div>
+              {selectedSkill && (
+                <div className="skillDetailOverlay" role="presentation" onClick={() => setSelectedSkill(undefined)}>
+                  <aside className="skillDetailPanel" aria-live="polite" onClick={(event) => event.stopPropagation()}>
+                    <header>
+                      <span className="skillsCatalogIcon"><Puzzle size={17} /></span>
+                      <span>
+                        <strong>{selectedSkill.displayName ?? selectedSkill.name}</strong>
+                        <small>{skillScopeLabels[selectedSkill.scope]} · ${selectedSkill.name}</small>
+                      </span>
+                      <button className="skillDetailClose" type="button" onClick={() => setSelectedSkill(undefined)} aria-label="关闭 Skill 详情">
+                        <X size={15} />
+                      </button>
+                    </header>
+                    <p className="skillDetailDescription">{selectedSkill.shortDescription ?? selectedSkill.description}</p>
+                    {selectedSkill.defaultPrompt && (
+                      <div className="skillPromptExample">
+                        <span>推荐调用</span>
+                        <p>{selectedSkill.defaultPrompt}</p>
+                        <button type="button" onClick={() => void navigator.clipboard.writeText(selectedSkill.defaultPrompt ?? "")}>
+                          <Copy size={13} />复制
+                        </button>
+                      </div>
+                    )}
+                    <div className="skillInstructionHeader"><span>完整指令</span><code>SKILL.md</code></div>
+                    <pre className="skillInstructionBody">{skillDetailLoading ? "正在读取…" : detailBody}</pre>
+                  </aside>
+                </div>
+              )}
+            </div>
+          </section>
+        </div>
+      );
+    }
+
+    if (activeSettingsSection === "learning") {
+      const normalizedQuery = learningSearch.trim().toLocaleLowerCase();
+      const visibleLearningRecords = learningRecords.filter((record) => {
+        if (learningCategory !== "all" && record.category !== learningCategory) return false;
+        if (!normalizedQuery) return true;
+        return `${record.title} ${record.insight} ${record.evidence ?? ""}`.toLocaleLowerCase().includes(normalizedQuery);
+      });
+      const autoLearningSkill = skills.find((skill) => skill.name === "auto-learning");
+      const learningStatusTitle = !autoLearningSkill
+        ? "自动学习 skill 未找到"
+        : latestLearningRun?.status === "failed"
+          ? "自动学习最近执行失败"
+          : "自动学习已启用";
+      const learningStatusDetail = !autoLearningSkill
+        ? "请检查 ~/.agent/skills/auto-learning"
+        : latestLearningRun
+          ? `${new Date(latestLearningRun.createdAt).toLocaleString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })} · ${latestLearningRun.reason}`
+          : "任务完成后会独立核验；只有经过验证且可复用的经验才会保存";
+      return (
+        <div className="settingsContentStack">
+          <section className="settingsPaneSection learningSection">
+            <div className="settingsPaneHeader learningHeader">
+              <div>
+                <h3>学习记录</h3>
+                <p>Rcode 会在任务验证完成后沉淀可复用经验，并在后续任务中自动参考。</p>
+              </div>
+              <button className="learningRefreshButton" type="button" onClick={() => void reloadPlatformData()} aria-label="刷新学习记录">
+                <RefreshCw size={14} />
+                刷新
+              </button>
+            </div>
+            <div className="learningStatusPanel">
+              <span className={`learningStatusIcon ${autoLearningSkill ? "active" : ""}`} aria-hidden="true">
+                <Brain size={20} />
+              </span>
+              <span>
+                <strong>{learningStatusTitle}</strong>
+                <small>{learningStatusDetail}</small>
+              </span>
+              <b>{learningRecords.length}</b>
+            </div>
+            <div className="learningToolbar">
+              <label className="learningSearchField">
+                <Search size={15} aria-hidden="true" />
+                <input
+                  aria-label="搜索学习记录"
+                  value={learningSearch}
+                  onChange={(event) => setLearningSearch(event.target.value)}
+                  placeholder="搜索经验、验证依据…"
+                />
+              </label>
+              <select
+                aria-label="按类型筛选学习记录"
+                value={learningCategory}
+                onChange={(event) => setLearningCategory(event.target.value as LearningCategory | "all")}
+              >
+                <option value="all">全部类型</option>
+                {(Object.entries(learningCategoryLabels) as Array<[LearningCategory, string]>).map(([value, label]) => (
+                  <option key={value} value={value}>{label}</option>
+                ))}
+              </select>
+            </div>
+            <div className="learningRecordList">
+              {visibleLearningRecords.length === 0 ? (
+                <div className="learningEmptyState">
+                  <Brain size={24} aria-hidden="true" />
+                  <strong>{learningRecords.length === 0 ? "还没有学习记录" : "没有匹配的记录"}</strong>
+                  <p>{learningRecords.length === 0 ? (latestLearningRun?.reason ?? "完成一次有可复用经验的任务后，记录会自动出现在这里。") : "换一个关键词或筛选类型试试。"}</p>
+                </div>
+              ) : visibleLearningRecords.map((record) => (
+                <article className="learningRecord" key={record.id}>
+                  <header>
+                    <span className={`learningCategoryBadge ${record.category}`}>{learningCategoryLabels[record.category]}</span>
+                    <time dateTime={record.updatedAt}>{new Date(record.updatedAt).toLocaleString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</time>
+                    <button type="button" onClick={() => void removeLearningRecord(record.id)} aria-label={`删除学习记录：${record.title}`}>
+                      <Trash2 size={14} />
+                    </button>
+                  </header>
+                  <h4>{record.title}</h4>
+                  <p>{record.insight}</p>
+                  {record.evidence && <small><strong>验证</strong>{record.evidence}</small>}
+                  <footer>
+                    <span>重要度 {record.importance}/5</span>
+                    <span>{record.projectPath === activeProject?.path ? "当前项目" : record.projectPath.split("/").filter(Boolean).pop()}</span>
+                  </footer>
+                </article>
+              ))}
+            </div>
+          </section>
+        </div>
+      );
+    }
+
     if (activeSettingsSection === "ai") {
-      const userProviders = aiProviders.filter((p) => p.source === "user");
-      const allSelected = userProviders.length > 0 && selectedProviders.size === userProviders.length;
       const activeProvider = aiProviders.find((provider) => provider.id === aiActiveProviderId || provider.active);
       const configuredProviders = aiProviders.filter((provider) => provider.configured).length;
       const missingProviders = aiProviders.length - configuredProviders;
+      const quickConnects = Object.entries(AI_PROVIDER_QUICK_CONNECTS).filter(([id]) => {
+        const existing = aiProviders.find((provider) => provider.id === id);
+        return !existing?.configured;
+      });
+      const primaryBalance = aiProviderBalance?.balances?.[0];
+      const balanceValue = aiProviderBalanceLoading
+        ? "查询中"
+        : aiProviderBalance?.status === "available" && primaryBalance
+          ? formatBalanceAmount(primaryBalance.currency, primaryBalance.amount)
+          : aiProviderBalance?.status === "unlimited"
+            ? "不限额"
+            : aiProviderBalance?.status === "unsupported"
+              ? "未提供"
+              : aiProviderBalance?.status === "unavailable"
+                ? "暂不可用"
+                : "等待查询";
+      const balanceHint = aiProviderBalanceLoading
+        ? `正在连接 ${activeProvider?.displayName ?? "当前上游"}`
+        : aiProviderBalance?.status === "available" && primaryBalance
+          ? primaryBalance.grantedAmount !== undefined || primaryBalance.toppedUpAmount !== undefined
+            ? `赠金 ${formatBalanceAmount(primaryBalance.currency, primaryBalance.grantedAmount ?? 0)} · 充值 ${formatBalanceAmount(primaryBalance.currency, primaryBalance.toppedUpAmount ?? 0)}`
+            : aiProviderBalance.balances && aiProviderBalance.balances.length > 1
+              ? `另有 ${aiProviderBalance.balances.length - 1} 个币种余额`
+              : "上游账户实时余额"
+          : aiProviderBalance?.reason ?? aiProviderBalance?.error ?? "切换接口后自动查询";
       return (
         <div className="settingsContentStack">
-          <section className="settingsPaneSection">
-            <div className="settingsPaneHeader">
-              <h3>AI 接口</h3>
-              <p>管理 AI 模型接口，支持 OpenAI-compatible 协议。添加后可直接切换当前 Agent 使用的模型来源。</p>
-            </div>
-            <div className="aiProviderSummary">
-              <div>
-                <span>当前接口</span>
-                <strong>{activeProvider?.displayName ?? "未选择"}</strong>
-                <small>{activeProvider?.defaultModel ?? health?.model ?? "等待配置模型"}</small>
-              </div>
-              <div>
-                <span>可用密钥</span>
-                <strong>{configuredProviders}/{aiProviders.length}</strong>
-                <small>{missingProviders > 0 ? `${missingProviders} 个接口缺少密钥` : "所有接口均可测试"}</small>
-              </div>
-              <div>
-                <span>模型候选</span>
-                <strong>{modelOptions.length || 0}</strong>
-                <small>{health?.providerConfigured ? "聊天栏可直接切换" : "配置密钥后刷新"}</small>
-              </div>
-            </div>
-            <div className="aiProviderToolbar">
+          <section className="settingsPaneSection aiProviderSection">
+            <div className="aiProviderPageIntro">
+              <p>配置 OpenAI-compatible 模型服务，并切换当前 Agent 使用的接口。</p>
               <button className="settingsBtnPrimary" type="button" onClick={openNewAiProvider}>
                 <Plus size={15} />
                 添加接口
               </button>
-              {userProviders.length > 0 && (
-                <>
-                  <label className="aiSelectAll">
-                    <input type="checkbox" checked={allSelected} onChange={toggleSelectAllProviders} />
-                    全选 ({selectedProviders.size}/{userProviders.length})
-                  </label>
-                  {selectedProviders.size > 0 && (
-                    <button className="settingsBtnDanger" type="button" onClick={() => void batchDeleteAiProviders()}>
-                      批量删除 ({selectedProviders.size})
-                    </button>
-                  )}
-                </>
-              )}
             </div>
-            <div className="settingsRows aiProviderList">
+            <div className="aiModuleCard aiProviderOverviewCard">
+              <div className="aiModuleHeader">
+                <span>
+                  <strong>接口概览</strong>
+                  <small>当前 Agent 的模型、密钥与账户状态</small>
+                </span>
+              </div>
+              <div className="aiProviderSummary">
+                <div>
+                  <span>当前接口</span>
+                  <strong>{activeProvider?.displayName ?? "未选择"}</strong>
+                  <small>{activeProvider?.defaultModel ?? health?.model ?? "等待配置模型"}</small>
+                </div>
+                <div>
+                  <span>可用密钥</span>
+                  <strong>{configuredProviders}/{aiProviders.length}</strong>
+                  <small>{missingProviders > 0 ? `${missingProviders} 个接口缺少密钥` : "所有接口均可测试"}</small>
+                </div>
+                <div>
+                  <span>模型候选</span>
+                  <strong>{modelOptions.length || 0}</strong>
+                  <small>{health?.providerConfigured ? "聊天栏可直接切换" : "配置密钥后刷新"}</small>
+                </div>
+                <div className={`aiProviderBalanceMetric ${aiProviderBalance?.status ?? "idle"}`}>
+                  <span className="aiProviderBalanceLabel">
+                    账号余额
+                    <button
+                      type="button"
+                      aria-label="刷新当前接口账号余额"
+                      title="调用上游接口刷新余额"
+                      onClick={() => void loadAiProviderBalance()}
+                      disabled={!aiActiveProviderId || aiProviderBalanceLoading}
+                    >
+                      <RefreshCw size={12} className={aiProviderBalanceLoading ? "spinning" : ""} />
+                    </button>
+                  </span>
+                  <strong title={balanceValue}>{balanceValue}</strong>
+                  <small title={balanceHint}>{balanceHint}</small>
+                </div>
+              </div>
+            </div>
+            {quickConnects.length > 0 && (
+              <div className="aiModuleCard aiQuickConnectCard">
+                <div className="aiPresetLauncher">
+                  <span className="aiPresetLauncherCopy">
+                    <strong>快速接入</strong>
+                    <small>官方参数已填好，只需填写 API Key</small>
+                  </span>
+                  <div className="aiPresetLauncherList">
+                    {quickConnects.map(([id, quickConnect]) => {
+                      return (
+                        <button
+                          className="aiPresetChip"
+                          key={id}
+                          type="button"
+                          style={{ "--provider-accent": quickConnect.accent } as CSSProperties}
+                          onClick={() => openAiQuickConnect(id)}
+                        >
+                          <span className="providerPresetMark" aria-hidden="true">{quickConnect.mark}</span>
+                          {quickConnect.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            )}
+            <div className="aiModuleCard aiProviderDirectoryCard">
+              <div className="aiProviderMonitorToolbar">
+                <span className="aiProviderMonitorCopy">
+                  <strong>接口与实时监测</strong>
+                  <small>{monitoredAiProviderIds.size > 0 ? `${monitoredAiProviderIds.size} 个接口 · 不消耗 Token` : "点击接口左侧圆点开启"}</small>
+                </span>
+                <span className="aiProviderMonitorLegend" aria-label="状态颜色说明">
+                  <span><i className="healthy" />正常</span>
+                  <span><i className="checking" />检测中</span>
+                  <span><i className="unhealthy" />异常</span>
+                </span>
+              </div>
+              <div className="settingsRows aiProviderList">
               {aiProviders.length === 0 && (
                 <div className="settingsRow">
                   <span>
@@ -3473,28 +4320,37 @@ export default function App() {
               )}
               {aiProviders.map((provider) => {
                 const isActiveProvider = provider.id === aiActiveProviderId || provider.active;
-                const isSelected = selectedProviders.has(provider.id);
+                const isMonitoring = monitoredAiProviderIds.has(provider.id);
+                const healthState = isMonitoring ? aiProviderHealth[provider.id]?.state ?? "checking" : "idle";
                 const statusText = aiProviderStatus[provider.id];
+                const healthLabel = healthState === "healthy"
+                  ? "正常"
+                  : healthState === "unhealthy"
+                    ? "异常"
+                    : healthState === "checking"
+                      ? "检测中"
+                      : "未开启";
                 return (
-                  <div className={`settingsRow aiProviderRow ${isActiveProvider ? "aiProviderActive" : ""} ${isSelected ? "aiProviderSelected" : ""}`} key={provider.id}>
+                  <div className={`settingsRow aiProviderRow ${isActiveProvider ? "aiProviderActive" : ""}`} key={provider.id}>
                     <div className="aiProviderSelectCell">
-                      {provider.source === "user" ? (
-                        <input
-                          aria-label={`选择 ${provider.displayName}`}
-                          checked={isSelected}
-                          className="aiProviderCheckbox"
-                          onChange={() => toggleProviderSelect(provider.id)}
-                          type="checkbox"
-                        />
-                      ) : (
-                        <span className={`aiProviderStateDot ${provider.configured ? "ready" : "missing"}`} />
-                      )}
+                      <button
+                        aria-label={`${isMonitoring ? "关闭" : "开启"} ${provider.displayName} 状态监测，当前${healthLabel}`}
+                        aria-pressed={isMonitoring}
+                        className={`aiProviderStateDot ${healthState}`}
+                        onClick={() => toggleAiProviderMonitoring(provider.id)}
+                        title={`${healthLabel} · 点击${isMonitoring ? "关闭" : "开启"}实时监测`}
+                        type="button"
+                      />
                     </div>
                     <span className="aiProviderInfo">
                       <strong className="aiProviderTitle">
                         <span className="aiProviderName">{provider.displayName}</span>
                         {isActiveProvider ? <span className="aiProviderBadge">当前</span> : ""}
-                        {provider.source === "builtin" ? <span className="aiProviderBadgeBuiltin">内置</span> : ""}
+                        {provider.source === "builtin"
+                          ? <span className="aiProviderBadgeBuiltin">内置</span>
+                          : AI_PROVIDER_QUICK_CONNECTS[provider.id]
+                            ? <span className="aiProviderBadgeBuiltin">快捷</span>
+                            : ""}
                         <span className={`aiProviderBadgeSoft ${provider.configured ? "ready" : "missing"}`}>
                           {provider.configured ? "密钥已配置" : "缺少密钥"}
                         </span>
@@ -3524,42 +4380,65 @@ export default function App() {
                   </div>
                 );
               })}
+              </div>
             </div>
           </section>
 
           {showAddProviderModal && (
             <div className="modalOverlay" onClick={() => { setShowAddProviderModal(false); setEditingAiProviderId(undefined); }}>
-              <div className="modalContent" onClick={(e) => e.stopPropagation()}>
+              <div className={`modalContent${isAiQuickConnect ? " aiPresetModal" : ""}`} onClick={(e) => e.stopPropagation()}>
                 <div className="modalHeader">
-                  <h3>{editingAiProviderId ? "配置 AI 接口" : "添加 AI 接口"}</h3>
+                  <h3>{isAiQuickConnect ? `连接 ${aiDraftQuickConnect.label}` : editingAiProviderId ? "配置 AI 接口" : "添加 AI 接口"}</h3>
                   <button className="modalClose" onClick={() => { setShowAddProviderModal(false); setEditingAiProviderId(undefined); }}>&times;</button>
                 </div>
                 <div className="modalBody">
-                  <div className="aiFormField">
-                    <label>协议类型</label>
-                    <select value={aiDraft.protocol} onChange={(e) => setAiDraft((cur) => ({ ...cur, protocol: e.target.value }))}>
-                      <option value="openai-compatible">OpenAI-compatible (推荐)</option>
-                    </select>
-                  </div>
-                  <div className="aiFormRow">
-                    <div className="aiFormField">
-                      <label>接口 ID</label>
-                      <input value={aiDraft.id} disabled={Boolean(editingAiProviderId)} onChange={(e) => setAiDraft((cur) => ({ ...cur, id: e.target.value }))} placeholder="如 deepseek" />
+                  {isAiQuickConnect ? (
+                    <div className="aiPresetIntro" style={{ "--provider-accent": aiDraftQuickConnect.accent } as CSSProperties}>
+                      <span className="providerPresetMark" aria-hidden="true">{aiDraftQuickConnect.mark}</span>
+                      <span>
+                        <strong>{aiDraftQuickConnect.label} 快捷接入</strong>
+                        <small>接口地址与推荐模型已填好，只需粘贴 API Key。</small>
+                      </span>
                     </div>
-                    <div className="aiFormField">
-                      <label>显示名称</label>
-                      <input value={aiDraft.displayName} onChange={(e) => setAiDraft((cur) => ({ ...cur, displayName: e.target.value }))} placeholder="显示名称" />
-                    </div>
-                  </div>
-                  <div className="aiFormField">
-                    <label>Base URL</label>
-                    <input value={aiDraft.baseUrl} onChange={(e) => setAiDraft((cur) => ({ ...cur, baseUrl: e.target.value }))} placeholder="https://api.openai.com/v1" />
-                  </div>
+                  ) : (
+                    <>
+                      <div className="aiFormField">
+                        <label>协议类型</label>
+                        <select value={aiDraft.protocol} onChange={(e) => setAiDraft((cur) => ({ ...cur, protocol: e.target.value }))}>
+                          <option value="openai-compatible">OpenAI-compatible (推荐)</option>
+                        </select>
+                      </div>
+                      <div className="aiFormRow">
+                        <div className="aiFormField">
+                          <label>接口 ID</label>
+                          <input value={aiDraft.id} disabled={Boolean(editingAiProviderId)} onChange={(e) => setAiDraft((cur) => ({ ...cur, id: e.target.value }))} placeholder="如 deepseek" />
+                        </div>
+                        <div className="aiFormField">
+                          <label>显示名称</label>
+                          <input value={aiDraft.displayName} onChange={(e) => setAiDraft((cur) => ({ ...cur, displayName: e.target.value }))} placeholder="显示名称" />
+                        </div>
+                      </div>
+                      <div className="aiFormField">
+                        <label>Base URL</label>
+                        <input value={aiDraft.baseUrl} onChange={(e) => setAiDraft((cur) => ({ ...cur, baseUrl: e.target.value }))} placeholder="https://api.openai.com/v1" />
+                      </div>
+                    </>
+                  )}
                   <div className="aiFormField">
                     <label>API Key</label>
-                    <input type="password" value={aiDraft.apiKey} onChange={(e) => setAiDraft((cur) => ({ ...cur, apiKey: e.target.value }))} placeholder={editingAiProviderId ? "输入新的 API Key" : "sk-..."} />
+                    <input
+                      autoFocus={isAiQuickConnect}
+                      type="password"
+                      value={aiDraft.apiKey}
+                      onChange={(e) => setAiDraft((cur) => ({ ...cur, apiKey: e.target.value }))}
+                      placeholder={aiDraftExistingProvider?.configured
+                        ? "输入新的 API Key（留空则保留原密钥）"
+                        : isAiQuickConnect
+                          ? `粘贴 ${aiDraftQuickConnect.label} API Key`
+                          : "sk-..."}
+                    />
                   </div>
-                  <div className="aiModelDiscovery">
+                  {!isAiQuickConnect && <div className="aiModelDiscovery">
                     <span>
                       <strong>模型发现</strong>
                       <small>{aiDraftModelStatus || "填写 Base URL 和 API Key 后可获取模型列表"}</small>
@@ -3568,7 +4447,22 @@ export default function App() {
                       <RefreshCw size={14} />
                       {aiDraftFetchingModels ? "获取中" : "获取模型"}
                     </button>
-                  </div>
+                  </div>}
+                  {isAiQuickConnect && (
+                    <div className="aiPresetReadyLine">
+                      <Check size={15} aria-hidden="true" />
+                      保存后自动设为当前接口
+                    </div>
+                  )}
+                  <details className={isAiQuickConnect ? "aiAdvancedSettings" : "aiAdvancedSettings open"} open={!isAiQuickConnect}>
+                    {isAiQuickConnect && <summary>高级设置</summary>}
+                    <div className="aiAdvancedSettingsBody">
+                  {isAiQuickConnect && (
+                    <div className="aiFormField">
+                      <label>Base URL</label>
+                      <input value={aiDraft.baseUrl} onChange={(e) => setAiDraft((cur) => ({ ...cur, baseUrl: e.target.value }))} />
+                    </div>
+                  )}
                   <div className="aiFormRow">
                     <div className="aiFormField">
                       <label>默认模型</label>
@@ -3597,13 +4491,24 @@ export default function App() {
                       <input value={aiDraft.modelsPath} onChange={(e) => setAiDraft((cur) => ({ ...cur, modelsPath: e.target.value }))} placeholder="/models" />
                     </div>
                   </div>
+                  <div className="aiFormField">
+                    <label>余额接口（可选）</label>
+                    <input
+                      value={aiDraft.balancePath}
+                      onChange={(e) => setAiDraft((cur) => ({ ...cur, balancePath: e.target.value }))}
+                      placeholder="相对 Base URL 的路径或完整 URL"
+                    />
+                    <small>DeepSeek 与 OpenRouter 可自动识别；其他上游可在此填写只读余额接口。</small>
+                  </div>
+                    </div>
+                  </details>
                   {aiDraftError ? <div className="aiFormError">{aiDraftError}</div> : null}
                 </div>
                 <div className="modalFooter">
                   <button type="button" className="settingsBtnSecondary" onClick={() => { setShowAddProviderModal(false); setEditingAiProviderId(undefined); }} disabled={aiDraftSaving}>取消</button>
                   <button type="button" className="settingsBtnPrimary" onClick={() => void saveAiProviderFromDraft()} disabled={!aiDraftCanSave || aiDraftSaving}>
                     <Save size={14} />
-                    {aiDraftSaving ? "保存中" : editingAiProviderId ? "保存配置" : "保存接口"}
+                    {aiDraftSaving ? "保存中" : isAiQuickConnect ? "保存并使用" : editingAiProviderId ? "保存配置" : "保存接口"}
                   </button>
                 </div>
               </div>
@@ -3656,15 +4561,45 @@ export default function App() {
                 </div>
               )}
               {mcpServers.map((server) => (
-                <div className="settingsRow" key={server.id}>
+                <div className={`settingsRow ${server.id === "github" ? "githubMcpRow" : ""}`} key={server.id}>
                   <span>
                     <strong>{server.name}</strong>
-                    <small>{server.transport === "http" ? server.url : server.command} · {server.enabled ? "已启用" : "已停用"} · 默认 {server.defaultApproval}</small>
+                    <small>
+                      {server.transport === "http" ? server.url : server.command} · {server.enabled ? "已启用" : "已停用"} · 默认 {server.defaultApproval}
+                      {server.bearerTokenEnvVar ? ` · 令牌变量 ${server.bearerTokenEnvVar}` : ""}
+                    </small>
+                    {server.id === "github" && <small>{githubMcpAuthorized ? "浏览器已授权；token 保存在系统安全存储" : "支持浏览器 OAuth 或环境变量 PAT；OAuth 将请求 repo、read:org"}</small>}
+                    {server.id === "github" && <small className="githubMcpCallbackHint">OAuth App 回调 URL：<code>http://127.0.0.1/oauth/github/callback</code></small>}
+                    {mcpStatus[server.id] && <small>{mcpStatus[server.id]}</small>}
                   </span>
-                  <button type="button" onClick={() => void saveMcpServer({ ...server, enabled: !server.enabled })}>
-                    {server.enabled ? "停用" : "启用"}
-                  </button>
-                  <button type="button" onClick={() => void deleteMcpServer(server.id)}>删除</button>
+                  {server.id === "github" && (
+                    <div className="githubMcpAuthControls">
+                      <input
+                        aria-label="GitHub OAuth Client ID"
+                        value={mcpOauthClientIds[server.id] ?? server.oauthClientId ?? ""}
+                        onChange={(event) => setMcpOauthClientIds((current) => ({ ...current, [server.id]: event.target.value }))}
+                        placeholder="GitHub OAuth Client ID"
+                      />
+                      <input
+                        type="password"
+                        aria-label="GitHub OAuth Client Secret"
+                        value={githubOauthClientSecret}
+                        onChange={(event) => setGithubOauthClientSecret(event.target.value)}
+                        placeholder="Client Secret（不会保存）"
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                      <button type="button" onClick={() => void authorizeGithubMcp(server)}>浏览器授权</button>
+                      {githubMcpAuthorized && <button type="button" onClick={() => void logoutGithubMcp(server)}>撤销授权</button>}
+                    </div>
+                  )}
+                  <div className="mcpServerActions">
+                    <button type="button" onClick={() => void saveMcpServer({ ...server, enabled: !server.enabled })}>
+                      {server.enabled ? "停用" : "启用"}
+                    </button>
+                    <button type="button" disabled={!server.enabled} onClick={() => void testMcpServer(server.id)}>测试</button>
+                    {server.id !== "github" && <button type="button" onClick={() => void deleteMcpServer(server.id)}>删除</button>}
+                  </div>
                 </div>
               ))}
             </div>
@@ -3675,7 +4610,7 @@ export default function App() {
 
     if (activeSettingsSection === "usage") {
       const usage = usageSummary ?? {
-        totals: { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0 },
+        totals: { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
         prompts: { total: 0, sessionHits: 0, hitRate: 0 },
         aiCalls: 0,
         byModel: [],
@@ -3703,8 +4638,8 @@ export default function App() {
               </div>
               <div className="usageMetric">
                 <span>缓存 Token</span>
-                <strong>{formatUsageNumber(usage.totals.cachedTokens)}</strong>
-                <small>上游返回的 cached_tokens</small>
+                <strong>{formatUsageNumber((usage.totals.cacheReadTokens ?? usage.totals.cachedTokens ?? 0) + (usage.totals.cacheCreationTokens ?? 0))}</strong>
+                <small>读取 {formatUsageNumber(usage.totals.cacheReadTokens ?? usage.totals.cachedTokens ?? 0)} · 写入 {formatUsageNumber(usage.totals.cacheCreationTokens ?? 0)}</small>
               </div>
             </div>
             <div className="settingsRows usageModelRows">
@@ -3780,6 +4715,7 @@ export default function App() {
             isSettings={activeView === "settings"}
             title={activeView === "settings" ? selectedSettingsItem.label : activeSession?.title ?? "Rcode"}
             modelName={modelName}
+            projectTokenTotal={activeView === "chat" ? activeProjectUsage : undefined}
             sidebarCollapsed={sidebarCollapsed}
             theme={resolvedTheme}
             onToggleSidebar={toggleSidebar}
@@ -3899,6 +4835,80 @@ export default function App() {
                     {(() => {
                       const renderItems = getMessageRenderItems(visibleMessages);
 
+                      const renderToolCallGroup = (
+                        toolMessages: ChatMessage[],
+                        options?: { groupId?: string; defaultOpen?: boolean }
+                      ) => {
+                        const runningCount = toolMessages.filter((message) =>
+                          message.status === "running" || message.toolResult?.process?.status === "running"
+                        ).length;
+                        const failCount = toolMessages.filter((message) =>
+                          message.status === "completed" && message.toolResult && (
+                            !message.toolResult.ok ||
+                            message.toolResult.process?.status === "failed" ||
+                            (message.toolResult.process?.status === "exited" && (message.toolResult.process.exitCode ?? 0) !== 0)
+                          )
+                        ).length;
+                        const hasRunning = runningCount > 0;
+                        const groupSummary = getToolGroupSummary(toolMessages, activeProject?.path);
+                        const activityGroups = getToolActivityGroups(toolMessages, activeProject?.path);
+                        const activeToolSkills = [...new Set(toolMessages.flatMap((message) => message.activeSkills ?? []))]
+                          .sort((a, b) => Number(a === "auto-learning") - Number(b === "auto-learning"))
+                          .map((name) => ({
+                            name,
+                            label: skills.find((skill) => skill.name === name)?.displayName ?? name
+                          }));
+                        const groupId = options?.groupId ?? `group-${toolMessages[0].id}`;
+                        const isManuallyClosed = manualClosedGroupsRef.current.has(groupId);
+                        const isEditToolGroup = toolMessages.some((message) => isEditToolName(message.toolName));
+                        const isCommandToolGroup = getToolActivityCategory(toolMessages[0]?.toolName) === "command";
+                        // Live edit and command groups stay compact. Replays override
+                        // this default so one click immediately reveals the timeline.
+                        const isOpen = options?.defaultOpen ?? (
+                          !isManuallyClosed && hasRunning && !isEditToolGroup && !isCommandToolGroup
+                        );
+
+                        return (
+                          <ToolCallGroup
+                            key={groupId}
+                            groupId={groupId}
+                            label={groupSummary.label}
+                            detail={groupSummary.detail}
+                            isRunning={groupSummary.isRunning}
+                            isEditGroup={isEditToolGroup}
+                            defaultOpen={isOpen}
+                            failedCount={failCount}
+                            addedLines={groupSummary.addedLines}
+                            removedLines={groupSummary.removedLines}
+                            isDiffEstimate={groupSummary.isDiffEstimate}
+                            activeSkills={activeToolSkills}
+                            activityGroups={activityGroups.map((activityGroup) => ({
+                              category: activityGroup.category,
+                              title: activityGroup.labels.title,
+                              items: activityGroup.messages.map((message) => {
+                                const lineChanges = getToolLineChangeStats(message);
+                                return {
+                                  id: message.id,
+                                  name: message.toolName ?? "unknown_tool",
+                                  target: getToolActivityTarget(message, activeProject?.path) || getToolDisplayTarget(message),
+                                  status: message.status === "running" || message.toolResult?.process?.status === "running"
+                                    ? "running"
+                                    : message.toolResult?.ok === false || message.toolResult?.process?.status === "failed" || (message.toolResult?.process?.status === "exited" && (message.toolResult.process.exitCode ?? 0) !== 0)
+                                      ? "fail"
+                                      : "ok",
+                                  args: message.toolArgs ? summarizeArguments(message.toolArgs) : undefined,
+                                  result: message.toolResult?.process ? undefined : message.toolResult?.content.slice(0, 1500),
+                                  process: message.toolResult?.process,
+                                  ...lineChanges
+                                };
+                              })
+                            }))}
+                            onClosed={(id) => manualClosedGroupsRef.current.add(id)}
+                            onStopProcess={stopManagedProcess}
+                          />
+                        );
+                      };
+
                       const renderArtifactCard = (message: ChatMessage) => {
                         if (!message.artifactDiffs?.length) return null;
                         const artifactDiffs = [...new Map(
@@ -3992,64 +5002,7 @@ export default function App() {
 
                       return renderItems.map((item) => {
                         if (item.type === "toolGroup") {
-                          const toolMessages = item.messages;
-                          const runningCount = toolMessages.filter((m) => m.status === "running" || m.toolResult?.process?.status === "running").length;
-                          const failCount = toolMessages.filter((m) =>
-                            m.status === "completed" && m.toolResult && (
-                              !m.toolResult.ok ||
-                              m.toolResult.process?.status === "failed" ||
-                              (m.toolResult.process?.status === "exited" && (m.toolResult.process.exitCode ?? 0) !== 0)
-                            )
-                          ).length;
-                          const hasRunning = runningCount > 0;
-                          const groupSummary = getToolGroupSummary(toolMessages, activeProject?.path);
-                          const activityGroups = getToolActivityGroups(toolMessages, activeProject?.path);
-                          const groupId = `group-${toolMessages[0].id}`;
-                          const isManuallyClosed = manualClosedGroupsRef.current.has(groupId);
-                          const isEditToolGroup = toolMessages.some((message) => isEditToolName(message.toolName));
-                          const isCommandToolGroup = getToolActivityCategory(toolMessages[0]?.toolName) === "command";
-                          // 编辑状态保持为紧凑提示，避免补丁内容在执行期间占满聊天流。
-                          // 执行指令也默认收起，避免长命令和实时输出挤占会话空间；
-                          // 用户仍可按需展开查看每一步工具详情。
-                          const isOpen = !isManuallyClosed && hasRunning && !isEditToolGroup && !isCommandToolGroup;
-                          return (
-                            <ToolCallGroup
-                              key={groupId}
-                              groupId={groupId}
-                              label={groupSummary.label}
-                              detail={groupSummary.detail}
-                              isRunning={groupSummary.isRunning}
-                              isEditGroup={isEditToolGroup}
-                              defaultOpen={isOpen}
-                              failedCount={failCount}
-                              addedLines={groupSummary.addedLines}
-                              removedLines={groupSummary.removedLines}
-                              isDiffEstimate={groupSummary.isDiffEstimate}
-                              activityGroups={activityGroups.map((activityGroup) => ({
-                                category: activityGroup.category,
-                                title: activityGroup.labels.title,
-                                items: activityGroup.messages.map((message) => {
-                                  const lineChanges = getToolLineChangeStats(message);
-                                  return {
-                                    id: message.id,
-                                    name: message.toolName ?? "unknown_tool",
-                                    target: getToolActivityTarget(message, activeProject?.path) || getToolDisplayTarget(message),
-                                    status: message.status === "running" || message.toolResult?.process?.status === "running"
-                                      ? "running"
-                                      : message.toolResult?.ok === false || message.toolResult?.process?.status === "failed" || (message.toolResult?.process?.status === "exited" && (message.toolResult.process.exitCode ?? 0) !== 0)
-                                        ? "fail"
-                                        : "ok",
-                                    args: message.toolArgs ? summarizeArguments(message.toolArgs) : undefined,
-                                    result: message.toolResult?.process ? undefined : message.toolResult?.content.slice(0, 1500),
-                                    process: message.toolResult?.process,
-                                    ...lineChanges
-                                  };
-                                })
-                              }))}
-                              onClosed={(id) => manualClosedGroupsRef.current.add(id)}
-                              onStopProcess={stopManagedProcess}
-                            />
-                          );
+                          return renderToolCallGroup(item.messages);
                         }
 
                         const message = item.message;
@@ -4075,6 +5028,38 @@ export default function App() {
                         );
                         const showTaskProgress = isAssistant && message.id === activeResponseMetaId && shouldShowTaskDuration;
                         const showFinalBadge = message.status === "completed" && !isActivelyStreaming;
+                        const hasProviderUsage = message.usage?.billedTotalTokens !== undefined;
+                        const displayPromptTokens = hasProviderUsage
+                          ? message.usage?.billedPromptTokens ?? 0
+                          : message.status === "error"
+                            ? 0
+                            : message.usage?.promptTokens ?? 0;
+                        const displayCompletionTokens = hasProviderUsage
+                          ? message.usage?.billedCompletionTokens ?? 0
+                          : message.status === "error"
+                            ? 0
+                            : message.usage?.completionTokens ?? 0;
+                        const inputUsageTitle = hasProviderUsage
+                          ? "上游返回的真实输入 token（包含本次请求上下文）"
+                          : message.status === "error"
+                            ? "请求失败且上游未返回 usage，不计 token"
+                            : "生成期间的本条消息 token 估算，完成后由上游 usage 校准";
+                        const outputUsageTitle = hasProviderUsage
+                          ? "上游返回的真实输出 token"
+                          : message.status === "error"
+                            ? "请求失败且上游未返回 usage，不计 token"
+                            : "生成期间的可见回复 token 估算，完成后由上游 usage 校准";
+                        const replayMessages = showFinalBadge ? getResponseReplayMessages(messages, message.id) : [];
+                        const isReplayOpen = expandedResponseReplays.has(message.id);
+                        const replayPanelId = `response-replay-${message.id}`;
+
+                        const toggleReplay = () => {
+                          setExpandedResponseReplays((current) => {
+                            const next = new Set(current);
+                            if (next.has(message.id)) next.delete(message.id); else next.add(message.id);
+                            return next;
+                          });
+                        };
 
                         return (
                           <Fragment key={message.id}>
@@ -4109,21 +5094,62 @@ export default function App() {
                                 {responseDurationMs !== undefined && (
                                   <span className="responseMetric">耗时 {formatResponseDuration(responseDurationMs)}</span>
                                 )}
-                                <span className="responseMetric" title={message.usage?.estimated ? "生成期间为实时估算，完成后由上游精确用量校准" : undefined}>
-                                  上传 {formatUsageNumber(message.usage?.promptTokens ?? 0)} token
+                                <span className="responseMetric" title={inputUsageTitle}>
+                                  上传 {formatUsageNumber(displayPromptTokens)} token
                                 </span>
-                                <span className="responseMetric" title={message.usage?.estimated ? "生成期间为实时估算，完成后由上游精确用量校准" : undefined}>
-                                  下传 {formatUsageNumber(message.usage?.completionTokens ?? 0)} token
+                                <span className="responseMetric" title={outputUsageTitle}>
+                                  下传 {formatUsageNumber(displayCompletionTokens)} token
                                 </span>
                                 {isResponseRunning && <strong className="streaming">生成中</strong>}
                                 {message.status === "error" && <strong className="toolFail">error</strong>}
                                 {message.status === "approval_required" && <strong>approval_required</strong>}
-                                {showFinalBadge && <strong className="finalBadge">最终回复</strong>}
+                                {showFinalBadge && (
+                                  <button
+                                    className={`responseReplayButton ${isReplayOpen ? "active" : ""}`}
+                                    type="button"
+                                    aria-expanded={isReplayOpen}
+                                    aria-controls={replayPanelId}
+                                    onClick={toggleReplay}
+                                    title={replayMessages.length > 0 ? `查看本轮 ${replayMessages.length} 次工具调用` : "本轮没有工具调用"}
+                                  >
+                                    <History size={11} aria-hidden="true" />
+                                    {isReplayOpen ? "收起回放" : "查看回放"}
+                                    <ChevronDown size={11} aria-hidden="true" />
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                            {showFinalBadge && isReplayOpen && (
+                              <section className="responseReplayPanel" id={replayPanelId} aria-label="本轮工具调用回放">
+                                <div className="responseReplayHeader">
+                                  <span><History size={14} aria-hidden="true" />执行回放</span>
+                                  <small>{replayMessages.length > 0 ? `${replayMessages.length} 次工具调用` : "没有工具调用"}</small>
+                                </div>
+                                {replayMessages.length > 0
+                                  ? renderToolCallGroup(replayMessages, { groupId: `replay-group-${message.id}`, defaultOpen: true })
+                                  : <p className="responseReplayEmpty">本轮直接生成回复，未调用任何工具。</p>}
+                              </section>
+                            )}
+                            {message.role === "user" && Boolean(message.attachments?.length) && (
+                              <div className="messageAttachmentGrid" aria-label="消息附件">
+                                {message.attachments!.map((attachment) => (
+                                  <div className={`messageAttachment ${attachment.kind}`} key={attachment.id} title={attachment.name}>
+                                    {attachment.kind === "image" && attachment.dataUrl ? (
+                                      <img src={attachment.dataUrl} alt={attachment.name} />
+                                    ) : (
+                                      <span className="messageAttachmentFileIcon"><FileText size={18} /></span>
+                                    )}
+                                    <span>
+                                      <strong>{attachment.name}</strong>
+                                      <small>{attachment.mimeType}</small>
+                                    </span>
+                                  </div>
+                                ))}
                               </div>
                             )}
                             {!isEmpty && (
                               <div className={`messageBubble ${isAssistant ? "assistantBubble" : ""}`}>
-                                {renderMessageContent(isAssistant ? message.content.trimEnd() : message.content)}
+                                {renderMessageContent(isAssistant ? message.content.trimEnd() : message.content, activeProject?.path)}
                                 {isActivelyStreaming && <span className="streamingCursor">▊</span>}
                               </div>
                             )}
@@ -4171,9 +5197,9 @@ export default function App() {
 	                          <CornerDownRight size={15} />
 	                          <span className="queueItemText">
 	                            {item.kind === "guide" && <strong>引导</strong>}
-	                            {item.content}
+	                            {item.content || item.attachments?.map((attachment) => attachment.name).join("、") || "附件消息"}
 	                          </span>
-	                          <span className="queueItemMeta">{index === 0 ? "下一个" : `#${index + 1}`}</span>
+	                          <span className="queueItemMeta">{item.attachments?.length ? `${item.attachments.length} 个附件 · ` : ""}{index === 0 ? "下一个" : `#${index + 1}`}</span>
 	                          <button
 	                            className="queueItemAction"
 	                            type="button"
@@ -4201,6 +5227,7 @@ export default function App() {
 
                   <ChatComposer
                     prompt={prompt}
+                    attachments={composerAttachments}
                     modelName={modelName}
                     modelOptions={modelOptions}
                     modelMenuOpen={modelMenuOpen}
@@ -4217,6 +5244,10 @@ export default function App() {
                     managedProcessPanelOpen={managedProcessPanelOpen}
                     managedProcessLoadError={managedProcessLoadError}
                     onPromptChange={setPrompt}
+                    onAttachmentsChange={(attachments) => {
+                      if (!activeSession) return;
+                      setComposerAttachmentsBySession((current) => ({ ...current, [activeSession.id]: attachments }));
+                    }}
                     onKeyDown={handleComposerKeyDown}
                     onToggleModelMenu={() => setModelMenuOpen((open) => !open)}
                     onSelectModel={(model) => {

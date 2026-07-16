@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { describePermissionMode, normalizePermissionMode } from "./security/permissions";
 import { approveToolCallStream, runAgentStream } from "./agent/agent";
-import type { PermissionMode, StreamEvent } from "./shared/types";
+import type { AgentAttachment, PermissionMode, StreamEvent } from "./shared/types";
 import { getRuntimeConfig } from "./runtime/config";
 import type { ThinkingMode } from "./providers/aiProvider";
 import {
@@ -15,12 +15,16 @@ import {
   listAuditEvents,
   listConversations,
   listMemories,
+  listLearningRecords,
+  getLatestLearningRun,
   listMcpServers,
   listPermissionRules,
   saveMemory,
+  saveLearningRecord,
   saveMcpServer,
   savePermissionRules,
   deleteMemory,
+  deleteLearningRecord,
   getArtifact,
   type AiProviderConfig,
   type McpServerConfig
@@ -28,6 +32,7 @@ import {
 import {
   activateAiProvider,
   fetchModelsForDraft,
+  fetchProviderBalance,
   fetchProviderModels,
   listAiProviders,
   removeAiProvider,
@@ -36,16 +41,19 @@ import {
 } from "./providers/aiProviderRegistry";
 import { getRegisteredTools } from "./runtime/tools";
 import { defaultPermissionRules } from "./security/permissionRules";
-import { listSkills } from "./agent/skills";
-import { listMcpTools, testMcpServer, trustMcpServer } from "./integrations/mcpClient";
+import { listSkills, loadSkillContent } from "./agent/skills";
+import { listMcpTools, setMcpRuntimeBearerToken, testMcpServer, trustMcpServer } from "./integrations/mcpClient";
 import { getProjectHookTrust } from "./agent/hooks";
 import { listSubagents } from "./agent/subagents";
 import { managedProcessManager } from "./runtime/processManager";
+import { warmMessageTokenizer } from "./providers/messageTokenizer";
 
 dotenv.config();
 if (existsSync(".env.local")) {
   dotenv.config({ path: ".env.local", override: true });
 }
+
+warmMessageTokenizer(process.env.AI_MODEL ?? getRuntimeConfig().provider.defaultModel);
 
 const app = express();
 const port = Number(process.env.PORT ?? 8787);
@@ -66,7 +74,7 @@ app.use(cors({
     callback(new Error(`Origin not allowed: ${origin}`));
   }
 }));
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "24mb" }));
 
 function parseMode(value: unknown): PermissionMode {
   return normalizePermissionMode(value);
@@ -85,6 +93,40 @@ function parseModel(value: unknown): string | undefined {
 
 function parseProjectPath(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function parseAttachments(value: unknown): AgentAttachment[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("attachments must be an array");
+  if (value.length > 8) throw new Error("最多发送 8 个附件");
+  let totalBytes = 0;
+  return value.map((raw, index) => {
+    if (!raw || typeof raw !== "object") throw new Error(`附件 ${index + 1} 格式无效`);
+    const item = raw as Record<string, unknown>;
+    const name = typeof item.name === "string" ? item.name.trim().slice(0, 255) : "";
+    const mimeType = typeof item.mimeType === "string" ? item.mimeType.trim().slice(0, 160) : "application/octet-stream";
+    const size = typeof item.size === "number" && Number.isFinite(item.size) ? Math.max(0, Math.floor(item.size)) : -1;
+    const kind = item.kind === "image" ? "image" : item.kind === "file" ? "file" : undefined;
+    const dataUrl = typeof item.dataUrl === "string" ? item.dataUrl : undefined;
+    const text = typeof item.text === "string" ? item.text : undefined;
+    if (!name || !kind || size < 0) throw new Error(`附件 ${index + 1} 缺少必要信息`);
+    if (size > 8 * 1024 * 1024) throw new Error(`${name} 超过单文件 8 MB 限制`);
+    totalBytes += size;
+    if (totalBytes > 16 * 1024 * 1024) throw new Error("附件总大小不能超过 16 MB");
+    if (text !== undefined && new TextEncoder().encode(text).byteLength > 1024 * 1024) throw new Error(`${name} 的文本内容超过 1 MB 限制`);
+    if (dataUrl !== undefined && !/^data:[^;,]+;base64,/i.test(dataUrl)) throw new Error(`${name} 的文件数据无效`);
+    if (kind === "image" && (!mimeType.startsWith("image/") || !dataUrl)) throw new Error(`${name} 不是有效图片`);
+    if (!dataUrl && text === undefined) throw new Error(`${name} 没有可发送的内容`);
+    return {
+      id: typeof item.id === "string" && item.id ? item.id.slice(0, 120) : randomUUID(),
+      name,
+      mimeType,
+      size,
+      kind,
+      dataUrl,
+      text
+    };
+  });
 }
 
 function writeSse(response: express.Response, event: StreamEvent) {
@@ -114,8 +156,9 @@ app.get("/api/health", (_request, response) => {
   const runtimeConfig = getRuntimeConfig();
   const providerConfigured = Boolean(
     runtimeConfig.provider.apiKey ??
-    process.env.AI_API_KEY ??
-    process.env[runtimeConfig.provider.apiKeyEnv]
+    (runtimeConfig.provider.apiKeyEnv
+      ? process.env[runtimeConfig.provider.apiKeyEnv]
+      : process.env.AI_API_KEY)
   );
   response.json({
     ok: true,
@@ -181,6 +224,17 @@ app.get("/api/skills", requireLocalToken, async (request, response) => {
   response.json({ skills: await listSkills(parseProjectPath(typeof request.query.projectPath === "string" ? request.query.projectPath : undefined)) });
 });
 
+app.get("/api/skills/content", requireLocalToken, async (request, response) => {
+  const projectPath = parseProjectPath(typeof request.query.projectPath === "string" ? request.query.projectPath : undefined);
+  const requestedPath = typeof request.query.path === "string" ? request.query.path : "";
+  const skill = (await listSkills(projectPath)).find((item) => item.path === requestedPath);
+  if (!skill) {
+    response.status(404).json({ error: "skill not found" });
+    return;
+  }
+  response.json({ skill, content: await loadSkillContent(skill.path, projectPath) });
+});
+
 app.get("/api/agents", requireLocalToken, async (request, response) => {
   response.json({ agents: await listSubagents(parseProjectPath(typeof request.query.projectPath === "string" ? request.query.projectPath : undefined)) });
 });
@@ -215,6 +269,17 @@ app.post("/api/ai/providers/:id/test", requireLocalToken, async (request, respon
   }
 });
 
+app.get("/api/ai/providers/:id/balance", requireLocalToken, async (request, response) => {
+  try {
+    response.json(await fetchProviderBalance(String(request.params.id)));
+  } catch (error) {
+    response.status(400).json({
+      status: "unavailable",
+      error: error instanceof Error ? error.message : "AI provider balance query failed"
+    });
+  }
+});
+
 app.post("/api/ai/providers/models", requireLocalToken, async (request, response) => {
   try {
     response.json(await fetchModelsForDraft(request.body as Partial<AiProviderConfig>));
@@ -229,19 +294,6 @@ app.delete("/api/ai/providers/:id", requireLocalToken, (request, response) => {
     response.json({ ok: true, ...listAiProviders() });
   } catch (error) {
     response.status(400).json({ error: error instanceof Error ? error.message : "failed to delete AI provider" });
-  }
-});
-
-app.post("/api/ai/providers/batch-delete", requireLocalToken, (request, response) => {
-  try {
-    const { ids } = request.body as { ids: string[] };
-    if (!Array.isArray(ids)) throw new Error("ids must be an array");
-    for (const id of ids) {
-      try { removeAiProvider(String(id)); } catch { /* skip */ }
-    }
-    response.json({ ok: true, ...listAiProviders() });
-  } catch (error) {
-    response.status(400).json({ error: error instanceof Error ? error.message : "batch delete failed" });
   }
 });
 
@@ -282,6 +334,12 @@ app.post("/api/mcp/servers", requireLocalToken, (request, response) => {
     command: typeof body.command === "string" ? body.command : undefined,
     args: Array.isArray(body.args) ? body.args.map(String) : [],
     url: typeof body.url === "string" ? body.url : undefined,
+    bearerTokenEnvVar: typeof body.bearerTokenEnvVar === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(body.bearerTokenEnvVar)
+      ? body.bearerTokenEnvVar
+      : undefined,
+    oauthClientId: typeof body.oauthClientId === "string" && /^[A-Za-z0-9._-]{8,128}$/.test(body.oauthClientId)
+      ? body.oauthClientId
+      : undefined,
     enabled: body.enabled !== false,
     defaultApproval: body.defaultApproval === "allow" || body.defaultApproval === "deny" ? body.defaultApproval : "ask",
     instructions: typeof body.instructions === "string" ? body.instructions : "",
@@ -293,6 +351,16 @@ app.post("/api/mcp/servers", requireLocalToken, (request, response) => {
 app.delete("/api/mcp/servers/:id", requireLocalToken, (request, response) => {
   deleteMcpServer(String(request.params.id));
   response.json({ ok: true, servers: listMcpServers() });
+});
+
+app.post("/api/mcp/servers/:id/runtime-token", requireLocalToken, (request, response) => {
+  const token = typeof request.body.token === "string" ? request.body.token.trim() : "";
+  if (token.length > 4096) {
+    response.status(400).json({ ok: false, error: "MCP runtime token is too long" });
+    return;
+  }
+  setMcpRuntimeBearerToken(String(request.params.id), token || undefined);
+  response.json({ ok: true, configured: Boolean(token) });
 });
 
 app.get("/api/memory", requireLocalToken, (request, response) => {
@@ -314,6 +382,38 @@ app.post("/api/memory", requireLocalToken, (request, response) => {
 
 app.delete("/api/memory/:id", requireLocalToken, (request, response) => {
   deleteMemory(String(request.params.id));
+  response.json({ ok: true });
+});
+
+app.get("/api/learning", requireLocalToken, (request, response) => {
+  const projectPath = parseProjectPath(request.query.projectPath) ?? process.cwd();
+  response.json({ records: listLearningRecords(projectPath, 250), lastRun: getLatestLearningRun(projectPath) });
+});
+
+app.post("/api/learning", requireLocalToken, (request, response) => {
+  try {
+    const projectPath = parseProjectPath(request.body.projectPath) ?? process.cwd();
+    const title = typeof request.body.title === "string" ? request.body.title : "";
+    const insight = typeof request.body.insight === "string" ? request.body.insight : "";
+    const record = saveLearningRecord({
+      projectPath,
+      conversationId: typeof request.body.conversationId === "string" ? request.body.conversationId : undefined,
+      title,
+      insight,
+      category: request.body.category,
+      evidence: typeof request.body.evidence === "string" ? request.body.evidence : undefined,
+      importance: typeof request.body.importance === "number" ? request.body.importance : undefined,
+      dedupeKey: typeof request.body.dedupeKey === "string" ? request.body.dedupeKey : undefined,
+      source: "manual"
+    });
+    response.json({ record, records: listLearningRecords(projectPath, 250) });
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : "Unable to save learning record" });
+  }
+});
+
+app.delete("/api/learning/:id", requireLocalToken, (request, response) => {
+  deleteLearningRecord(String(request.params.id));
   response.json({ ok: true });
 });
 
@@ -389,8 +489,15 @@ app.get("/api/models", async (_request, response) => {
 
 app.post("/api/agent/run", requireLocalToken, async (request, response) => {
   const prompt = typeof request.body.prompt === "string" ? request.body.prompt : "";
-  if (!prompt.trim()) {
-    response.status(400).json({ error: "prompt is required" });
+  let attachments: AgentAttachment[];
+  try {
+    attachments = parseAttachments(request.body.attachments);
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : "attachments are invalid" });
+    return;
+  }
+  if (!prompt.trim() && attachments.length === 0) {
+    response.status(400).json({ error: "prompt or attachments are required" });
     return;
   }
 
@@ -407,6 +514,7 @@ app.post("/api/agent/run", requireLocalToken, async (request, response) => {
   try {
     for await (const event of runAgentStream({
       prompt,
+      attachments,
       conversationId: typeof request.body.conversationId === "string" ? request.body.conversationId : undefined,
       mode: parseMode(request.body.mode),
       model: parseModel(request.body.model),

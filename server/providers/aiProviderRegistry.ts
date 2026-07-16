@@ -16,6 +16,19 @@ export interface PublicAiProvider extends Omit<AiProviderConfig, "apiKey"> {
   apiKeyPreview?: string;
 }
 
+export interface ProviderBalanceAmount {
+  currency: string;
+  amount: number;
+  grantedAmount?: number;
+  toppedUpAmount?: number;
+}
+
+export type ProviderBalanceResult =
+  | { status: "available"; source: string; balances: ProviderBalanceAmount[]; endpoint: string; checkedAt: string }
+  | { status: "unlimited"; source: string; endpoint: string; checkedAt: string }
+  | { status: "unsupported"; source: string; reason: string; checkedAt: string }
+  | { status: "unavailable"; source: string; error: string; endpoint?: string; checkedAt: string };
+
 const knownCompatSuffixes = [
   "/api/claudecode",
   "/api/anthropic",
@@ -35,7 +48,7 @@ function previewSecret(value: string | undefined) {
 }
 
 function resolveProviderApiKey(provider: Pick<AiProviderConfig, "apiKey" | "apiKeyEnv">) {
-  return provider.apiKey || (provider.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined) || process.env.AI_API_KEY;
+  return provider.apiKey || (provider.apiKeyEnv ? process.env[provider.apiKeyEnv] : process.env.AI_API_KEY);
 }
 
 function providerEntryToConfig(id: string, provider: ProviderEntry, source: "builtin" | "user"): AiProviderConfig {
@@ -48,6 +61,7 @@ function providerEntryToConfig(id: string, provider: ProviderEntry, source: "bui
     apiKeyEnv: provider.apiKeyEnv,
     chatCompletionsPath: provider.chatCompletionsPath,
     modelsPath: provider.modelsPath,
+    balancePath: provider.balancePath,
     defaultModel: provider.defaultModel,
     fallbackModels: provider.fallbackModels,
     enabled: provider.enabled !== false,
@@ -100,6 +114,7 @@ export function normalizeAiProviderInput(input: Partial<AiProviderConfig>) {
       ? input.chatCompletionsPath.trim()
       : "/chat/completions",
     modelsPath: typeof input.modelsPath === "string" && input.modelsPath.trim() ? input.modelsPath.trim() : "/models",
+    balancePath: typeof input.balancePath === "string" && input.balancePath.trim() ? input.balancePath.trim() : undefined,
     defaultModel,
     fallbackModels: Array.isArray(input.fallbackModels) ? input.fallbackModels.map(String).filter(Boolean) : [],
     enabled: input.enabled !== false,
@@ -108,7 +123,12 @@ export function normalizeAiProviderInput(input: Partial<AiProviderConfig>) {
 }
 
 export function saveAiProvider(input: Partial<AiProviderConfig>) {
-  const provider = saveUserAiProvider(normalizeAiProviderInput(input));
+  const normalized = normalizeAiProviderInput(input);
+  const existing = getUserAiProvider(normalized.id);
+  const provider = saveUserAiProvider({
+    ...normalized,
+    apiKey: normalized.apiKey ?? existing?.apiKey
+  });
   reloadRuntimeConfig();
   return provider;
 }
@@ -172,6 +192,161 @@ function resolveProviderForTest(id: string): AiProviderConfig {
   const userProvider = getUserAiProvider(id);
   if (userProvider) return userProvider;
   throw new Error(`AI provider "${id}" was not found`);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function asFiniteNumber(value: unknown): number | undefined {
+  const number = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : Number.NaN;
+  return Number.isFinite(number) ? number : undefined;
+}
+
+function readCurrency(record: Record<string, unknown>) {
+  const value = record.currency ?? record.currency_code ?? record.unit;
+  return typeof value === "string" && value.trim() ? value.trim().toUpperCase() : "USD";
+}
+
+export function normalizeProviderBalanceResponse(payload: unknown):
+  | { status: "available"; balances: ProviderBalanceAmount[] }
+  | { status: "unlimited" }
+  | undefined {
+  const root = asRecord(payload);
+  if (!root) return undefined;
+  const data = asRecord(root.data) ?? root;
+  const balanceInfos = Array.isArray(root.balance_infos)
+    ? root.balance_infos
+    : Array.isArray(data.balance_infos)
+      ? data.balance_infos
+      : undefined;
+  if (balanceInfos) {
+    const balances = balanceInfos.flatMap((item) => {
+      const record = asRecord(item);
+      const amount = record ? asFiniteNumber(record.total_balance ?? record.available_balance ?? record.balance) : undefined;
+      if (!record || amount === undefined) return [];
+      return [{
+        currency: readCurrency(record),
+        amount,
+        grantedAmount: asFiniteNumber(record.granted_balance),
+        toppedUpAmount: asFiniteNumber(record.topped_up_balance)
+      }];
+    });
+    if (balances.length > 0) return { status: "available", balances };
+  }
+
+  if (("limit_remaining" in data && data.limit_remaining === null) || ("remaining" in data && data.remaining === null)) {
+    return { status: "unlimited" };
+  }
+
+  const limitRemaining = asFiniteNumber(data.limit_remaining);
+  if (limitRemaining !== undefined) {
+    return { status: "available", balances: [{ currency: readCurrency(data), amount: limitRemaining }] };
+  }
+
+  const totalCredits = asFiniteNumber(data.total_credits);
+  const totalUsage = asFiniteNumber(data.total_usage);
+  if (totalCredits !== undefined && totalUsage !== undefined) {
+    return { status: "available", balances: [{ currency: readCurrency(data), amount: Math.max(0, totalCredits - totalUsage) }] };
+  }
+
+  const amount = asFiniteNumber(
+    data.total_balance ??
+    data.available_balance ??
+    data.remaining_balance ??
+    data.credit_balance ??
+    data.balance ??
+    data.remaining ??
+    data.credits
+  );
+  if (amount === undefined) return undefined;
+  return { status: "available", balances: [{ currency: readCurrency(data), amount }] };
+}
+
+function inferProviderBalanceUrl(provider: AiProviderConfig) {
+  const explicitPath = provider.balancePath?.trim();
+  if (explicitPath) {
+    return {
+      url: /^https?:\/\//i.test(explicitPath)
+        ? explicitPath
+        : `${provider.baseUrl.replace(/\/+$/, "")}/${explicitPath.replace(/^\/+/, "")}`,
+      inferred: false
+    };
+  }
+  let base: URL;
+  try {
+    base = new URL(provider.baseUrl);
+  } catch {
+    return undefined;
+  }
+  if (base.hostname === "api.deepseek.com" || base.hostname.endsWith(".deepseek.com")) {
+    return { url: `${base.origin}/user/balance`, inferred: true };
+  }
+  if (base.hostname === "openrouter.ai" || base.hostname.endsWith(".openrouter.ai")) {
+    return { url: `${base.origin}/api/v1/key`, inferred: true };
+  }
+  return undefined;
+}
+
+export async function fetchProviderBalance(id: string): Promise<ProviderBalanceResult> {
+  const provider = resolveProviderForTest(id);
+  const checkedAt = new Date().toISOString();
+  const apiKey = resolveProviderApiKey(provider);
+  if (!apiKey) {
+    return { status: "unavailable", source: provider.id, error: "未配置 API Key", checkedAt };
+  }
+  const request = inferProviderBalanceUrl(provider);
+  if (!request) {
+    return {
+      status: "unsupported",
+      source: provider.id,
+      reason: "该上游未公开余额接口，可在高级设置中配置余额路径",
+      checkedAt
+    };
+  }
+  try {
+    const response = await fetch(request.url, {
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${apiKey}`,
+        "user-agent": "Rcode"
+      },
+      signal: AbortSignal.timeout(12000)
+    });
+    if (!response.ok) {
+      if (request.inferred && (response.status === 404 || response.status === 405)) {
+        return { status: "unsupported", source: provider.id, reason: "上游未开放余额查询", checkedAt };
+      }
+      return {
+        status: "unavailable",
+        source: provider.id,
+        error: `上游余额接口返回 HTTP ${response.status}`,
+        endpoint: request.url,
+        checkedAt
+      };
+    }
+    const parsed = normalizeProviderBalanceResponse(await response.json());
+    if (!parsed) {
+      return {
+        status: "unavailable",
+        source: provider.id,
+        error: "无法识别上游余额响应",
+        endpoint: request.url,
+        checkedAt
+      };
+    }
+    return { ...parsed, source: provider.id, endpoint: request.url, checkedAt };
+  } catch (error) {
+    return {
+      status: "unavailable",
+      source: provider.id,
+      error: error instanceof Error ? error.message : "上游余额查询失败",
+      endpoint: request.url,
+      checkedAt
+    };
+  }
 }
 
 async function fetchModelsForConfig(provider: AiProviderConfig) {
@@ -240,6 +415,7 @@ export async function fetchModelsForDraft(input: Partial<AiProviderConfig>) {
     apiKeyEnv: typeof input.apiKeyEnv === "string" && input.apiKeyEnv.trim() ? input.apiKeyEnv.trim() : undefined,
     chatCompletionsPath: typeof input.chatCompletionsPath === "string" && input.chatCompletionsPath.trim() ? input.chatCompletionsPath.trim() : "/chat/completions",
     modelsPath: typeof input.modelsPath === "string" && input.modelsPath.trim() ? input.modelsPath.trim() : "/models",
+    balancePath: typeof input.balancePath === "string" && input.balancePath.trim() ? input.balancePath.trim() : undefined,
     defaultModel: typeof input.defaultModel === "string" ? input.defaultModel.trim() : "",
     fallbackModels: [],
     enabled: true,

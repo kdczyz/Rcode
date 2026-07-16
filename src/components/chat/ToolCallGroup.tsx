@@ -5,6 +5,7 @@ import {
   FilePenLine,
   FileText,
   LoaderCircle,
+  Puzzle,
   Search,
   Square,
   TerminalSquare,
@@ -61,6 +62,7 @@ interface ToolCallGroupProps {
   addedLines: number;
   removedLines: number;
   isDiffEstimate: boolean;
+  activeSkills: Array<{ name: string; label: string }>;
   activityGroups: ToolActivityGroupView[];
   onClosed: (groupId: string) => void;
   onStopProcess?: (processId: string) => Promise<void>;
@@ -210,7 +212,20 @@ export function ToolCallGroup(props: ToolCallGroupProps) {
           {props.isRunning ? <LoaderCircle size={16} className="toolStatusSpinner" /> : <CategoryIcon category={primaryCategory} size={16} />}
         </span>
         <span className="toolToggleCopy">
-          <span className="toolToggleTitleLine"><span className="toolToggleText">{props.label}</span><span className="toolCallCount">{totalCalls} 次调用</span></span>
+          <span className="toolToggleTitleLine">
+            <span className="toolToggleText">{props.label}</span>
+            <span className="toolCallCount">{totalCalls} 次调用</span>
+            {props.activeSkills.length > 0 && (
+              <span className="toolSkillBadges" aria-label={`当前调用 Skill：${props.activeSkills.map((skill) => skill.label).join("、")}`}>
+                <span className="toolSkillLead"><Puzzle size={11} />Skill</span>
+                {props.activeSkills.map((skill) => (
+                  <span className={`toolSkillBadge ${skill.name === "auto-learning" ? "background" : ""}`} key={skill.name} title={`$${skill.name}`}>
+                    {skill.label}
+                  </span>
+                ))}
+              </span>
+            )}
+          </span>
           {props.detail && <span className="toolToggleDetail">{props.detail}</span>}
         </span>
         {(props.addedLines > 0 || props.removedLines > 0) && (

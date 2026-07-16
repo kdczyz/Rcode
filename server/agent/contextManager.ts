@@ -1,7 +1,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { listMemories } from "../storage/database";
+import { listLearningRecords, listMemories } from "../storage/database";
 import { getWorkspaceRoot } from "../security/sandbox";
 import { activateSkills } from "./skills";
 import type { AgentMessage, ContextSnapshot } from "../shared/types";
@@ -45,6 +45,11 @@ export async function buildProjectContextBundle(projectPath?: string, prompt = "
   const rules = await readRuleFiles(workspaceRoot);
   const memories = listMemories(workspaceRoot, 12) as Array<{ kind: string; content: string }>;
   const memoryText = memories.map((memory) => `- [${memory.kind}] ${memory.content}`).join("\n").slice(0, 6000);
+  const learningRecords = listLearningRecords(workspaceRoot, 12);
+  const learningText = learningRecords
+    .map((record) => `- [${record.category}] ${record.title}: ${record.insight}`)
+    .join("\n")
+    .slice(0, 7000);
   const skills = prompt ? await activateSkills(prompt, projectPath) : [];
   const skillText = skills.map((skill) => [
     `Skill $${skill.name}: ${skill.description}`,
@@ -55,6 +60,7 @@ export async function buildProjectContextBundle(projectPath?: string, prompt = "
     agentsMd ? `AGENTS.md guidance:\n${agentsMd}` : "",
     rules ? `.agent/rules guidance:\n${rules}` : "",
     memoryText ? `Project memory:\n${memoryText}` : "",
+    learningText ? `Verified learning records:\n${learningText}` : "",
     skillText ? `Activated skills:\n${skillText}` : ""
   ].filter(Boolean);
   return {
@@ -71,7 +77,11 @@ export function estimateMessageTokens(message: AgentMessage): number {
   const toolCallChars = message.toolCalls
     ? message.toolCalls.reduce((total, toolCall) => total + toolCall.name.length + JSON.stringify(toolCall.arguments).length, 0)
     : 0;
-  return Math.max(1, Math.ceil((message.content.length + toolCallChars) / 4) + 8);
+  const attachmentTokens = message.attachments?.reduce((total, attachment) => {
+    if (attachment.text !== undefined) return total + Math.ceil(attachment.text.length / 4);
+    return total + (attachment.kind === "image" ? 850 : 1_200);
+  }, 0) ?? 0;
+  return Math.max(1, Math.ceil((message.content.length + toolCallChars) / 4) + attachmentTokens + 8);
 }
 
 function truncateToolMessage(message: AgentMessage): AgentMessage {

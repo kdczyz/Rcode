@@ -1,8 +1,8 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { AgentMessage, PendingApproval, PermissionRule, ToolCall, ToolResult } from "../shared/types";
+import type { AgentAttachment, AgentMessage, LearningRunStatus, PendingApproval, PermissionRule, ToolCall, ToolResult } from "../shared/types";
 
 interface ConversationRow {
   id: string;
@@ -17,6 +17,7 @@ interface MessageRow {
   content: string;
   tool_call_id: string | null;
   tool_calls_json: string | null;
+  attachments_json: string | null;
 }
 
 type UsageEventType = "prompt" | "ai_call";
@@ -32,6 +33,8 @@ export interface AgentUsageEventInput {
   completionTokens?: number;
   totalTokens?: number;
   cachedTokens?: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
   sessionWasExisting?: boolean;
 }
 
@@ -41,6 +44,8 @@ export interface AgentUsageSummary {
     completionTokens: number;
     totalTokens: number;
     cachedTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
   };
   prompts: {
     total: number;
@@ -74,6 +79,8 @@ export interface AgentUsageSummary {
     completionTokens: number;
     totalTokens: number;
     cachedTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
     sessionWasExisting?: boolean;
   }>;
 }
@@ -86,6 +93,48 @@ export interface StoredConversation {
   updatedAt: string;
   messages: AgentMessage[];
   pendingApprovals: PendingApproval[];
+}
+
+export type LearningRecordCategory = "preference" | "project" | "pattern" | "bugfix" | "workflow";
+
+export interface LearningRecordInput {
+  projectPath: string;
+  conversationId?: string;
+  title: string;
+  insight: string;
+  category?: LearningRecordCategory;
+  evidence?: string;
+  importance?: number;
+  dedupeKey?: string;
+  source?: "agent" | "automatic" | "manual";
+  confidence?: number;
+}
+
+export interface LearningRecord {
+  id: string;
+  projectPath: string;
+  conversationId?: string;
+  title: string;
+  insight: string;
+  category: LearningRecordCategory;
+  evidence?: string;
+  importance: number;
+  dedupeKey?: string;
+  source: "agent" | "automatic" | "manual";
+  confidence: number;
+  confirmationCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LearningRun {
+  id: string;
+  projectPath: string;
+  conversationId?: string;
+  status: LearningRunStatus;
+  reason: string;
+  recordsSaved: number;
+  createdAt: string;
 }
 
 export interface AuditEvent {
@@ -118,10 +167,12 @@ export interface McpServerConfig {
   command?: string;
   args?: string[];
   url?: string;
+  bearerTokenEnvVar?: string;
+  oauthClientId?: string;
   enabled: boolean;
   defaultApproval: "allow" | "ask" | "deny";
   instructions?: string;
-  tools?: Array<{ name: string; description?: string; enabled?: boolean; approvalMode?: "allow" | "ask" | "deny" }>;
+  tools?: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown>; enabled?: boolean; approvalMode?: "allow" | "ask" | "deny" }>;
 }
 
 export interface AiProviderConfig {
@@ -133,6 +184,7 @@ export interface AiProviderConfig {
   apiKeyEnv?: string;
   chatCompletionsPath?: string;
   modelsPath?: string;
+  balancePath?: string;
   defaultModel: string;
   fallbackModels?: string[];
   enabled: boolean;
@@ -164,6 +216,7 @@ function getDatabase() {
       content TEXT NOT NULL,
       tool_call_id TEXT,
       tool_calls_json TEXT,
+      attachments_json TEXT,
       created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS approvals (
@@ -236,6 +289,34 @@ function getDatabase() {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS learning_records (
+      id TEXT PRIMARY KEY,
+      project_path TEXT NOT NULL,
+      conversation_id TEXT,
+      title TEXT NOT NULL,
+      insight TEXT NOT NULL,
+      category TEXT NOT NULL,
+      evidence TEXT,
+      importance INTEGER NOT NULL DEFAULT 2,
+      fingerprint TEXT NOT NULL,
+      dedupe_key TEXT,
+      source TEXT NOT NULL DEFAULT 'agent',
+      confidence REAL NOT NULL DEFAULT 1,
+      confirmation_count INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS learning_records_project_fingerprint
+      ON learning_records(project_path, fingerprint);
+    CREATE TABLE IF NOT EXISTS learning_runs (
+      id TEXT PRIMARY KEY,
+      project_path TEXT NOT NULL,
+      conversation_id TEXT,
+      status TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      records_saved INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS artifacts (
       id TEXT PRIMARY KEY,
       conversation_id TEXT,
@@ -257,10 +338,33 @@ function getDatabase() {
       completion_tokens INTEGER NOT NULL DEFAULT 0,
       total_tokens INTEGER NOT NULL DEFAULT 0,
       cached_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
       session_was_existing INTEGER
     );
   `);
   migrateDatabase(database);
+  const githubPreset: McpServerConfig = {
+    id: "github",
+    name: "GitHub",
+    transport: "http",
+    url: "https://api.githubcopilot.com/mcp/",
+    bearerTokenEnvVar: "GITHUB_PERSONAL_ACCESS_TOKEN",
+    enabled: false,
+    defaultApproval: "ask",
+    instructions: "GitHub 官方远程 MCP。启用前请在 .env.local 中配置 GITHUB_PERSONAL_ACCESS_TOKEN。",
+    tools: []
+  };
+  database.prepare(`
+    INSERT OR IGNORE INTO mcp_servers (id, name, config_json, enabled, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(
+    githubPreset.id,
+    githubPreset.name,
+    JSON.stringify(githubPreset),
+    0,
+    new Date().toISOString()
+  );
   return database;
 }
 
@@ -276,6 +380,7 @@ function migrateDatabase(db: DatabaseSync) {
   tryExec(db, "DROP TABLE IF EXISTS auth_sessions");
   tryExec(db, "DROP TABLE IF EXISTS users");
   tryExec(db, "ALTER TABLE approvals ADD COLUMN remaining_tool_queue_json TEXT");
+  tryExec(db, "ALTER TABLE messages ADD COLUMN attachments_json TEXT");
   tryExec(db, "ALTER TABLE approvals ADD COLUMN resume_input_json TEXT");
   tryExec(db, "ALTER TABLE approvals ADD COLUMN conversation_snapshot_id TEXT");
   tryExec(db, "ALTER TABLE audit_events ADD COLUMN executor_kind TEXT");
@@ -284,6 +389,14 @@ function migrateDatabase(db: DatabaseSync) {
   tryExec(db, "ALTER TABLE audit_events ADD COLUMN network_risk INTEGER");
   tryExec(db, "ALTER TABLE audit_events ADD COLUMN outside_workspace_risk INTEGER");
   tryExec(db, "ALTER TABLE audit_events ADD COLUMN artifact_ids_json TEXT");
+  tryExec(db, "ALTER TABLE learning_records ADD COLUMN dedupe_key TEXT");
+  tryExec(db, "ALTER TABLE learning_records ADD COLUMN source TEXT NOT NULL DEFAULT 'agent'");
+  tryExec(db, "ALTER TABLE learning_records ADD COLUMN confidence REAL NOT NULL DEFAULT 1");
+  tryExec(db, "ALTER TABLE learning_records ADD COLUMN confirmation_count INTEGER NOT NULL DEFAULT 1");
+  tryExec(db, "ALTER TABLE agent_usage_events ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0");
+  tryExec(db, "ALTER TABLE agent_usage_events ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0");
+  tryExec(db, "UPDATE agent_usage_events SET cache_read_tokens = cached_tokens WHERE cache_read_tokens = 0 AND cached_tokens > 0");
+  tryExec(db, "CREATE UNIQUE INDEX IF NOT EXISTS learning_records_project_dedupe_key ON learning_records(project_path, dedupe_key) WHERE dedupe_key IS NOT NULL");
 }
 
 function jsonParse<T>(value: string | null | undefined, fallback: T): T {
@@ -325,7 +438,7 @@ export function getOrCreateConversation(input: {
   }
 
   const messageRows = db.prepare(`
-    SELECT role, content, tool_call_id, tool_calls_json
+    SELECT role, content, tool_call_id, tool_calls_json, attachments_json
     FROM messages
     WHERE conversation_id = ?
     ORDER BY id ASC
@@ -354,7 +467,8 @@ export function getOrCreateConversation(input: {
       role: message.role,
       content: message.content,
       toolCallId: message.tool_call_id ?? undefined,
-      toolCalls: jsonParse<ToolCall[] | undefined>(message.tool_calls_json, undefined)
+      toolCalls: jsonParse<ToolCall[] | undefined>(message.tool_calls_json, undefined),
+      attachments: jsonParse<AgentAttachment[] | undefined>(message.attachments_json, undefined)
     })),
     pendingApprovals: approvals.map((approval) => ({
       id: approval.id,
@@ -396,14 +510,15 @@ export function appendConversationMessage(conversationId: string, message: Agent
   const db = getDatabase();
   const now = new Date().toISOString();
   db.prepare(`
-    INSERT INTO messages (conversation_id, role, content, tool_call_id, tool_calls_json, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO messages (conversation_id, role, content, tool_call_id, tool_calls_json, attachments_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(
     conversationId,
     message.role,
     message.content,
     message.toolCallId ?? null,
     message.toolCalls ? JSON.stringify(message.toolCalls) : null,
+    message.attachments ? JSON.stringify(message.attachments) : null,
     now
   );
   db.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?").run(now, conversationId);
@@ -556,9 +671,9 @@ export function recordAgentUsageEvent(event: AgentUsageEventInput) {
     INSERT INTO agent_usage_events (
       id, created_at, event_type, project_path, conversation_id, request_id,
       model, provider, prompt_tokens, completion_tokens, total_tokens,
-      cached_tokens, session_was_existing
+      cached_tokens, cache_read_tokens, cache_creation_tokens, session_was_existing
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     createdAt,
@@ -571,7 +686,9 @@ export function recordAgentUsageEvent(event: AgentUsageEventInput) {
     toSafeInteger(event.promptTokens),
     toSafeInteger(event.completionTokens),
     toSafeInteger(event.totalTokens),
-    toSafeInteger(event.cachedTokens),
+    toSafeInteger(event.cacheReadTokens ?? event.cachedTokens),
+    toSafeInteger(event.cacheReadTokens ?? event.cachedTokens),
+    toSafeInteger(event.cacheCreationTokens),
     typeof event.sessionWasExisting === "boolean" ? (event.sessionWasExisting ? 1 : 0) : null
   );
   return id;
@@ -584,14 +701,16 @@ export function getAgentUsageSummary(): AgentUsageSummary {
       COALESCE(SUM(prompt_tokens), 0) AS promptTokens,
       COALESCE(SUM(completion_tokens), 0) AS completionTokens,
       COALESCE(SUM(total_tokens), 0) AS totalTokens,
-      COALESCE(SUM(cached_tokens), 0) AS cachedTokens,
+      COALESCE(SUM(cache_read_tokens), 0) AS cacheReadTokens,
+      COALESCE(SUM(cache_creation_tokens), 0) AS cacheCreationTokens,
       COALESCE(SUM(CASE WHEN event_type = 'ai_call' THEN 1 ELSE 0 END), 0) AS aiCalls
     FROM agent_usage_events
   `).get() as {
     promptTokens: number;
     completionTokens: number;
     totalTokens: number;
-    cachedTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
     aiCalls: number;
   };
   const prompts = db.prepare(`
@@ -655,6 +774,8 @@ export function getAgentUsageSummary(): AgentUsageSummary {
     completion_tokens: number;
     total_tokens: number;
     cached_tokens: number;
+    cache_read_tokens: number;
+    cache_creation_tokens: number;
     session_was_existing: number | null;
   }>;
 
@@ -663,7 +784,9 @@ export function getAgentUsageSummary(): AgentUsageSummary {
       promptTokens: totals.promptTokens,
       completionTokens: totals.completionTokens,
       totalTokens: totals.totalTokens,
-      cachedTokens: totals.cachedTokens
+      cachedTokens: totals.cacheReadTokens,
+      cacheReadTokens: totals.cacheReadTokens,
+      cacheCreationTokens: totals.cacheCreationTokens
     },
     prompts: {
       total: prompts.total,
@@ -685,6 +808,8 @@ export function getAgentUsageSummary(): AgentUsageSummary {
       completionTokens: row.completion_tokens,
       totalTokens: row.total_tokens,
       cachedTokens: row.cached_tokens,
+      cacheReadTokens: row.cache_read_tokens,
+      cacheCreationTokens: row.cache_creation_tokens,
       sessionWasExisting: row.session_was_existing === null ? undefined : row.session_was_existing === 1
     }))
   };
@@ -830,6 +955,202 @@ export function saveMemory(projectPath: string, kind: string, content: string, i
 
 export function deleteMemory(id: string) {
   getDatabase().prepare("DELETE FROM memories WHERE id = ?").run(id);
+}
+
+const learningCategories = new Set<LearningRecordCategory>(["preference", "project", "pattern", "bugfix", "workflow"]);
+
+function normalizeLearningText(value: string, maxLength: number) {
+  return value.trim().replace(/\s+/g, " ").slice(0, maxLength);
+}
+
+function learningFingerprint(title: string, insight: string) {
+  const normalized = `${title}\n${insight}`.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  return createHash("sha256").update(normalized).digest("hex").slice(0, 32);
+}
+
+function normalizeLearningDedupeKey(value: string | undefined) {
+  if (!value) return "";
+  return value
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 160);
+}
+
+function assertSafeLearningContent(content: string) {
+  const secretPattern = /(?:\bsk-[a-z0-9_-]{12,}|\bapi[_ -]?key\s*[:=]|\bauthorization\s*:\s*bearer|\bpassword\s*[:=]|\bcookie\s*:)/i;
+  if (secretPattern.test(content)) throw new Error("Learning records cannot contain credentials or authentication data");
+}
+
+function mapLearningRecord(row: Record<string, unknown>): LearningRecord {
+  return {
+    id: String(row.id),
+    projectPath: String(row.project_path),
+    conversationId: row.conversation_id ? String(row.conversation_id) : undefined,
+    title: String(row.title),
+    insight: String(row.insight),
+    category: String(row.category) as LearningRecordCategory,
+    evidence: row.evidence ? String(row.evidence) : undefined,
+    importance: Number(row.importance),
+    dedupeKey: row.dedupe_key ? String(row.dedupe_key) : undefined,
+    source: (row.source ? String(row.source) : "agent") as LearningRecord["source"],
+    confidence: Number(row.confidence ?? 1),
+    confirmationCount: Number(row.confirmation_count ?? 1),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at)
+  };
+}
+
+export function listLearningRecords(projectPath: string, limit = 100): LearningRecord[] {
+  const rows = getDatabase().prepare(`
+    SELECT id, project_path, conversation_id, title, insight, category, evidence, importance,
+           dedupe_key, source, confidence, confirmation_count, created_at, updated_at
+    FROM learning_records
+    WHERE project_path = ?
+    ORDER BY importance DESC, updated_at DESC
+    LIMIT ?
+  `).all(projectPath, Math.max(1, Math.min(limit, 500))) as unknown as Array<Record<string, unknown>>;
+  return rows.map(mapLearningRecord);
+}
+
+export function saveLearningRecord(input: LearningRecordInput): LearningRecord {
+  const projectPath = input.projectPath.trim();
+  const title = normalizeLearningText(input.title, 120);
+  const insight = normalizeLearningText(input.insight, 1200);
+  const evidence = input.evidence ? normalizeLearningText(input.evidence, 600) : "";
+  if (!projectPath || !title || !insight) throw new Error("projectPath, title, and insight are required");
+  assertSafeLearningContent(`${title}\n${insight}\n${evidence}`);
+  const category = input.category && learningCategories.has(input.category) ? input.category : "pattern";
+  const importance = Math.max(1, Math.min(5, Math.round(input.importance ?? 2)));
+  const dedupeKey = normalizeLearningDedupeKey(input.dedupeKey);
+  const source = input.source === "automatic" || input.source === "manual" ? input.source : "agent";
+  const confidence = Math.max(0, Math.min(1, Number.isFinite(input.confidence) ? input.confidence! : 1));
+  const fingerprint = learningFingerprint(title, insight);
+  const db = getDatabase();
+  const existing = dedupeKey
+    ? db.prepare(`
+        SELECT id FROM learning_records
+        WHERE project_path = ? AND (dedupe_key = ? OR fingerprint = ?)
+      `).get(projectPath, dedupeKey, fingerprint) as { id: string } | undefined
+    : db.prepare(`
+        SELECT id FROM learning_records WHERE project_path = ? AND fingerprint = ?
+      `).get(projectPath, fingerprint) as { id: string } | undefined;
+  const now = new Date().toISOString();
+  const id = existing?.id ?? createId("learning");
+  if (existing) {
+    db.prepare(`
+      UPDATE learning_records
+      SET conversation_id = COALESCE(?, conversation_id), title = ?, insight = ?, category = ?,
+          evidence = ?, importance = MAX(importance, ?), dedupe_key = COALESCE(?, dedupe_key),
+          source = ?, confidence = MAX(confidence, ?), confirmation_count = confirmation_count + 1,
+          updated_at = ?
+      WHERE id = ?
+    `).run(
+      input.conversationId ?? null,
+      title,
+      insight,
+      category,
+      evidence || null,
+      importance,
+      dedupeKey || null,
+      source,
+      confidence,
+      now,
+      id
+    );
+  } else {
+    db.prepare(`
+      INSERT INTO learning_records
+        (id, project_path, conversation_id, title, insight, category, evidence, importance,
+         fingerprint, dedupe_key, source, confidence, confirmation_count, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    `).run(
+      id,
+      projectPath,
+      input.conversationId ?? null,
+      title,
+      insight,
+      category,
+      evidence || null,
+      importance,
+      fingerprint,
+      dedupeKey || null,
+      source,
+      confidence,
+      now,
+      now
+    );
+  }
+  const row = db.prepare(`
+    SELECT id, project_path, conversation_id, title, insight, category, evidence, importance,
+           dedupe_key, source, confidence, confirmation_count, created_at, updated_at
+    FROM learning_records WHERE id = ?
+  `).get(id) as unknown as Record<string, unknown>;
+  return mapLearningRecord(row);
+}
+
+export function deleteLearningRecord(id: string) {
+  getDatabase().prepare("DELETE FROM learning_records WHERE id = ?").run(id);
+}
+
+export function recordLearningRun(input: {
+  projectPath: string;
+  conversationId?: string;
+  status: LearningRunStatus;
+  reason: string;
+  recordsSaved?: number;
+}): LearningRun {
+  const run: LearningRun = {
+    id: createId("learning_run"),
+    projectPath: input.projectPath,
+    conversationId: input.conversationId,
+    status: input.status,
+    reason: normalizeLearningText(input.reason, 400),
+    recordsSaved: Math.max(0, Math.round(input.recordsSaved ?? 0)),
+    createdAt: new Date().toISOString()
+  };
+  getDatabase().prepare(`
+    INSERT INTO learning_runs (id, project_path, conversation_id, status, reason, records_saved, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    run.id,
+    run.projectPath,
+    run.conversationId ?? null,
+    run.status,
+    run.reason,
+    run.recordsSaved,
+    run.createdAt
+  );
+  return run;
+}
+
+export function getLatestLearningRun(projectPath: string): LearningRun | undefined {
+  const row = getDatabase().prepare(`
+    SELECT id, project_path, conversation_id, status, reason, records_saved, created_at
+    FROM learning_runs
+    WHERE project_path = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(projectPath) as {
+    id: string;
+    project_path: string;
+    conversation_id: string | null;
+    status: LearningRunStatus;
+    reason: string;
+    records_saved: number;
+    created_at: string;
+  } | undefined;
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    projectPath: row.project_path,
+    conversationId: row.conversation_id ?? undefined,
+    status: row.status,
+    reason: row.reason,
+    recordsSaved: row.records_saved,
+    createdAt: row.created_at
+  };
 }
 
 export function saveArtifact(input: { conversationId?: string; kind: string; label: string; content: string }) {
