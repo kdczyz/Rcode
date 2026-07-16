@@ -1,0 +1,20 @@
+{
+  "name": "rcode-remote-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --local",
+    "check": "wrangler types --check && tsc --noEmit",
+    "test": "vitest run --max-workers=1 --no-isolate",
+    "deploy": "wrangler deploy --minify",
+    "db:migrate:local": "wrangler d1 migrations apply rcode-remote-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply rcode-remote-db --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.18.5",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10",
+    "wrangler": "4.111.0"
+  }
+}
