@@ -29,6 +29,7 @@ export interface AgentUsageEventInput {
   requestId?: string;
   model?: string;
   provider?: string;
+  rawInputTokens?: number;
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
@@ -40,12 +41,15 @@ export interface AgentUsageEventInput {
 
 export interface AgentUsageSummary {
   totals: {
+    rawInputTokens: number;
     promptTokens: number;
     completionTokens: number;
     totalTokens: number;
     cachedTokens: number;
     cacheReadTokens: number;
     cacheCreationTokens: number;
+    realTotalTokens: number;
+    cacheHitRate: number;
   };
   prompts: {
     total: number;
@@ -75,6 +79,7 @@ export interface AgentUsageSummary {
     conversationId?: string;
     model?: string;
     provider?: string;
+    rawInputTokens: number;
     promptTokens: number;
     completionTokens: number;
     totalTokens: number;
@@ -334,12 +339,14 @@ function getDatabase() {
       request_id TEXT,
       model TEXT,
       provider TEXT,
+      raw_input_tokens INTEGER NOT NULL DEFAULT 0,
       prompt_tokens INTEGER NOT NULL DEFAULT 0,
       completion_tokens INTEGER NOT NULL DEFAULT 0,
       total_tokens INTEGER NOT NULL DEFAULT 0,
       cached_tokens INTEGER NOT NULL DEFAULT 0,
       cache_read_tokens INTEGER NOT NULL DEFAULT 0,
       cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+      input_token_semantics INTEGER NOT NULL DEFAULT 1,
       session_was_existing INTEGER
     );
   `);
@@ -395,7 +402,26 @@ function migrateDatabase(db: DatabaseSync) {
   tryExec(db, "ALTER TABLE learning_records ADD COLUMN confirmation_count INTEGER NOT NULL DEFAULT 1");
   tryExec(db, "ALTER TABLE agent_usage_events ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0");
   tryExec(db, "ALTER TABLE agent_usage_events ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0");
+  tryExec(db, "ALTER TABLE agent_usage_events ADD COLUMN raw_input_tokens INTEGER NOT NULL DEFAULT 0");
+  tryExec(db, "ALTER TABLE agent_usage_events ADD COLUMN input_token_semantics INTEGER NOT NULL DEFAULT 0");
   tryExec(db, "UPDATE agent_usage_events SET cache_read_tokens = cached_tokens WHERE cache_read_tokens = 0 AND cached_tokens > 0");
+  tryExec(db, `
+    UPDATE agent_usage_events
+    SET raw_input_tokens = prompt_tokens,
+        prompt_tokens = CASE
+          WHEN prompt_tokens >= cache_read_tokens + cache_creation_tokens
+          THEN prompt_tokens - cache_read_tokens - cache_creation_tokens
+          ELSE prompt_tokens
+        END,
+        total_tokens = CASE
+          WHEN prompt_tokens >= cache_read_tokens + cache_creation_tokens
+          THEN prompt_tokens - cache_read_tokens - cache_creation_tokens
+               + completion_tokens + cache_read_tokens + cache_creation_tokens
+          ELSE prompt_tokens + completion_tokens + cache_read_tokens + cache_creation_tokens
+        END,
+        input_token_semantics = 1
+    WHERE input_token_semantics = 0
+  `);
   tryExec(db, "CREATE UNIQUE INDEX IF NOT EXISTS learning_records_project_dedupe_key ON learning_records(project_path, dedupe_key) WHERE dedupe_key IS NOT NULL");
 }
 
@@ -670,10 +696,11 @@ export function recordAgentUsageEvent(event: AgentUsageEventInput) {
   getDatabase().prepare(`
     INSERT INTO agent_usage_events (
       id, created_at, event_type, project_path, conversation_id, request_id,
-      model, provider, prompt_tokens, completion_tokens, total_tokens,
-      cached_tokens, cache_read_tokens, cache_creation_tokens, session_was_existing
+      model, provider, raw_input_tokens, prompt_tokens, completion_tokens, total_tokens,
+      cached_tokens, cache_read_tokens, cache_creation_tokens, input_token_semantics,
+      session_was_existing
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     createdAt,
@@ -683,12 +710,14 @@ export function recordAgentUsageEvent(event: AgentUsageEventInput) {
     event.requestId ?? null,
     event.model ?? null,
     event.provider ?? null,
+    toSafeInteger(event.rawInputTokens ?? event.promptTokens),
     toSafeInteger(event.promptTokens),
     toSafeInteger(event.completionTokens),
     toSafeInteger(event.totalTokens),
     toSafeInteger(event.cacheReadTokens ?? event.cachedTokens),
     toSafeInteger(event.cacheReadTokens ?? event.cachedTokens),
     toSafeInteger(event.cacheCreationTokens),
+    1,
     typeof event.sessionWasExisting === "boolean" ? (event.sessionWasExisting ? 1 : 0) : null
   );
   return id;
@@ -698,6 +727,7 @@ export function getAgentUsageSummary(): AgentUsageSummary {
   const db = getDatabase();
   const totals = db.prepare(`
     SELECT
+      COALESCE(SUM(raw_input_tokens), 0) AS rawInputTokens,
       COALESCE(SUM(prompt_tokens), 0) AS promptTokens,
       COALESCE(SUM(completion_tokens), 0) AS completionTokens,
       COALESCE(SUM(total_tokens), 0) AS totalTokens,
@@ -706,6 +736,7 @@ export function getAgentUsageSummary(): AgentUsageSummary {
       COALESCE(SUM(CASE WHEN event_type = 'ai_call' THEN 1 ELSE 0 END), 0) AS aiCalls
     FROM agent_usage_events
   `).get() as {
+    rawInputTokens: number;
     promptTokens: number;
     completionTokens: number;
     totalTokens: number;
@@ -713,6 +744,8 @@ export function getAgentUsageSummary(): AgentUsageSummary {
     cacheCreationTokens: number;
     aiCalls: number;
   };
+  const cacheableInput = totals.promptTokens + totals.cacheReadTokens + totals.cacheCreationTokens;
+  const realTotalTokens = totals.promptTokens + totals.completionTokens + totals.cacheReadTokens + totals.cacheCreationTokens;
   const prompts = db.prepare(`
     SELECT
       COUNT(*) AS total,
@@ -770,23 +803,28 @@ export function getAgentUsageSummary(): AgentUsageSummary {
     conversation_id: string | null;
     model: string | null;
     provider: string | null;
+    raw_input_tokens: number;
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
     cached_tokens: number;
     cache_read_tokens: number;
     cache_creation_tokens: number;
+    input_token_semantics: number;
     session_was_existing: number | null;
   }>;
 
   return {
     totals: {
+      rawInputTokens: totals.rawInputTokens,
       promptTokens: totals.promptTokens,
       completionTokens: totals.completionTokens,
-      totalTokens: totals.totalTokens,
+      totalTokens: realTotalTokens,
       cachedTokens: totals.cacheReadTokens,
       cacheReadTokens: totals.cacheReadTokens,
-      cacheCreationTokens: totals.cacheCreationTokens
+      cacheCreationTokens: totals.cacheCreationTokens,
+      realTotalTokens,
+      cacheHitRate: cacheableInput > 0 ? totals.cacheReadTokens / cacheableInput : 0
     },
     prompts: {
       total: prompts.total,
@@ -804,6 +842,7 @@ export function getAgentUsageSummary(): AgentUsageSummary {
       conversationId: row.conversation_id ?? undefined,
       model: row.model ?? undefined,
       provider: row.provider ?? undefined,
+      rawInputTokens: row.raw_input_tokens,
       promptTokens: row.prompt_tokens,
       completionTokens: row.completion_tokens,
       totalTokens: row.total_tokens,

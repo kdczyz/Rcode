@@ -17,8 +17,12 @@ export interface ProviderUsagePayload {
 }
 
 export interface NormalizedProviderUsage {
+  /** Provider-reported input. OpenAI-compatible protocols include cache buckets here. */
+  rawInputTokens: number;
+  /** Newly processed input after cache read/write buckets are removed. */
   inputTokens: number;
   outputTokens: number;
+  /** Cache-normalized total: fresh input + output + cache read + cache creation. */
   totalTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
@@ -30,7 +34,7 @@ function safeTokenCount(value: number | undefined) {
 
 /** Normalize OpenAI Chat Completions and Responses-style usage payloads. */
 export function normalizeProviderUsage(usage: ProviderUsagePayload): NormalizedProviderUsage {
-  const inputTokens = safeTokenCount(usage.prompt_tokens ?? usage.input_tokens);
+  const rawInputTokens = safeTokenCount(usage.prompt_tokens ?? usage.input_tokens);
   const outputTokens = safeTokenCount(usage.completion_tokens ?? usage.output_tokens);
   const cacheReadTokens = safeTokenCount(
     usage.cache_read_input_tokens ??
@@ -42,11 +46,19 @@ export function normalizeProviderUsage(usage: ProviderUsagePayload): NormalizedP
     usage.input_tokens_details?.cache_write_tokens ??
     usage.prompt_tokens_details?.cache_write_tokens
   );
+  const cacheTokens = cacheReadTokens + cacheCreationTokens;
+  // Match CC Switch's defensive normalization: malformed providers that report
+  // cache buckets larger than total input keep their raw input instead of
+  // producing a negative fresh-input value.
+  const inputTokens = rawInputTokens >= cacheTokens
+    ? rawInputTokens - cacheTokens
+    : rawInputTokens;
 
   return {
+    rawInputTokens,
     inputTokens,
     outputTokens,
-    totalTokens: safeTokenCount(usage.total_tokens) || inputTokens + outputTokens,
+    totalTokens: inputTokens + outputTokens + cacheReadTokens + cacheCreationTokens,
     cacheReadTokens,
     cacheCreationTokens
   };
@@ -57,4 +69,9 @@ export function hasBillableProviderUsage(usage: NormalizedProviderUsage) {
     usage.outputTokens > 0 ||
     usage.cacheReadTokens > 0 ||
     usage.cacheCreationTokens > 0;
+}
+
+export function deriveCacheHitRate(usage: Pick<NormalizedProviderUsage, "inputTokens" | "cacheReadTokens" | "cacheCreationTokens">) {
+  const cacheableInput = usage.inputTokens + usage.cacheReadTokens + usage.cacheCreationTokens;
+  return cacheableInput > 0 ? usage.cacheReadTokens / cacheableInput : 0;
 }

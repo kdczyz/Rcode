@@ -5,7 +5,6 @@ import { evaluatePermission, type PermissionDecision } from "../security/permiss
 import { executeTool } from "../runtime/tools";
 import { runHooks } from "./hooks";
 import { runAutoLearning } from "./autoLearning";
-import { countMessageTokens } from "../providers/messageTokenizer";
 import { hasBillableProviderUsage, normalizeProviderUsage } from "../providers/providerUsage";
 import type { AgentAttachment, AgentMessage, PendingApproval, PermissionMode, StreamEvent, TaskPlan, ToolCall, ToolResult, ToolRisk } from "../shared/types";
 import {
@@ -160,8 +159,10 @@ async function* continueConversationStream(
 ): AsyncGenerator<StreamEvent> {
   let step = 0;
   let billedPromptTokens = 0;
+  let billedRawInputTokens = 0;
   let billedCompletionTokens = 0;
-  const inputTokenCount = await countMessageTokens(options.messageInput ?? "", options.model);
+  let billedCacheReadTokens = 0;
+  let billedCacheCreationTokens = 0;
   while (true) {
     if (step >= MAX_AGENT_STEPS) {
       throw new Error(`Agent reached the ${MAX_AGENT_STEPS}-step safety limit. Refine the task or continue in a new turn.`);
@@ -177,56 +178,22 @@ async function* continueConversationStream(
 
     let contentBuffer = "";
     let toolCalls: ToolCall[] = [];
-    let currentModel = options.model ?? "";
-    let currentProvider = "";
-    let hasEmittedInitialUsage = false;
-    let lastProgressChars = 0;
-    let lastProgressAt = 0;
-
-    const messageUsageEvent = async (type: "usage_progress" | "usage"): Promise<StreamEvent> => {
-      const completionTokenCount = await countMessageTokens(contentBuffer, currentModel || options.model);
-      return {
-        type,
-        usage: {
-          promptTokens: inputTokenCount.tokens,
-          completionTokens: completionTokenCount.tokens,
-          totalTokens: inputTokenCount.tokens + completionTokenCount.tokens,
-          estimated: !(inputTokenCount.exact && completionTokenCount.exact)
-        },
-        model: currentModel,
-        provider: currentProvider
-      };
-    };
 
     // 流式调用 AI，逐 token 输出（带 429 重试）
     let aiRetries = 0;
     let aiSuccess = false;
     while (aiRetries < 3 && !aiSuccess) {
       try {
-        for await (const event of callAiStream(conversation.messages, { ...options, mode })) {
+        for await (const event of callAiStream(conversation.messages, { ...options, mode, sessionId: conversation.id })) {
           if (event.type === "text_delta") {
             contentBuffer += event.content;
             yield { type: "text_delta", content: event.content };
-            if (!hasEmittedInitialUsage) {
-              hasEmittedInitialUsage = true;
-              yield await messageUsageEvent("usage_progress");
-            } else if (contentBuffer.length - lastProgressChars >= 24 || Date.now() - lastProgressAt >= 120) {
-              lastProgressChars = contentBuffer.length;
-              lastProgressAt = Date.now();
-              yield await messageUsageEvent("usage_progress");
-            }
           } else if (event.type === "context_snapshot") {
             yield { type: "context_snapshot", snapshot: event.snapshot };
-          } else if (event.type === "usage_progress") {
-            currentModel = event.model;
-            currentProvider = event.provider;
-            if (!hasEmittedInitialUsage) {
-              hasEmittedInitialUsage = true;
-              yield await messageUsageEvent("usage_progress");
-            }
           } else if (event.type === "usage") {
             const providerUsage = normalizeProviderUsage(event.usage);
             const usage = {
+              rawInputTokens: providerUsage.rawInputTokens,
               promptTokens: providerUsage.inputTokens,
               completionTokens: providerUsage.outputTokens,
               totalTokens: providerUsage.totalTokens,
@@ -234,16 +201,15 @@ async function* continueConversationStream(
               cacheReadTokens: providerUsage.cacheReadTokens,
               cacheCreationTokens: providerUsage.cacheCreationTokens
             };
-            currentModel = event.model;
-            currentProvider = event.provider;
             if (hasBillableProviderUsage(providerUsage)) {
               recordAgentUsageEvent({
                 eventType: "ai_call",
                 projectPath: options.projectPath,
                 conversationId: conversation.id,
-                requestId: options.requestId,
+                requestId: event.requestId,
                 model: event.model,
                 provider: event.provider,
+                rawInputTokens: usage.rawInputTokens,
                 promptTokens: usage.promptTokens,
                 completionTokens: usage.completionTokens,
                 totalTokens: usage.totalTokens,
@@ -252,15 +218,21 @@ async function* continueConversationStream(
                 cacheCreationTokens: usage.cacheCreationTokens
               });
             }
+            billedRawInputTokens += usage.rawInputTokens;
             billedPromptTokens += usage.promptTokens;
             billedCompletionTokens += usage.completionTokens;
+            billedCacheReadTokens += usage.cacheReadTokens;
+            billedCacheCreationTokens += usage.cacheCreationTokens;
             yield {
               type: "billing_usage",
               usage: {
-                ...usage,
+                rawInputTokens: billedRawInputTokens,
                 promptTokens: billedPromptTokens,
                 completionTokens: billedCompletionTokens,
-                totalTokens: billedPromptTokens + billedCompletionTokens
+                totalTokens: billedPromptTokens + billedCompletionTokens + billedCacheReadTokens + billedCacheCreationTokens,
+                cachedTokens: billedCacheReadTokens,
+                cacheReadTokens: billedCacheReadTokens,
+                cacheCreationTokens: billedCacheCreationTokens
               },
               model: event.model,
               provider: event.provider
@@ -289,10 +261,6 @@ async function* continueConversationStream(
         throw error;
       }
     }
-
-    // Always finish a model turn with the count for the visible message only.
-    // Upstream request-wide usage is emitted separately as billing_usage.
-    yield await messageUsageEvent("usage");
 
     console.log(`[Agent] AI returned: content=${contentBuffer.length}chars, toolCalls=${toolCalls.length}`);
 

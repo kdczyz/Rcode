@@ -222,31 +222,9 @@ export type StreamEvent =
   | { type: "task_plan"; plan: TaskPlan }
   | { type: "text_delta"; content: string }
   | {
-      type: "usage_progress";
-      usage: {
-        promptTokens: number;
-        completionTokens: number;
-        totalTokens: number;
-        estimated?: boolean;
-      };
-      model: string;
-      provider: string;
-    }
-  | {
-      type: "usage";
-      usage: {
-        promptTokens: number;
-        completionTokens: number;
-        totalTokens: number;
-        cachedTokens?: number;
-        estimated?: boolean;
-      };
-      model: string;
-      provider: string;
-    }
-  | {
       type: "billing_usage";
       usage: {
+        rawInputTokens: number;
         promptTokens: number;
         completionTokens: number;
         totalTokens: number;

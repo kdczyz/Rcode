@@ -146,6 +146,7 @@ export async function runAutoLearning(input: {
           requestId: input.requestId,
           model: extraction.model,
           provider: extraction.provider,
+          rawInputTokens: providerUsage.rawInputTokens,
           promptTokens: providerUsage.inputTokens,
           completionTokens: providerUsage.outputTokens,
           totalTokens: providerUsage.totalTokens,

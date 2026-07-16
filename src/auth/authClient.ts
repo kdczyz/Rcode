@@ -29,7 +29,7 @@ type AuthResponse = AuthSession & { token?: string };
 
 const webTokenKey = "rcode.auth.session.v1";
 const guestSessionKey = "rcode.auth.guest-session.v1";
-const defaultAuthApiUrl = "https://rcode-auth.kdczyz0728-994.workers.dev";
+const defaultAuthApiUrl = "https://rcode-remote-server.kdczyz0728-994.workers.dev";
 
 function authApiUrl() {
   return (import.meta.env.VITE_AUTH_API_URL || defaultAuthApiUrl).replace(/\/$/, "");

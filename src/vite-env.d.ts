@@ -27,6 +27,7 @@ interface Window {
     authLogin?: (details: { identifier: string; password: string }) => Promise<RcodeAuthSession>;
     authRegister?: (details: { email: string; username: string; displayName: string; password: string }) => Promise<RcodeAuthSession>;
     authLogout?: () => Promise<{ ok: boolean }>;
+    remoteUpdateDevice?: (details: { projectPath?: string; projectName?: string }) => Promise<{ ok: boolean }>;
     getThemePreference?: () => Promise<"system" | "dark" | "light" | undefined>;
     setThemePreference?: (themePreference: "system" | "dark" | "light") => Promise<"system" | "dark" | "light">;
     selectProjectFolder?: () => Promise<string | undefined>;

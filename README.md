@@ -178,7 +178,7 @@ Agent SSE 流除文本和工具事件外，还会返回 `workflow_state`、`cont
 
 ## Cloudflare 账号服务
 
-线上认证服务：`https://rcode-auth.kdczyz0728-994.workers.dev`
+线上认证与远程连接服务：`https://rcode-remote-server.kdczyz0728-994.workers.dev`
 
 ```bash
 npm run dev:auth             # 本地 Worker，端口 8788

@@ -46,14 +46,11 @@ import { listMcpTools, setMcpRuntimeBearerToken, testMcpServer, trustMcpServer }
 import { getProjectHookTrust } from "./agent/hooks";
 import { listSubagents } from "./agent/subagents";
 import { managedProcessManager } from "./runtime/processManager";
-import { warmMessageTokenizer } from "./providers/messageTokenizer";
 
 dotenv.config();
 if (existsSync(".env.local")) {
   dotenv.config({ path: ".env.local", override: true });
 }
-
-warmMessageTokenizer(process.env.AI_MODEL ?? getRuntimeConfig().provider.defaultModel);
 
 const app = express();
 const port = Number(process.env.PORT ?? 8787);

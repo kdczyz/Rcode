@@ -50,12 +50,6 @@ export interface AiTurn {
 
 export type AiUsage = ProviderUsagePayload;
 
-export interface AiUsageProgress {
-  prompt_tokens: number;
-  completion_tokens: number;
-  total_tokens: number;
-}
-
 export interface ApprovalAuditResult {
   allow: boolean;
   risk: ToolRisk;
@@ -348,6 +342,20 @@ function getConfig(modelOverride?: string) {
     temperature: runtimeConfig.temperature,
     maxTokens: runtimeConfig.maxTokens
   };
+}
+
+function supportsPromptCacheKey(baseUrl: string) {
+  try {
+    const url = new URL(baseUrl);
+    if (url.hostname === "api.openai.com") return true;
+    if (url.hostname === "api.kimi.com") {
+      const pathname = url.pathname.replace(/\/$/, "");
+      return pathname === "/coding" || pathname.startsWith("/coding/");
+    }
+  } catch {
+    return false;
+  }
+  return false;
 }
 
 function escapeAttachmentName(value: string) {
@@ -672,11 +680,10 @@ export async function callAi(
 /** Streaming AI call: yields text deltas token-by-token, returns tool calls at the end. */
 export async function* callAiStream(
   messages: AgentMessage[],
-  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; mode?: PermissionMode; signal?: AbortSignal } = {}
+  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; mode?: PermissionMode; sessionId?: string; signal?: AbortSignal } = {}
 ): AsyncGenerator<
   | { type: "text_delta"; content: string }
-  | { type: "usage_progress"; usage: AiUsageProgress; model: string; provider: string }
-  | { type: "usage"; usage: AiUsage; model: string; provider: string }
+  | { type: "usage"; usage: AiUsage; model: string; provider: string; requestId: string }
   | { type: "context_snapshot"; snapshot: ContextSnapshot }
   | { type: "tool_calls"; toolCalls: ToolCall[]; cleanContent?: string }
 > {
@@ -691,7 +698,7 @@ export async function* callAiStream(
   const providerContext = await toProviderMessages(messages, [], options.thinkingMode, options.projectPath, config.model, config.providerDisplayName, options.mode);
   yield { type: "context_snapshot", snapshot: providerContext.snapshot };
   const tools = await getToolsForMode(options.projectPath, options.mode);
-  const requestBody = {
+  const requestBody: Record<string, unknown> = {
     model: config.model,
     messages: providerContext.messages,
     tools,
@@ -701,75 +708,69 @@ export async function* callAiStream(
     stream: true,
     stream_options: { include_usage: true }
   };
-  // Streaming APIs normally return exact usage only in their final chunk. Send a
-  // stable local estimate first so the UI can update both counters while the
-  // response is still being generated, then replace it with exact usage later.
-  const estimatedPromptTokens = Math.max(
-    1,
-    Math.ceil(JSON.stringify({ messages: providerContext.messages, tools }).length / 4)
-  );
-  yield {
-    type: "usage_progress",
-    usage: {
-      prompt_tokens: estimatedPromptTokens,
-      completion_tokens: 0,
-      total_tokens: estimatedPromptTokens
-    },
-    model: config.model,
-    provider: config.providerDisplayName
-  };
 
-  let response = await fetch(`${config.baseUrl.replace(/\/$/, "")}${config.chatPath}`, {
+  // A stable session key improves upstream prefix-cache routing. Like CC
+  // Switch, auto mode is conservative: only endpoints known to accept this
+  // field receive it, and per-request random IDs are never used as cache keys.
+  if (options.sessionId && supportsPromptCacheKey(config.baseUrl)) {
+    requestBody.prompt_cache_key = options.sessionId;
+  }
+
+  const endpoint = `${config.baseUrl.replace(/\/$/, "")}${config.chatPath}`;
+  const sendRequest = (body: Record<string, unknown>) => fetch(endpoint, {
     method: "POST",
     signal: options.signal,
     headers: { "content-type": "application/json", authorization: `Bearer ${config.apiKey}` },
-    body: JSON.stringify(requestBody)
+    body: JSON.stringify(body)
   });
 
+  let activeRequestBody = requestBody;
+  let response = await sendRequest(activeRequestBody);
   if (!response.ok) {
-    const body = await response.text();
-    if ((response.status === 400 || response.status === 422) && /stream_options|include_usage/i.test(body)) {
-      const { stream_options: _streamOptions, ...fallbackBody } = requestBody;
-      response = await fetch(`${config.baseUrl.replace(/\/$/, "")}${config.chatPath}`, {
-        method: "POST",
-        signal: options.signal,
-        headers: { "content-type": "application/json", authorization: `Bearer ${config.apiKey}` },
-        body: JSON.stringify(fallbackBody)
-      });
-      if (response.ok) {
-        // This provider can stream, but it does not expose usage in streaming mode.
-      } else {
-        const fallbackErrorBody = await response.text();
-        throw new Error(`AI provider error ${response.status}: ${fallbackErrorBody.slice(0, 500)}`);
-      }
-    } else {
-      throw new Error(`AI provider error ${response.status}: ${body.slice(0, 500)}`);
+    const errorBody = await response.text();
+    const canRetry = response.status === 400 || response.status === 422;
+    const fallbackBody = { ...activeRequestBody };
+    let changed = false;
+    if (canRetry && /stream_options|include_usage/i.test(errorBody) && "stream_options" in fallbackBody) {
+      delete fallbackBody.stream_options;
+      changed = true;
+    }
+    if (canRetry && /prompt_cache_key/i.test(errorBody) && "prompt_cache_key" in fallbackBody) {
+      delete fallbackBody.prompt_cache_key;
+      changed = true;
+    }
+    if (!changed) {
+      throw new Error(`AI provider error ${response.status}: ${errorBody.slice(0, 500)}`);
+    }
+    activeRequestBody = fallbackBody;
+    response = await sendRequest(activeRequestBody);
+    if (!response.ok) {
+      const fallbackErrorBody = await response.text();
+      throw new Error(`AI provider error ${response.status}: ${fallbackErrorBody.slice(0, 500)}`);
     }
   }
 
-  const reader = response.body!.getReader();
+  if (!response.body) throw new Error("AI provider returned an empty streaming response");
+  const providerRequestId = nanoid();
+  const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let contentBuffer = "";
   const toolCallMap = new Map<number, { id: string; name: string; argsBuffer: string }>();
-  let lastEstimatedCompletionTokens = 0;
   let finalUsage: AiUsage | undefined;
 
   while (true) {
     const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
+    if (value) buffer += decoder.decode(value, { stream: true });
+    if (done) buffer += decoder.decode();
+    const lines = buffer.split(/\r?\n/);
+    buffer = done ? "" : (lines.pop() ?? "");
 
     for (const line of lines) {
       const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith("data: ")) continue;
-
-      const data = trimmed.slice(6);
-      if (data === "[DONE]") continue;
-
+      if (!trimmed.startsWith("data:")) continue;
+      const data = trimmed.slice(5).trimStart();
+      if (!data || data === "[DONE]") continue;
       try {
         const chunk = JSON.parse(data) as StreamChunk;
         if (chunk.usage) {
@@ -797,34 +798,19 @@ export async function* callAiStream(
             if (tc.function?.arguments) entry.argsBuffer += tc.function.arguments;
           }
         }
-
-        const streamedToolChars = [...toolCallMap.values()].reduce(
-          (total, entry) => total + entry.name.length + entry.argsBuffer.length,
-          0
-        );
-        const estimatedCompletionTokens = Math.max(
-          contentBuffer || streamedToolChars ? 1 : 0,
-          Math.ceil((contentBuffer.length + streamedToolChars) / 4)
-        );
-        if (estimatedCompletionTokens !== lastEstimatedCompletionTokens) {
-          lastEstimatedCompletionTokens = estimatedCompletionTokens;
-          yield {
-            type: "usage_progress",
-            usage: {
-              prompt_tokens: estimatedPromptTokens,
-              completion_tokens: estimatedCompletionTokens,
-              total_tokens: estimatedPromptTokens + estimatedCompletionTokens
-            },
-            model: config.model,
-            provider: config.providerDisplayName
-          };
-        }
-      } catch { /* ignore parse errors */ }
+      } catch { /* ignore non-JSON provider events */ }
     }
+    if (done) break;
   }
 
   if (finalUsage) {
-    yield { type: "usage", usage: finalUsage, model: config.model, provider: config.providerDisplayName };
+    yield {
+      type: "usage",
+      usage: finalUsage,
+      model: config.model,
+      provider: config.providerDisplayName,
+      requestId: providerRequestId
+    };
   }
 
   // Build final tool call list from accumulated deltas

@@ -90,16 +90,18 @@ interface ChatMessage {
   responseStartedAt?: number;
   responseCompletedAt?: number;
   usage?: {
+    rawInputTokens?: number;
     promptTokens: number;
     completionTokens: number;
     totalTokens: number;
     cachedTokens?: number;
+    cacheReadTokens?: number;
+    cacheCreationTokens?: number;
     billedPromptTokens?: number;
     billedCompletionTokens?: number;
     billedTotalTokens?: number;
     model?: string;
     provider?: string;
-    estimated?: boolean;
   };
 }
 
@@ -155,12 +157,15 @@ interface WorkspaceState {
 
 interface UsageSummary {
   totals: {
+    rawInputTokens: number;
     promptTokens: number;
     completionTokens: number;
     totalTokens: number;
     cachedTokens: number;
     cacheReadTokens: number;
     cacheCreationTokens: number;
+    realTotalTokens: number;
+    cacheHitRate: number;
   };
   prompts: {
     total: number;
@@ -188,6 +193,7 @@ interface UsageSummary {
     eventType: "prompt" | "ai_call";
     model?: string;
     provider?: string;
+    rawInputTokens: number;
     promptTokens: number;
     completionTokens: number;
     totalTokens: number;
@@ -360,7 +366,7 @@ interface TaskTimerState {
 
 /** SSE 流事件 */
 interface StreamEvent {
-  type: "run_started" | "workflow_state" | "context_snapshot" | "task_plan" | "text_delta" | "usage_progress" | "usage" | "billing_usage" | "tool_call" | "permission_decision" | "tool_result" | "diff_created" | "learning_result" | "approval_required" | "completed" | "error";
+  type: "run_started" | "workflow_state" | "context_snapshot" | "task_plan" | "text_delta" | "billing_usage" | "tool_call" | "permission_decision" | "tool_result" | "diff_created" | "learning_result" | "approval_required" | "completed" | "error";
   content?: string;
   toolCall?: { id: string; name: string; arguments: Record<string, unknown> };
   result?: { toolCallId: string; name: string; ok: boolean; content: string; diff?: DiffResult; diffs?: DiffResult[]; auditEventId?: string; exitCode?: number; process?: ManagedProcessView };
@@ -374,13 +380,13 @@ interface StreamEvent {
   plan?: TaskPlanView;
   snapshot?: ProjectSession["contextSnapshot"];
   usage?: {
+    rawInputTokens: number;
     promptTokens: number;
     completionTokens: number;
     totalTokens: number;
     cachedTokens?: number;
     cacheReadTokens?: number;
     cacheCreationTokens?: number;
-    estimated?: boolean;
   };
   model?: string;
   provider?: string;
@@ -2020,6 +2026,13 @@ export default function App() {
   }, [themePreference]);
 
   useEffect(() => {
+    void window.agentDesktop?.remoteUpdateDevice?.({
+      projectPath: activeProject?.path,
+      projectName: activeProject?.name
+    });
+  }, [activeProject?.name, activeProject?.path]);
+
+  useEffect(() => {
     void window.agentDesktop?.getThemePreference?.().then((saved) => {
       if (saved === "dark" || saved === "light" || saved === "system") {
         setThemePreference(saved);
@@ -2566,8 +2579,7 @@ export default function App() {
         promptTokens: 0,
         completionTokens: 0,
         totalTokens: 0,
-        model: modelName,
-        estimated: true
+        model: modelName
       };
       return [
         ...messages.map((message) =>
@@ -2794,30 +2806,6 @@ export default function App() {
           break;
         }
 
-        case "usage_progress":
-        case "usage":
-          if (event.usage) {
-            const isEstimated = event.usage.estimated ?? false;
-            updateSession(projectId, sessionId, (s) => ({
-              ...s,
-              messages: s.messages.map((message) =>
-                message.showResponseMeta
-                  ? {
-                      ...message,
-                      usage: {
-                        ...message.usage,
-                        ...event.usage!,
-                        model: event.model,
-                        provider: event.provider,
-                        estimated: message.usage?.billedTotalTokens !== undefined ? false : isEstimated
-                      }
-                    }
-                  : message
-              )
-            }));
-          }
-          break;
-
         case "billing_usage":
           if (event.usage) {
             updateSession(projectId, sessionId, (s) => ({
@@ -2835,9 +2823,12 @@ export default function App() {
                         billedPromptTokens: event.usage!.promptTokens,
                         billedCompletionTokens: event.usage!.completionTokens,
                         billedTotalTokens: event.usage!.totalTokens,
+                        rawInputTokens: event.usage!.rawInputTokens,
+                        cacheReadTokens: event.usage!.cacheReadTokens,
+                        cacheCreationTokens: event.usage!.cacheCreationTokens,
+                        cachedTokens: event.usage!.cacheReadTokens,
                         model: event.model,
                         provider: event.provider,
-                        estimated: false
                       }
                     }
                   : message
@@ -3013,7 +3004,7 @@ export default function App() {
         startedAt: requestStartedAt,
         showResponseMeta: true,
         responseStartedAt: requestStartedAt,
-        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, model: modelName, estimated: true }
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, model: modelName }
       }]
     }));
 
@@ -3143,7 +3134,7 @@ export default function App() {
         startedAt: requestStartedAt,
         showResponseMeta: true,
         responseStartedAt: requestStartedAt,
-        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, model: modelName, estimated: true }
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, model: modelName }
       }]
     }));
 
@@ -4610,7 +4601,17 @@ export default function App() {
 
     if (activeSettingsSection === "usage") {
       const usage = usageSummary ?? {
-        totals: { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+        totals: {
+          rawInputTokens: 0,
+          promptTokens: 0,
+          completionTokens: 0,
+          totalTokens: 0,
+          cachedTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          realTotalTokens: 0,
+          cacheHitRate: 0
+        },
         prompts: { total: 0, sessionHits: 0, hitRate: 0 },
         aiCalls: 0,
         byModel: [],
@@ -4627,14 +4628,19 @@ export default function App() {
             {renderUsageActivityPanel(usage)}
             <div className="usageOverviewGrid">
               <div className="usageMetric">
-                <span>总 Token</span>
-                <strong>{formatUsageNumber(usage.totals.totalTokens)}</strong>
-                <small>输入 {formatUsageNumber(usage.totals.promptTokens)} · 输出 {formatUsageNumber(usage.totals.completionTokens)}</small>
+                <span>真实消耗 Token</span>
+                <strong>{formatUsageNumber(usage.totals.realTotalTokens ?? usage.totals.totalTokens)}</strong>
+                <small>新增输入 {formatUsageNumber(usage.totals.promptTokens)} · 输出 {formatUsageNumber(usage.totals.completionTokens)}</small>
               </div>
               <div className="usageMetric">
                 <span>AI 调用</span>
                 <strong>{formatUsageNumber(usage.aiCalls)}</strong>
                 <small>已记录模型请求次数</small>
+              </div>
+              <div className="usageMetric">
+                <span>缓存命中率</span>
+                <strong>{((usage.totals.cacheHitRate ?? 0) * 100).toFixed(1)}%</strong>
+                <small>读取 /（新增输入 + 写入 + 读取）</small>
               </div>
               <div className="usageMetric">
                 <span>缓存 Token</span>
@@ -5040,15 +5046,15 @@ export default function App() {
                             ? 0
                             : message.usage?.completionTokens ?? 0;
                         const inputUsageTitle = hasProviderUsage
-                          ? "上游返回的真实输入 token（包含本次请求上下文）"
+                          ? `上游返回的新增输入 token；原始输入 ${formatUsageNumber(message.usage?.rawInputTokens ?? displayPromptTokens)}`
                           : message.status === "error"
                             ? "请求失败且上游未返回 usage，不计 token"
-                            : "生成期间的本条消息 token 估算，完成后由上游 usage 校准";
+                            : "等待上游返回 usage；不使用本地估算";
                         const outputUsageTitle = hasProviderUsage
                           ? "上游返回的真实输出 token"
                           : message.status === "error"
                             ? "请求失败且上游未返回 usage，不计 token"
-                            : "生成期间的可见回复 token 估算，完成后由上游 usage 校准";
+                            : "等待上游返回 usage；不使用本地估算";
                         const replayMessages = showFinalBadge ? getResponseReplayMessages(messages, message.id) : [];
                         const isReplayOpen = expandedResponseReplays.has(message.id);
                         const replayPanelId = `response-replay-${message.id}`;
@@ -5100,6 +5106,11 @@ export default function App() {
                                 <span className="responseMetric" title={outputUsageTitle}>
                                   下传 {formatUsageNumber(displayCompletionTokens)} token
                                 </span>
+                                {(message.usage?.cacheReadTokens ?? 0) > 0 && (
+                                  <span className="responseMetric" title="上游报告的缓存读取 token">
+                                    缓存 R{formatUsageNumber(message.usage?.cacheReadTokens ?? 0)}
+                                  </span>
+                                )}
                                 {isResponseRunning && <strong className="streaming">生成中</strong>}
                                 {message.status === "error" && <strong className="toolFail">error</strong>}
                                 {message.status === "approval_required" && <strong>approval_required</strong>}

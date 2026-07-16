@@ -7689,6 +7689,395 @@ strong.streaming {
 .desktopShell[data-theme="light"] .diffLine.remove { background: #fdecee; }
 
 /* ================================================================
+   Business workspace refresh
+   Calm navy accents, clearer navigation hierarchy and a grounded
+   conversation canvas. Typography intentionally inherits unchanged.
+   ================================================================ */
+.desktopShell {
+  --page: #0d1520;
+  --surface: #111b28;
+  --surface-1: #172231;
+  --surface-2: #1c2938;
+  --surface-3: #263648;
+  --topbar-surface: #101a26;
+  --sidebar-surface: #111c29;
+  --composer-surface: #172330;
+  --text: #edf3f8;
+  --muted: #a1afbd;
+  --faint: #718195;
+  --border: rgba(175, 195, 214, 0.16);
+  --border-soft: rgba(175, 195, 214, 0.09);
+  --accent: #72a4d4;
+  --accent-text: #0b1825;
+  --selected: #72a4d4;
+  --selected-text: #0b1825;
+  --selected-muted: rgba(11, 24, 37, 0.66);
+  --selected-hover: #8ab5de;
+  --info: #72a4d4;
+  background: var(--page);
+}
+
+.desktopShell[data-theme="light"] {
+  --page: #eef2f6;
+  --surface: #ffffff;
+  --surface-1: #f8fafc;
+  --surface-2: #edf2f7;
+  --surface-3: #e3eaf1;
+  --topbar-surface: #ffffff;
+  --sidebar-surface: #f7f9fb;
+  --composer-surface: #ffffff;
+  --text: #172436;
+  --muted: #5f6f80;
+  --faint: #8a98a8;
+  --border: rgba(31, 50, 71, 0.15);
+  --border-soft: rgba(31, 50, 71, 0.085);
+  --accent: #285f96;
+  --accent-text: #ffffff;
+  --selected: #285f96;
+  --selected-text: #ffffff;
+  --selected-muted: rgba(255, 255, 255, 0.72);
+  --selected-hover: #1f507f;
+  --info: #285f96;
+  background: var(--page);
+}
+
+.clientWindow {
+  background: var(--surface);
+}
+
+.appTopBar {
+  height: 52px;
+  flex-basis: 52px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--topbar-surface);
+}
+
+.topBarSidebarZone {
+  border-right: 1px solid var(--border);
+  background: var(--sidebar-surface);
+}
+
+.topBarSidebarActions {
+  border-color: var(--border-soft);
+  border-radius: 8px;
+  background: var(--surface-1);
+  box-shadow: 0 1px 2px rgba(12, 25, 39, 0.04);
+}
+
+.topBarIconButton:hover,
+.topBarIconButton[aria-pressed="true"] {
+  border-color: var(--border);
+  color: var(--accent);
+  background: var(--surface-2);
+}
+
+.topBarTitle > svg,
+.projectRow.active .projectSelectButton > svg {
+  color: var(--accent);
+}
+
+.topBarModelStatus {
+  border-color: var(--border);
+  border-radius: 7px;
+  background: var(--surface-1);
+  box-shadow: none;
+}
+
+.topBarModelDot {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.appLayout {
+  grid-template-columns: var(--sidebar-width) 5px minmax(0, 1fr);
+  background: var(--surface);
+}
+
+.sidebar {
+  gap: 16px;
+  padding: 18px 14px 14px;
+  border-right: 1px solid var(--border);
+  background: var(--sidebar-surface);
+}
+
+.projectSidebarHeader {
+  padding: 2px 4px 8px;
+}
+
+.projectSidebarHeader .iconButton {
+  border-color: var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(12, 25, 39, 0.05);
+}
+
+.projectSidebarHeader .iconButton:hover {
+  color: var(--accent);
+  background: var(--surface-2);
+  transform: none;
+  box-shadow: none;
+}
+
+.projectActions {
+  gap: 5px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.projectActions button {
+  min-height: 36px;
+  border-color: var(--border-soft);
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(12, 25, 39, 0.035);
+}
+
+.projectActions button:hover {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+  transform: none;
+  box-shadow: none;
+}
+
+.projectList {
+  gap: 16px;
+  padding: 2px 0 10px;
+}
+
+.projectGroup {
+  gap: 5px;
+}
+
+.projectRow {
+  min-height: 44px;
+  border-radius: 8px;
+}
+
+.projectRow:hover {
+  background: var(--surface-2);
+}
+
+.projectRow.active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 11%, var(--sidebar-surface));
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.sessionList {
+  gap: 3px;
+  padding-left: 32px;
+}
+
+.sessionRow {
+  min-height: 36px;
+  border-radius: 7px;
+  padding-right: 8px;
+}
+
+.sessionRow:hover {
+  background: var(--surface-2);
+}
+
+.sessionRow.active {
+  color: var(--text);
+  background: var(--surface-2);
+  box-shadow: none;
+}
+
+.sessionRow.active::before {
+  position: absolute;
+  inset: 9px auto 9px 0;
+  width: 2px;
+  border-radius: 999px;
+  background: var(--accent);
+  content: "";
+}
+
+.sessionRow.active time {
+  color: var(--accent);
+}
+
+.sidebarProfileButton {
+  border-color: var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(12, 25, 39, 0.04);
+}
+
+.sidebarProfileButton:hover,
+.sidebarProfileButton.active {
+  border-color: color-mix(in srgb, var(--accent) 36%, var(--border));
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
+  transform: none;
+}
+
+.accountAvatar,
+.desktopShell[data-theme="dark"] .accountAvatar {
+  color: var(--accent-text);
+  background: var(--accent);
+  box-shadow: none;
+}
+
+.sidebarResizeHandle {
+  background: var(--surface);
+}
+
+.sidebarResizeHandle::before {
+  left: 2px;
+  background: var(--border-soft);
+}
+
+.workspace {
+  padding: 0;
+  background: var(--surface);
+}
+
+.chatPanel {
+  position: relative;
+  grid-template-rows: minmax(0, 1fr) auto;
+  background:
+    linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 2.5%, transparent), transparent),
+    var(--surface);
+}
+
+.messageList {
+  width: min(100%, 980px);
+  gap: 26px;
+  padding: 44px 32px 32px;
+}
+
+.message.assistant {
+  width: min(100%, 840px);
+}
+
+.message.user {
+  max-width: min(620px, 72%);
+}
+
+.message.user .messageBubble,
+.desktopShell[data-theme="light"] .message.user .messageBubble {
+  border-color: var(--border);
+  border-radius: 10px 10px 3px 10px;
+  color: var(--text);
+  background: var(--surface-2);
+  box-shadow: none;
+}
+
+.message.assistant .messageMeta {
+  border-left: 2px solid var(--border);
+  padding-left: 9px;
+}
+
+.messageLink {
+  color: var(--accent);
+}
+
+.chatComposer {
+  width: min(calc(100% - 64px), 980px);
+  margin: 0 auto 24px;
+  border-color: var(--border);
+  border-radius: 12px;
+  padding: 14px 15px 11px;
+  background: var(--composer-surface);
+  box-shadow: 0 10px 30px rgba(12, 25, 39, 0.08), 0 1px 3px rgba(12, 25, 39, 0.05);
+}
+
+.chatComposer:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 68%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent), 0 12px 34px rgba(12, 25, 39, 0.10);
+}
+
+.composerFooter {
+  border-top-color: var(--border-soft);
+}
+
+.attachmentPickerButton,
+.modelPickerButton,
+.thinkingMode,
+.permissionModeButton,
+.managedProcessButton {
+  border-color: transparent;
+  border-radius: 7px;
+  background: var(--surface-2);
+}
+
+.attachmentPickerButton:hover,
+.modelPickerButton:hover,
+.thinkingMode:hover,
+.permissionModeButton:hover,
+.managedProcessButton:hover,
+.managedProcessButton.active {
+  border-color: var(--border);
+  color: var(--text);
+  background: var(--surface-3);
+}
+
+.sendButton {
+  border-radius: 8px;
+  color: var(--accent-text);
+  background: var(--accent);
+  box-shadow: none;
+}
+
+.sendButton:hover {
+  background: var(--selected-hover);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--accent) 22%, transparent);
+  transform: translateY(-1px);
+}
+
+.sendButton:active {
+  transform: translateY(0);
+}
+
+.sendButton:disabled {
+  color: var(--faint);
+  background: var(--surface-3);
+  box-shadow: none;
+}
+
+.modelMenu,
+.permissionMenu,
+.managedProcessPopover {
+  border-color: var(--border);
+  background: var(--surface-1);
+  box-shadow: 0 18px 44px rgba(12, 25, 39, 0.18);
+}
+
+.modelMenu button:hover,
+.modelMenu button.active,
+.permissionMenu button:hover,
+.permissionMenu button.active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface-1));
+}
+
+@media (max-width: 760px) {
+  .appLayout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .workspace {
+    padding: 0;
+  }
+
+  .messageList {
+    gap: 18px;
+    padding: 24px 18px 20px;
+  }
+
+  .message.user {
+    max-width: 88%;
+  }
+
+  .chatComposer {
+    width: calc(100% - 28px);
+    margin-bottom: 14px;
+  }
+}
+
+/* ================================================================
    Settings — restrained, content-first layout
    ================================================================ */
 .settingsPage {
@@ -9216,3 +9605,100 @@ strong.streaming {
 .diffSplitMarker.remove { background: rgba(214, 75, 85, 0.12); }
 .desktopShell[data-theme="light"] .diffLine.add { background: #e8f7ee; }
 .desktopShell[data-theme="light"] .diffLine.remove { background: #fdecee; }
+
+/* Final monochrome palette authority: black, white and neutral gray only. */
+.desktopShell {
+  --page: #0e0f11;
+  --surface: #121315;
+  --surface-1: #18191c;
+  --surface-2: #202226;
+  --surface-3: #2b2e33;
+  --topbar-surface: #101113;
+  --sidebar-surface: #151618;
+  --composer-surface: #191a1d;
+  --text: #f2f2f3;
+  --muted: #a5a7ac;
+  --faint: #72757c;
+  --border: rgba(255, 255, 255, 0.14);
+  --border-soft: rgba(255, 255, 255, 0.08);
+  --accent: #f0f0ee;
+  --accent-text: #151619;
+  --selected: #ebebea;
+  --selected-text: #151619;
+  --selected-muted: rgba(21, 22, 25, 0.64);
+  --selected-hover: #ffffff;
+  --info: #d2d3d5;
+}
+
+.desktopShell[data-theme="light"] {
+  --page: #ededee;
+  --surface: #ffffff;
+  --surface-1: #fafafa;
+  --surface-2: #f1f1f2;
+  --surface-3: #e5e6e8;
+  --topbar-surface: #ffffff;
+  --sidebar-surface: #f6f6f7;
+  --composer-surface: #ffffff;
+  --text: #1a1b1d;
+  --muted: #62656b;
+  --faint: #9699a0;
+  --border: rgba(18, 20, 24, 0.15);
+  --border-soft: rgba(18, 20, 24, 0.085);
+  --accent: #252629;
+  --accent-text: #ffffff;
+  --selected: #252629;
+  --selected-text: #ffffff;
+  --selected-muted: rgba(255, 255, 255, 0.7);
+  --selected-hover: #0f1012;
+  --info: #4f5257;
+}
+
+.projectRow.active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 11%, var(--sidebar-surface));
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.projectRow.active .projectSelectButton > svg,
+.topBarTitle > svg {
+  color: var(--accent);
+}
+
+.sessionRow.active {
+  color: var(--text);
+  background: var(--surface-2);
+  box-shadow: none;
+}
+
+.sessionRow.active time,
+.messageLink {
+  color: var(--accent);
+}
+
+.chatComposer:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 68%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent), 0 12px 34px rgba(12, 25, 39, 0.10);
+}
+
+.sendButton {
+  color: var(--accent-text);
+  background: var(--accent);
+  box-shadow: none;
+}
+
+.sendButton:hover {
+  background: var(--selected-hover);
+}
+
+.sendButton:disabled {
+  color: var(--faint);
+  background: var(--surface-3);
+  box-shadow: none;
+}
+
+.accountAvatar,
+.desktopShell[data-theme="dark"] .accountAvatar {
+  color: var(--accent-text);
+  background: var(--accent);
+  box-shadow: none;
+}

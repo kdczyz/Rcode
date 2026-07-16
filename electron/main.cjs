@@ -14,10 +14,20 @@ let serverProcess = null;
 const localApiToken = process.env.AGENT_LOCAL_TOKEN || crypto.randomBytes(32).toString("base64url");
 let volatileAuthToken;
 let volatileGithubMcpToken;
+let remoteSocket;
+let remoteReconnectTimer;
+let remoteHeartbeatTimer;
+let remoteConnectionWanted = false;
+let remoteProject = { path: undefined, name: undefined };
+let remoteCommandRunning = false;
+const remoteCommandQueue = [];
+const receivedRemoteCommandIds = new Set();
 const preferencesPath = () => path.join(app.getPath("userData"), "preferences.json");
 const authSessionPath = () => path.join(app.getPath("userData"), "auth-session.bin");
 const githubMcpSessionPath = () => path.join(app.getPath("userData"), "github-mcp-oauth.bin");
-const authApiUrl = () => (process.env.RCODE_AUTH_API_URL || "https://rcode-auth.kdczyz0728-994.workers.dev").replace(/\/$/, "");
+const remoteDevicePath = () => path.join(app.getPath("userData"), "remote-device.json");
+const authApiUrl = () => (process.env.RCODE_AUTH_API_URL || "https://rcode-remote-server.kdczyz0728-994.workers.dev").replace(/\/$/, "");
+const localAgentApiUrl = () => process.env.RCODE_LOCAL_API_URL || (isDev ? "http://127.0.0.1:8789" : "http://127.0.0.1:8787");
 const githubOauthCallbackPath = "/oauth/github/callback";
 
 async function readAuthToken() {
@@ -272,6 +282,259 @@ async function authRequest(pathname, options = {}) {
   return data;
 }
 
+async function remoteDeviceId() {
+  try {
+    const stored = JSON.parse(await fs.readFile(remoteDevicePath(), "utf8"));
+    if (typeof stored.id === "string" && /^[a-zA-Z0-9._:-]+$/.test(stored.id)) return stored.id;
+  } catch {
+    // A device id is created on first use.
+  }
+  const id = `desktop:${crypto.randomUUID()}`;
+  await fs.mkdir(path.dirname(remoteDevicePath()), { recursive: true });
+  await fs.writeFile(remoteDevicePath(), JSON.stringify({ id }, null, 2), { mode: 0o600 });
+  return id;
+}
+
+function sendRemote(value) {
+  if (!remoteSocket || remoteSocket.readyState !== WebSocket.OPEN) return false;
+  try {
+    remoteSocket.send(JSON.stringify(value));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function stopRemoteAgentConnection(clearWanted = true) {
+  if (clearWanted) remoteConnectionWanted = false;
+  clearTimeout(remoteReconnectTimer);
+  clearInterval(remoteHeartbeatTimer);
+  remoteReconnectTimer = undefined;
+  remoteHeartbeatTimer = undefined;
+  const socket = remoteSocket;
+  remoteSocket = undefined;
+  if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, "desktop disconnect");
+}
+
+function scheduleRemoteReconnect(delayMs = 3_000) {
+  if (!remoteConnectionWanted) return;
+  clearTimeout(remoteReconnectTimer);
+  remoteReconnectTimer = setTimeout(() => void startRemoteAgentConnection(), delayMs);
+}
+
+function publicRemoteEvent(event) {
+  if (!event || typeof event !== "object" || typeof event.type !== "string") return undefined;
+  if (event.type === "workflow_state") {
+    return { type: event.type, phase: event.phase, label: String(event.label || "电脑正在处理").slice(0, 240) };
+  }
+  if (event.type === "text_delta") {
+    return { type: event.type, delta: String(event.content || "").slice(0, 8_000) };
+  }
+  if (event.type === "tool_call") {
+    return { type: event.type, toolName: String(event.toolCall?.name || "未知工具").slice(0, 160) };
+  }
+  if (event.type === "permission_decision") {
+    return { type: event.type, effect: event.effect, reason: String(event.reason || "权限检查完成").slice(0, 1_000) };
+  }
+  if (event.type === "approval_required") {
+    const approval = Array.isArray(event.approvals) ? event.approvals[0] : undefined;
+    if (!approval?.id) return undefined;
+    return {
+      type: event.type,
+      approvalId: String(approval.id).slice(0, 160),
+      reason: String(approval.reason || event.answer || "电脑请求执行受保护操作").slice(0, 2_000),
+      risk: approval.risk === "high" || approval.risk === "medium" ? approval.risk : "low",
+      toolCall: approval.toolCall ? { name: String(approval.toolCall.name || "").slice(0, 160) } : undefined
+    };
+  }
+  if (event.type === "completed") {
+    return { type: event.type, answer: String(event.answer || "任务已完成").slice(0, 12_000) };
+  }
+  if (event.type === "error") {
+    return { type: event.type, message: String(event.message || "任务执行失败").slice(0, 2_000) };
+  }
+  return undefined;
+}
+
+async function consumeLocalAgentStream(command) {
+  const payload = command?.payload && typeof command.payload === "object" ? command.payload : {};
+  const action = command?.action;
+  if (action !== "agent.run" && action !== "agent.approve") throw new Error("不支持的远程指令");
+  const endpoint = action === "agent.run" ? "/api/agent/run" : "/api/agent/approve";
+  const body = action === "agent.run"
+    ? {
+        prompt: String(payload.prompt || "").slice(0, 8_000),
+        mode: payload.mode === "plan" ? "plan" : "workspace_write",
+        projectPath: remoteProject.path
+      }
+    : {
+        approvalId: String(payload.approvalId || "").slice(0, 160),
+        allow: payload.allow === true,
+        mode: "workspace_write",
+        projectPath: remoteProject.path
+      };
+  if (action === "agent.run" && !body.prompt.trim()) throw new Error("远程任务内容为空");
+  if (action === "agent.approve" && !body.approvalId) throw new Error("远程审批编号为空");
+
+  const response = await fetch(`${localAgentApiUrl()}${endpoint}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-agent-token": localApiToken },
+    body: JSON.stringify(body)
+  });
+  if (!response.ok || !response.body) {
+    const details = await response.json().catch(() => ({}));
+    throw new Error(typeof details.error === "string" ? details.error : `本地 Agent 请求失败 (${response.status})`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let summary = "";
+  let sawApproval = false;
+  let failed = false;
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+    const blocks = buffer.split("\n\n");
+    buffer = blocks.pop() || "";
+    for (const block of blocks) {
+      const line = block.split("\n").find((candidate) => candidate.startsWith("data:"));
+      if (!line) continue;
+      let event;
+      try { event = JSON.parse(line.slice(5).trim()); } catch { continue; }
+      const safeEvent = publicRemoteEvent(event);
+      if (!safeEvent) continue;
+      if (safeEvent.type === "approval_required") sawApproval = true;
+      if (safeEvent.type === "error") failed = true;
+      if (safeEvent.type === "completed") summary = safeEvent.answer;
+      if (safeEvent.type === "error") summary = safeEvent.message;
+      sendRemote({ type: "command.event", commandId: command.id, event: safeEvent });
+    }
+    if (done) break;
+  }
+  return { ok: !failed, summary: summary || (sawApproval ? "等待远程审批" : "任务已完成"), sawApproval };
+}
+
+async function drainRemoteCommandQueue() {
+  if (remoteCommandRunning) return;
+  remoteCommandRunning = true;
+  try {
+    while (remoteCommandQueue.length > 0) {
+      const command = remoteCommandQueue.shift();
+      if (!command?.id) continue;
+      sendRemote({ type: "command.updated", command: { id: command.id, status: "running" } });
+      try {
+        const result = await consumeLocalAgentStream(command);
+        if (!result.sawApproval) {
+          const status = result.ok ? "completed" : "failed";
+          sendRemote({ type: "command.updated", command: { id: command.id, status, summary: result.summary } });
+          const originCommandId = command.action === "agent.approve" && typeof command.payload?.originCommandId === "string"
+            ? command.payload.originCommandId.slice(0, 128)
+            : "";
+          if (originCommandId) {
+            sendRemote({ type: "command.updated", command: { id: originCommandId, status, summary: result.summary } });
+          }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "远程任务执行失败";
+        sendRemote({ type: "command.event", commandId: command.id, event: { type: "error", message } });
+        sendRemote({ type: "command.updated", command: { id: command.id, status: "failed", summary: message } });
+      }
+    }
+  } finally {
+    remoteCommandRunning = false;
+  }
+}
+
+function queueRemoteCommand(command) {
+  if (!command?.id || receivedRemoteCommandIds.has(command.id)) return;
+  receivedRemoteCommandIds.add(command.id);
+  if (receivedRemoteCommandIds.size > 500) {
+    const oldest = receivedRemoteCommandIds.values().next().value;
+    if (oldest) receivedRemoteCommandIds.delete(oldest);
+  }
+  remoteCommandQueue.push(command);
+  void drainRemoteCommandQueue();
+}
+
+async function sendRemoteDeviceUpdate() {
+  const serverReady = await waitForServer(1_500);
+  sendRemote({
+    type: "device.announce",
+    device: {
+      id: await remoteDeviceId(),
+      name: os.hostname(),
+      platform: process.platform,
+      appVersion: app.getVersion(),
+      projectName: remoteProject.name,
+      ready: serverReady && Boolean(remoteProject.path)
+    }
+  });
+}
+
+async function startRemoteAgentConnection() {
+  remoteConnectionWanted = true;
+  stopRemoteAgentConnection(false);
+  const token = await readAuthToken();
+  if (!token) {
+    remoteConnectionWanted = false;
+    return;
+  }
+  try {
+    const serverReady = await waitForServer(4_000);
+    const ticket = await authRequest("/v1/remote/ticket", {
+      method: "POST",
+      authenticated: true,
+      body: {
+        role: "agent",
+        device: {
+          id: await remoteDeviceId(),
+          name: os.hostname(),
+          platform: process.platform,
+          appVersion: app.getVersion(),
+          projectName: remoteProject.name,
+          ready: serverReady && Boolean(remoteProject.path)
+        }
+      }
+    });
+    if (!ticket?.url) throw new Error("远程服务未返回连接地址");
+    const socket = new WebSocket(ticket.url);
+    remoteSocket = socket;
+    socket.addEventListener("open", () => {
+      if (remoteSocket !== socket) return;
+      clearTimeout(remoteReconnectTimer);
+      remoteHeartbeatTimer = setInterval(() => sendRemote({ type: "ping" }), 25_000);
+      void sendRemoteDeviceUpdate();
+    });
+    socket.addEventListener("message", (message) => {
+      if (remoteSocket !== socket) return;
+      let body;
+      try { body = JSON.parse(String(message.data)); } catch { return; }
+      if (
+        body?.type === "command.execute"
+        && body.command && typeof body.command === "object" && !Array.isArray(body.command)
+        && body.payload && typeof body.payload === "object" && !Array.isArray(body.payload)
+      ) {
+        queueRemoteCommand({ ...body.command, payload: body.payload });
+      } else if (body?.type === "remote.error") {
+        console.warn("Remote server rejected a message:", body.error || "unknown error");
+      }
+    });
+    socket.addEventListener("close", () => {
+      if (remoteSocket !== socket) return;
+      remoteSocket = undefined;
+      clearInterval(remoteHeartbeatTimer);
+      scheduleRemoteReconnect();
+    });
+    socket.addEventListener("error", () => {
+      if (remoteSocket === socket && socket.readyState < WebSocket.CLOSING) socket.close();
+    });
+  } catch (error) {
+    console.warn("Remote agent connection unavailable:", error instanceof Error ? error.message : error);
+    scheduleRemoteReconnect(5_000);
+  }
+}
+
 async function migrateLegacyDatabase(databasePath) {
   const legacyPath = path.join(process.resourcesPath, "data", "agent-console.sqlite");
   try {
@@ -346,7 +609,7 @@ async function waitForServer(timeoutMs = 12000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch("http://127.0.0.1:8787/api/health", {
+      const response = await fetch(`${localAgentApiUrl()}/api/health`, {
         headers: { "x-agent-token": localApiToken }
       });
       if (response.ok) return true;
@@ -473,25 +736,45 @@ app.whenReady().then(async () => {
     await syncGithubMcpToken(details?.apiBase, undefined);
     return { ok: true };
   });
-  ipcMain.handle("agent:auth-session", async () => authRequest("/v1/auth/me", { authenticated: true }));
+  ipcMain.handle("agent:auth-session", async () => {
+    const session = await authRequest("/v1/auth/me", { authenticated: true });
+    if (session) void startRemoteAgentConnection();
+    return session;
+  });
   ipcMain.handle("agent:auth-login", async (_event, details) => {
     const result = await authRequest("/v1/auth/login", { method: "POST", body: details });
     if (!result?.token) throw new Error("认证服务未返回会话 Token");
     await writeAuthToken(result.token);
+    void startRemoteAgentConnection();
     return { user: result.user, expiresAt: result.expiresAt };
   });
   ipcMain.handle("agent:auth-register", async (_event, details) => {
     const result = await authRequest("/v1/auth/register", { method: "POST", body: details });
     if (!result?.token) throw new Error("认证服务未返回会话 Token");
     await writeAuthToken(result.token);
+    void startRemoteAgentConnection();
     return { user: result.user, expiresAt: result.expiresAt };
   });
   ipcMain.handle("agent:auth-logout", async () => {
     try {
       await authRequest("/v1/auth/logout", { method: "POST", authenticated: true });
     } finally {
+      stopRemoteAgentConnection();
       await clearAuthToken();
     }
+    return { ok: true };
+  });
+  ipcMain.handle("agent:remote-update-device", async (_event, details) => {
+    const projectPath = typeof details?.projectPath === "string" && path.isAbsolute(details.projectPath)
+      ? details.projectPath
+      : undefined;
+    remoteProject = {
+      path: projectPath,
+      name: typeof details?.projectName === "string" && details.projectName.trim()
+        ? details.projectName.trim().slice(0, 160)
+        : projectPath ? path.basename(projectPath) : undefined
+    };
+    await sendRemoteDeviceUpdate();
     return { ok: true };
   });
   ipcMain.handle("agent:get-theme-preference", async () => {
@@ -556,6 +839,7 @@ app.whenReady().then(async () => {
   }
 
   createWindow();
+  void startRemoteAgentConnection();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -571,6 +855,7 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  stopRemoteAgentConnection();
   if (serverProcess) {
     serverProcess.kill();
     serverProcess = null;
