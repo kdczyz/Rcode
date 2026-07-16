@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Rcode</string>
+    <string name="title_activity_main">Rcode</string>
+    <string name="package_name">com.rcode.mobile</string>
+    <string name="custom_url_scheme">com.rcode.mobile</string>
+</resources>
