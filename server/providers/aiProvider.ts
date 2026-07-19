@@ -615,6 +615,15 @@ function getWorkflowInstruction(mode: PermissionMode = "workspace_write") {
       "- Keep the plan between 2 and 8 steps and mention validation in the last step."
     ].join("\n");
   }
+  if (mode === "full_access") {
+    return [
+      "## Current workflow: Execute with full access",
+      "- Full access is active for this turn. You may read, write, list, search, and run commands at user-requested local paths outside the current project.",
+      "- Do not claim that an ordinary local path is blocked merely because it is outside the workspace. Call the appropriate tool and report only an actual tool or operating-system error.",
+      "- Mandatory credential, secret-exfiltration, interactive-process, and destructive-operation safeguards still apply.",
+      "- Inspect, implement, validate, and then report the outcome."
+    ].join("\n");
+  }
   return [
     "## Current workflow: Execute",
     "- Inspect, implement, validate, and then report the outcome.",
@@ -638,6 +647,7 @@ function buildSystemPrompt(modelName: string, providerDisplayName: string, mode:
   "- start_process/read_process/write_process/stop_process/list_processes: Manage long-running dev servers and watchers without &, nohup, or shell redirection.",
   "- git_status/git_diff/git_branch/git_stage/git_commit: Inspect and manage local git workflow with approval for mutating actions.",
   "- web_fetch: Fetch documentation or API references.",
+  "- generate_image: Generate an image with the current provider's automatically detected image model.",
   "",
   "## Workflow Rules",
   "- ALWAYS explain what you are about to do in 1-2 sentences BEFORE calling tools.",
@@ -652,6 +662,8 @@ function buildSystemPrompt(modelName: string, providerDisplayName: string, mode:
   "- Use the project root as the working directory for all file paths.",
   "- When running shell commands, use non-interactive flags (e.g. --yes for npm).",
   "- Respond in the same language the user uses.",
+  "- When the user asks to create, draw, render, or generate an image, call generate_image automatically instead of sending an image model to Chat Completions.",
+  "- Treat a clear image-generation request as authorization for that image call. Do not call generate_image for image-related explanations, code, or analysis unless an actual generated image is requested.",
   "",
   getWorkflowInstruction(mode)
   ].join("\n");
@@ -745,7 +757,9 @@ async function toProviderMessages(
   reasoningConfig?: ReasoningRequestConfig
 ) {
   const projectInstruction = projectPath
-    ? `Current project root: ${projectPath}. Resolve relative file paths and shell commands inside this project unless the user asks otherwise.`
+    ? mode === "full_access"
+      ? `Current project root: ${projectPath}. Resolve relative paths from this project, but full access is active and explicit absolute paths outside it are allowed.`
+      : `Current project root: ${projectPath}. Resolve relative file paths and shell commands inside this project unless the user asks otherwise.`
     : "Current project type: empty project. Use relative file paths from the app workspace unless the user provides a folder path.";
   const latestUserPrompt = [...messages].reverse().find((message) =>
     message.role === "user" && !message.content.startsWith("Visual result returned by tool ")

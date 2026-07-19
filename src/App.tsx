@@ -449,6 +449,12 @@ const AI_PROVIDER_QUICK_CONNECTS: Record<string, AiProviderQuickConnect> = {
 function inferredImageModels(models: string[]) {
   return models.filter((model) => /(?:^|[-_.\/])(gpt-image|dall-e|image|imagen|flux|sdxl|stable-diffusion|recraft|seedream)(?:$|[-_.\/\d])/i.test(model));
 }
+
+function attachmentImageSource(attachment: ComposerAttachment) {
+  if (attachment.dataUrl) return attachment.dataUrl;
+  if (attachment.url?.startsWith("/")) return `${API_BASE}${attachment.url}`;
+  return attachment.url || "";
+}
 const defaultPermissionOptions: PermissionOption[] = [
   { id: "default", label: "默认", description: "使用配置文件中的默认工作区沙箱策略" },
   { id: "plan", label: "计划", description: "只读规划模式，不允许写文件、联网或执行命令" },
@@ -1203,6 +1209,7 @@ function getRealtimeToolStatus(toolName?: string): { phase: WorkflowPhase; label
   if (toolName === "read_file") return { phase: "inspecting", label: "正在读取文件" };
   if (toolName === "list_files" || toolName === "inspect_tree") return { phase: "inspecting", label: "正在查看项目文件" };
   if (toolName === "search_text") return { phase: "inspecting", label: "正在搜索代码" };
+  if (toolName === "generate_image") return { phase: "executing", label: "正在生成图片" };
   if (toolName === "write_file" || toolName === "apply_patch") return { phase: "executing", label: "正在编辑文件" };
   if (toolName === "web_fetch") return { phase: "inspecting", label: "正在获取网页" };
   if (toolName === "run_shell") return { phase: "executing", label: "正在执行操作" };
@@ -1533,9 +1540,8 @@ export default function App() {
   const [health, setHealth] = useState<{ providerConfigured: boolean; model: string; provider?: string }>();
   const [modelOptions, setModelOptions] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState("");
-  const [imageMode, setImageMode] = useState(false);
-  const [selectedImageModel, setSelectedImageModel] = useState("");
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [providerMenuOpen, setProviderMenuOpen] = useState(false);
   const [thinkingMode, setThinkingMode] = useState<ThinkingMode>(() => loadThinkingMode());
   const [permissionMenuOpen, setPermissionMenuOpen] = useState(false);
   const [managedProcessPanelOpen, setManagedProcessPanelOpen] = useState(false);
@@ -1617,6 +1623,37 @@ export default function App() {
   // 所有变更始终可在审核面板右侧切换。
   const [expandedArtifactCards, setExpandedArtifactCards] = useState<Set<string>>(() => new Set());
   const [expandedResponseReplays, setExpandedResponseReplays] = useState<Set<string>>(() => new Set());
+  const [previewAttachment, setPreviewAttachment] = useState<ComposerAttachment | null>(null);
+
+  useEffect(() => {
+    if (!previewAttachment) return;
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setPreviewAttachment(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [previewAttachment]);
+
+  useEffect(() => {
+    if (!providerMenuOpen && !modelMenuOpen) return;
+    const closeComposerMenus = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest(".providerPicker, .modelPicker")) return;
+      setProviderMenuOpen(false);
+      setModelMenuOpen(false);
+    };
+    const closeComposerMenusOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setProviderMenuOpen(false);
+      setModelMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeComposerMenus);
+    document.addEventListener("keydown", closeComposerMenusOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeComposerMenus);
+      document.removeEventListener("keydown", closeComposerMenusOnEscape);
+    };
+  }, [modelMenuOpen, providerMenuOpen]);
 
   function markSessionRunning(sessionId: string) {
     const now = Date.now();
@@ -1648,14 +1685,20 @@ export default function App() {
   }
 
   const resolvedTheme = themePreference === "system" ? systemTheme : themePreference;
-  const modelName = selectedModel || health?.model || "Agent";
-  const activeAiProvider = aiProviders.find((provider) => provider.id === aiActiveProviderId || provider.active);
-  const imageModelOptions = [...new Set([activeAiProvider?.defaultImageModel, ...(activeAiProvider?.imageModels ?? [])].filter((model): model is string => Boolean(model)))];
-  const imageModelName = imageModelOptions.includes(selectedImageModel) ? selectedImageModel : imageModelOptions[0] || "图片模型";
-
-  useEffect(() => {
-    if (imageMode && imageModelOptions.length === 0) setImageMode(false);
-  }, [imageMode, imageModelOptions.length]);
+  const activeAiProvider = useMemo(
+    () => aiProviders.find((provider) => provider.id === aiActiveProviderId || provider.active),
+    [aiActiveProviderId, aiProviders]
+  );
+  const textModelOptions = useMemo(
+    () => [...new Set([activeAiProvider?.defaultModel, ...modelOptions]
+      .filter((model): model is string => Boolean(model))
+      .filter((model) => inferredImageModels([model]).length === 0))],
+    [activeAiProvider?.defaultModel, modelOptions]
+  );
+  const requestedModelName = selectedModel || activeAiProvider?.defaultModel || health?.model || "";
+  const modelName = inferredImageModels([requestedModelName]).length > 0
+    ? textModelOptions[0] || health?.model || "Agent"
+    : requestedModelName || textModelOptions[0] || "Agent";
 
   const activeProject = useMemo(
     () => workspaceState.projects.find((project) => project.id === workspaceState.activeProjectId),
@@ -1947,7 +1990,6 @@ export default function App() {
       .then((r) => r.json())
       .then((data) => {
         setHealth(data);
-        setSelectedModel((cur) => cur || data.model || "");
       })
       .catch(() => setHealth(undefined));
   }, []);
@@ -2385,6 +2427,8 @@ export default function App() {
     let hasPostToolAssistantResponse = false;
     // 当前 Agent 运行产生的文件变更，在最终回复上作为可审核交付物展示。
     const runDiffs = new Map<string, DiffResult>();
+    // 生图工具的产物跟随最终回复展示，避免图片只存在于折叠的工具日志中。
+    let generatedAttachments: ComposerAttachment[] = [];
     let currentActiveSkills: string[] = [];
 
     const appendAssistantSegment = (
@@ -2515,6 +2559,7 @@ export default function App() {
             content: completionContent,
             status,
             artifactDiffs,
+            attachments: generatedAttachments.length > 0 ? generatedAttachments : undefined,
             startedAt: modelCallStartedAt,
             completedAt,
             durationMs: Math.max(0, completedAt - modelCallStartedAt),
@@ -2537,7 +2582,8 @@ export default function App() {
                 ...finalizeAssistantMessage(message, completedAt),
                 status,
                 content: message.content || completionContent,
-                artifactDiffs
+                artifactDiffs,
+                attachments: generatedAttachments.length > 0 ? generatedAttachments : message.attachments
               }
             : message
         );
@@ -2726,6 +2772,11 @@ export default function App() {
 
         case "tool_result":
           if (event.result) {
+            if (event.result.name === "generate_image" && event.result.attachments?.length) {
+              generatedAttachments = [...new Map(
+                [...generatedAttachments, ...event.result.attachments].map((attachment) => [attachment.id, attachment])
+              ).values()];
+            }
             const resultDiff = event.result.diff ?? event.result.diffs?.[0];
             if (resultDiff && event.result.ok) {
               runDiffs.set(normalizeFilePath(resultDiff.filePath), resultDiff);
@@ -2876,6 +2927,7 @@ export default function App() {
           model: modelName,
           thinkingMode,
           projectPath: context.project.path,
+          providerId: aiActiveProviderId || undefined,
           attachments
         })
       });
@@ -2966,85 +3018,8 @@ export default function App() {
     await runAgentForSession(activeProject.id, activeSession.id, content, true, content, undefined, attachments);
   }
 
-  async function runImageGeneration() {
-    const content = prompt.trim();
-    if (!content || !activeProject || !activeSession || imageModelOptions.length === 0 || isActiveSessionRunning) return;
-    const projectId = activeProject.id;
-    const sessionId = activeSession.id;
-    const assistantMessageId = createId("message");
-    const startedAt = Date.now();
-    appendUserMessage(projectId, sessionId, content);
-    setPrompt("");
-    updateSession(projectId, sessionId, (session) => ({
-      ...session,
-      updatedAt: new Date().toISOString(),
-      workflowPhase: "executing",
-      workflowLabel: "正在生成图片",
-      messages: [...session.messages, {
-        id: assistantMessageId,
-        role: "assistant",
-        content: "",
-        isStreaming: true,
-        startedAt,
-        showResponseMeta: true,
-        responseStartedAt: startedAt,
-        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, model: imageModelName, provider: aiActiveProviderId }
-      }]
-    }));
-    const abortController = new AbortController();
-    abortControllersRef.current.set(sessionId, abortController);
-    markSessionRunning(sessionId);
-    try {
-      const response = await fetch(`${API_BASE}/api/images/generate`, {
-        method: "POST",
-        signal: abortController.signal,
-        headers: getJsonHeaders(),
-        body: JSON.stringify({ prompt: content, providerId: aiActiveProviderId, model: imageModelName, count: 1, size: "auto", quality: "auto" })
-      });
-      const data = await response.json().catch(() => ({})) as { error?: string; attachments?: ComposerAttachment[]; model?: string; provider?: string };
-      if (!response.ok || !data.attachments?.length) throw new Error(data.error || "图片服务没有返回图片");
-      const completedAt = Date.now();
-      updateSession(projectId, sessionId, (session) => ({
-        ...session,
-        workflowPhase: "completed",
-        workflowLabel: "图片生成完成",
-        messages: session.messages.map((message) => message.id === assistantMessageId ? {
-          ...message,
-          content: `已生成 ${data.attachments!.length} 张图片。`,
-          attachments: data.attachments,
-          isStreaming: false,
-          status: "completed" as const,
-          completedAt,
-          durationMs: completedAt - startedAt,
-          responseCompletedAt: completedAt,
-          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, model: data.model || imageModelName, provider: data.provider || aiActiveProviderId }
-        } : message)
-      }));
-    } catch (error) {
-      const completedAt = Date.now();
-      updateSession(projectId, sessionId, (session) => ({
-        ...session,
-        workflowPhase: "failed",
-        workflowLabel: "图片生成失败",
-        messages: session.messages.map((message) => message.id === assistantMessageId ? {
-          ...message,
-          content: error instanceof DOMException && error.name === "AbortError" ? "已停止图片生成。" : error instanceof Error ? error.message : "图片生成失败",
-          isStreaming: false,
-          status: "error" as const,
-          completedAt,
-          durationMs: completedAt - startedAt,
-          responseCompletedAt: completedAt
-        } : message)
-      }));
-    } finally {
-      if (abortControllersRef.current.get(sessionId) === abortController) abortControllersRef.current.delete(sessionId);
-      markSessionIdle(sessionId);
-    }
-  }
-
   function submitCurrentComposer() {
-    if (imageMode) void runImageGeneration();
-    else void runAgent();
+    void runAgent();
   }
 
   async function decideApproval(approvalId: string, allow: boolean) {
@@ -3086,7 +3061,8 @@ export default function App() {
           mode: activeSession.permissionMode ?? mode,
           model: modelName,
           thinkingMode,
-          projectPath: activeProject.path
+          projectPath: activeProject.path,
+          providerId: aiActiveProviderId || undefined
         })
       });
 
@@ -3455,8 +3431,9 @@ export default function App() {
       if (!response.ok) throw new Error(data.error || "获取模型失败");
       if (data.error) throw new Error(data.error);
       const models = (data.models ?? []).map((model: { id: string }) => model.id).filter(Boolean);
-      setAiDraftModels(models);
       const imageModels = inferredImageModels(models);
+      const textModels = models.filter((model: string) => !imageModels.includes(model));
+      setAiDraftModels(textModels);
       if (imageModels.length) {
         setAiDraft((cur) => ({
           ...cur,
@@ -3464,9 +3441,9 @@ export default function App() {
           imageModelsText: cur.imageModelsText || imageModels.join(", ")
         }));
       }
-      setAiDraftModelStatus(models.length ? `已获取 ${models.length} 个模型` : "未发现模型，请检查 URL 或密钥权限");
-      if (models.length && !models.includes(aiDraft.defaultModel)) {
-        setAiDraft((cur) => ({ ...cur, defaultModel: models[0] }));
+      setAiDraftModelStatus(models.length ? `已获取 ${textModels.length} 个聊天模型、${imageModels.length} 个图片模型` : "未发现模型，请检查 URL 或密钥权限");
+      if (textModels.length && !textModels.includes(aiDraft.defaultModel)) {
+        setAiDraft((cur) => ({ ...cur, defaultModel: textModels[0] }));
       }
     } catch (error) {
       setAiDraftModels([]);
@@ -3595,13 +3572,20 @@ export default function App() {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "切换接口失败");
+      setSelectedModel("");
+      setModelMenuOpen(false);
+      setProviderMenuOpen(false);
+      await Promise.all([reloadPlatformData(), reloadRuntimeData()]);
       try {
         await syncAllWorkAiProvidersToCloud();
       } catch (error) {
-        throw new Error(`已设为当前接口，但同步到手机 Work 失败：${error instanceof Error ? error.message : "未知错误"}`);
+        setAiProviderStatus((cur) => ({
+          ...cur,
+          [id]: `桌面端已切换；同步到手机 Work 失败：${error instanceof Error ? error.message : "未知错误"}`
+        }));
+        return;
       }
       setAiProviderStatus((cur) => ({ ...cur, [id]: "已设为当前接口，并同步到手机 Work" }));
-      await Promise.all([reloadPlatformData(), reloadRuntimeData()]);
     } catch (error) {
       setAiProviderStatus((cur) => ({ ...cur, [id]: error instanceof Error ? `失败：${error.message}` : "切换接口失败" }));
     } finally {
@@ -5182,7 +5166,15 @@ export default function App() {
                                 {message.attachments!.map((attachment) => (
                                   <div className={`messageAttachment ${attachment.kind}`} key={attachment.id} title={attachment.name}>
                                     {attachment.kind === "image" && (attachment.dataUrl || attachment.url) ? (
-                                      <img src={attachment.dataUrl || (attachment.url?.startsWith("/") ? `${API_BASE}${attachment.url}` : attachment.url)} alt={attachment.name} />
+                                      <button
+                                        className="messageAttachmentImageButton"
+                                        type="button"
+                                        aria-label={`打开图片 ${attachment.name}`}
+                                        onClick={() => setPreviewAttachment(attachment)}
+                                      >
+                                        <img src={attachmentImageSource(attachment)} alt={attachment.name} />
+                                        <span>点击查看原图</span>
+                                      </button>
                                     ) : (
                                       <span className="messageAttachmentFileIcon"><FileText size={18} /></span>
                                     )}
@@ -5275,11 +5267,14 @@ export default function App() {
                   <ChatComposer
                     prompt={prompt}
                     attachments={composerAttachments}
-                    modelName={imageMode ? imageModelName : modelName}
-                    modelOptions={imageMode ? imageModelOptions : modelOptions}
+                    modelName={modelName}
+                    modelOptions={textModelOptions}
                     modelMenuOpen={modelMenuOpen}
-                    imageMode={imageMode}
-                    imageGenerationAvailable={imageModelOptions.length > 0}
+                    providerId={aiActiveProviderId}
+                    providerName={activeAiProvider?.displayName ?? health?.provider ?? ""}
+                    providerOptions={aiProviders.map(({ id, displayName, defaultModel, configured, enabled }) => ({ id, displayName, defaultModel, configured, enabled }))}
+                    providerMenuOpen={providerMenuOpen}
+                    providerSwitchingId={Object.entries(aiProviderBusy).find(([, action]) => action === "activate")?.[0]}
                     thinkingMode={thinkingMode}
                     permissionMode={currentMode}
                     permissionOptions={permissionOptions}
@@ -5298,15 +5293,21 @@ export default function App() {
                       setComposerAttachmentsBySession((current) => ({ ...current, [activeSession.id]: attachments }));
                     }}
                     onKeyDown={handleComposerKeyDown}
-                    onToggleModelMenu={() => setModelMenuOpen((open) => !open)}
+                    onToggleModelMenu={() => {
+                      setModelMenuOpen((open) => !open);
+                      setProviderMenuOpen(false);
+                    }}
                     onSelectModel={(model) => {
-                      if (imageMode) setSelectedImageModel(model);
-                      else setSelectedModel(model);
+                      setSelectedModel(model);
                       setModelMenuOpen(false);
                     }}
-                    onToggleImageMode={() => {
-                      setImageMode((enabled) => !enabled);
+                    onToggleProviderMenu={() => {
+                      setProviderMenuOpen((open) => !open);
                       setModelMenuOpen(false);
+                    }}
+                    onSelectProvider={(providerId) => {
+                      setProviderMenuOpen(false);
+                      if (providerId !== aiActiveProviderId) void activateAiProvider(providerId);
                     }}
                     onThinkingModeChange={setThinkingMode}
                     onTogglePermissionMenu={() => setPermissionMenuOpen((open) => !open)}
@@ -5330,6 +5331,28 @@ export default function App() {
             </section>
           </section>
         </div>
+        {previewAttachment && (
+          <div className="imagePreviewOverlay" role="dialog" aria-modal="true" aria-label={`查看图片 ${previewAttachment.name}`} onClick={() => setPreviewAttachment(null)}>
+            <div className="imagePreviewDialog" onClick={(event) => event.stopPropagation()}>
+              <div className="imagePreviewHeader">
+                <div>
+                  <strong>{previewAttachment.name}</strong>
+                  <small>{previewAttachment.mimeType}</small>
+                </div>
+                <div className="imagePreviewActions">
+                  <a href={attachmentImageSource(previewAttachment)} download={previewAttachment.name} title="保存原图">
+                    <Save size={16} />
+                    保存原图
+                  </a>
+                  <button type="button" onClick={() => setPreviewAttachment(null)} aria-label="关闭图片预览"><X size={18} /></button>
+                </div>
+              </div>
+              <div className="imagePreviewCanvas">
+                <img src={attachmentImageSource(previewAttachment)} alt={previewAttachment.name} />
+              </div>
+            </div>
+          </div>
+        )}
         {/* 右侧 diff 对比面板 */}
         {diffPanel && (
           <aside className="diffPanel" aria-label="代码审核">

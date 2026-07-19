@@ -8,8 +8,8 @@ import { portableExecutor } from "./executor";
 import { managedProcessManager } from "./processManager";
 import { executeMcpTool, listMcpToolDefinitions } from "../integrations/mcpClient";
 import { generateImage, type ImageQuality, type ImageSize } from "../providers/imageProvider";
-import { analyzeShellCommand, assertNotSymlinkEscape, assertPathInsideWorkspace, getWorkspaceRoot, sandboxPolicyName } from "../security/sandbox";
-import type { AgentToolName, BuiltinToolName, DiffResult, ExecutorResult, ManagedProcessSnapshot, ToolCall, ToolDefinition, ToolResult } from "../shared/types";
+import { assertNotSymlinkEscape, assertPathInsideWorkspace, getWorkspaceRoot, resolveWorkspacePath, sandboxPolicyName } from "../security/sandbox";
+import type { AgentToolName, BuiltinToolName, DiffResult, ExecutorResult, ManagedProcessSnapshot, PermissionMode, ToolCall, ToolDefinition, ToolResult } from "../shared/types";
 
 const ignoredWorkspaceEntries = new Set([
   ".DS_Store",
@@ -224,7 +224,7 @@ export const registeredTools: ToolDefinition[] = [
   { id: "search_text", name: "search_text", description: "Search text in workspace files while ignoring build artifacts.", inputSchema: inputSchemas.search_text, source: "builtin", risk: "low", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "inspect_tree", name: "inspect_tree", description: "Inspect the workspace directory tree.", inputSchema: inputSchemas.inspect_tree, source: "builtin", risk: "low", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "project_diagnostics", name: "project_diagnostics", description: "Run configured project typecheck, lint, test, or build diagnostics inside the workspace.", inputSchema: inputSchemas.project_diagnostics, source: "builtin", risk: "low", requiresSandbox: true, requiresExecutor: true, defaultApproval: "allow", approvalMode: "allow" },
-  { id: "generate_image", name: "generate_image", description: "Generate images with the selected provider's configured image model. This uses a paid network API and always requires approval.", inputSchema: inputSchemas.generate_image, source: "builtin", risk: "high", requiresSandbox: false, defaultApproval: "ask", approvalMode: "ask" },
+  { id: "generate_image", name: "generate_image", description: "Generate images when the user requests an actual image. Uses the selected provider's automatically detected image model; omit model unless the user explicitly chooses one.", inputSchema: inputSchemas.generate_image, source: "builtin", risk: "high", requiresSandbox: false, defaultApproval: "allow", approvalMode: "allow" },
   { id: "record_learning", name: "record_learning", description: "Save a verified reusable lesson to this project's learning records. Never store credentials, personal data, raw logs, or unverified guesses.", inputSchema: inputSchemas.record_learning, source: "builtin", risk: "low", requiresSandbox: false, defaultApproval: "allow", approvalMode: "allow" },
   { id: "apply_patch", name: "apply_patch", description: "Patch an existing file using unified diff or exact oldText/newText replacement.", inputSchema: inputSchemas.apply_patch, source: "builtin", risk: "high", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "web_fetch", name: "web_fetch", description: "Fetch documentation or API references from a URL.", inputSchema: inputSchemas.web_fetch, source: "builtin", risk: "medium", requiresSandbox: false, defaultApproval: "ask", approvalMode: "ask" },
@@ -267,6 +267,26 @@ function getString(value: unknown, field: string): string {
 
 function getNumber(value: unknown, fallback: number) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+interface ToolExecutionContext {
+  conversationId?: string;
+  permissionEffect?: string;
+  permissionReason?: string;
+  permissionMode?: PermissionMode;
+  providerId?: string;
+}
+
+async function resolveReadableToolPath(input: unknown, projectPath: string | undefined, allowOutsideWorkspace: boolean) {
+  return allowOutsideWorkspace
+    ? resolveWorkspacePath(input, projectPath)
+    : assertPathInsideWorkspace(input, projectPath);
+}
+
+async function resolveWritableToolPath(input: unknown, projectPath: string | undefined, allowOutsideWorkspace: boolean) {
+  return allowOutsideWorkspace
+    ? resolveWorkspacePath(input, projectPath)
+    : assertNotSymlinkEscape(input, projectPath);
 }
 
 function formatProcess(process: ManagedProcessSnapshot) {
@@ -415,8 +435,9 @@ function buildExecutorToolResult(
   };
 }
 
-export async function executeTool(call: ToolCall, projectPath?: string, context?: { conversationId?: string; permissionEffect?: string; permissionReason?: string; providerId?: string }): Promise<ToolResult> {
+export async function executeTool(call: ToolCall, projectPath?: string, context?: ToolExecutionContext): Promise<ToolResult> {
   const startedAt = Date.now();
+  const allowOutsideWorkspace = context?.permissionMode === "full_access";
   let auditEventId: string | undefined;
   let exitCode: number | undefined;
   let outputSummary = "";
@@ -458,11 +479,11 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         attachments: mcpResult.attachments
       };
     } else if (call.name === "read_file") {
-      const filePath = await assertPathInsideWorkspace(call.arguments.path, projectPath);
+      const filePath = await resolveReadableToolPath(call.arguments.path, projectPath, allowOutsideWorkspace);
       const content = await readFile(filePath.canonicalPath, "utf8");
       result = { toolCallId: call.id, name: call.name, ok: true, content: content.slice(0, 12000) };
     } else if (call.name === "write_file") {
-      const filePath = await assertNotSymlinkEscape(call.arguments.path, projectPath);
+      const filePath = await resolveWritableToolPath(call.arguments.path, projectPath, allowOutsideWorkspace);
       const content = getString(call.arguments.content, "content");
       let oldContent: string | null = null;
       if (existsSync(filePath.canonicalPath)) oldContent = await readFile(filePath.canonicalPath, "utf8");
@@ -478,7 +499,7 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         diffs: [diff]
       };
     } else if (call.name === "apply_patch") {
-      const filePath = await assertNotSymlinkEscape(call.arguments.path, projectPath);
+      const filePath = await resolveWritableToolPath(call.arguments.path, projectPath, allowOutsideWorkspace);
       const oldContent = await readFile(filePath.canonicalPath, "utf8");
       const patchText = typeof call.arguments.patch === "string" ? call.arguments.patch : "";
       const newContent = patchText
@@ -495,26 +516,26 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         diffs: [diff]
       };
     } else if (call.name === "list_files") {
-      const dir = await assertPathInsideWorkspace(call.arguments.path ?? ".", projectPath);
+      const dir = await resolveReadableToolPath(call.arguments.path ?? ".", projectPath, allowOutsideWorkspace);
       const dirStat = await stat(dir.canonicalPath);
       if (!dirStat.isDirectory()) throw new Error("path must be a directory");
       const files = await walkFiles(dir.canonicalPath, getNumber(call.arguments.maxResults, 200));
       result = { toolCallId: call.id, name: call.name, ok: true, content: files.join("\n").slice(0, 12000) };
     } else if (call.name === "search_text") {
-      const dir = await assertPathInsideWorkspace(call.arguments.path ?? ".", projectPath);
+      const dir = await resolveReadableToolPath(call.arguments.path ?? ".", projectPath, allowOutsideWorkspace);
       const query = getString(call.arguments.query, "query");
       const pattern = new RegExp(query, "i");
       const matches = await walkFiles(dir.canonicalPath, getNumber(call.arguments.maxResults, 80), { query: pattern });
       result = { toolCallId: call.id, name: call.name, ok: true, content: matches.join("\n").slice(0, 12000) };
     } else if (call.name === "inspect_tree") {
-      const dir = await assertPathInsideWorkspace(call.arguments.path ?? ".", projectPath);
+      const dir = await resolveReadableToolPath(call.arguments.path ?? ".", projectPath, allowOutsideWorkspace);
       const tree = await inspectTree(dir.canonicalPath, Math.min(getNumber(call.arguments.depth, 2), 5));
       result = { toolCallId: call.id, name: call.name, ok: true, content: tree.slice(0, 12000) };
     } else if (call.name === "project_diagnostics") {
-      const cwd = call.arguments.cwd ? (await assertPathInsideWorkspace(call.arguments.cwd, projectPath)).canonicalPath : getWorkspaceRoot(projectPath);
+      const cwd = call.arguments.cwd ? (await resolveReadableToolPath(call.arguments.cwd, projectPath, allowOutsideWorkspace)).canonicalPath : getWorkspaceRoot(projectPath);
       const kind = typeof call.arguments.kind === "string" ? call.arguments.kind : "typecheck";
       const command = await diagnosticCommand(cwd, kind);
-      executorResult = await portableExecutor.run({ command, cwd, projectPath });
+      executorResult = await portableExecutor.run({ command, cwd, projectPath, allowOutsideWorkspace });
       exitCode = executorResult.exitCode;
       result = buildExecutorToolResult(call, executorResult, context);
     } else if (call.name === "generate_image") {
@@ -561,9 +582,7 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         throw new Error("Computer control shell is disabled by config/agent.toml");
       }
       const command = getString(call.arguments.command, "command");
-      const analysis = await analyzeShellCommand(command, call.arguments.cwd, projectPath);
-      if (analysis.blockedReason) throw new Error(analysis.blockedReason);
-      executorResult = await portableExecutor.run({ command, cwd: analysis.cwd, projectPath, secretRefs: call.arguments.secretRefs });
+      executorResult = await portableExecutor.run({ command, cwd: call.arguments.cwd, projectPath, allowOutsideWorkspace, secretRefs: call.arguments.secretRefs });
       exitCode = executorResult.exitCode;
       result = buildExecutorToolResult(call, executorResult, context);
     } else if (call.name === "start_process") {
@@ -575,6 +594,7 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         command,
         cwd: call.arguments.cwd,
         projectPath,
+        allowOutsideWorkspace,
         label: typeof call.arguments.label === "string" ? call.arguments.label : undefined,
         startupWaitMs: getNumber(call.arguments.startupWaitMs, 700),
         secretRefs: call.arguments.secretRefs
@@ -615,7 +635,7 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         content: processes.length ? processes.map((process) => formatProcess({ ...process, output: process.output.slice(-2_000) })).join("\n\n---\n\n") : "No managed processes for this project."
       };
     } else if (call.name === "docker_compose") {
-      const cwd = call.arguments.cwd ? (await assertPathInsideWorkspace(call.arguments.cwd, projectPath)).canonicalPath : getWorkspaceRoot(projectPath);
+      const cwd = call.arguments.cwd ? (await resolveReadableToolPath(call.arguments.cwd, projectPath, allowOutsideWorkspace)).canonicalPath : getWorkspaceRoot(projectPath);
       const action = getString(call.arguments.action, "action");
       const allowedActions = new Set(["config", "ps", "logs", "build", "pull", "up", "down", "restart"]);
       if (!allowedActions.has(action)) throw new Error(`Unsupported Docker Compose action: ${action}`);
@@ -624,11 +644,11 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
       const tail = Math.max(1, Math.min(getNumber(call.arguments.tail, 200), 2_000));
       const actionArgs = action === "logs" ? `logs --no-color --tail ${tail}` : action === "up" ? "up --detach" : action;
       const command = `docker compose ${actionArgs}${serviceArgs ? ` ${serviceArgs}` : ""}`;
-      executorResult = await portableExecutor.run({ command, cwd, projectPath });
+      executorResult = await portableExecutor.run({ command, cwd, projectPath, allowOutsideWorkspace });
       exitCode = executorResult.exitCode;
       result = buildExecutorToolResult(call, executorResult, context);
     } else if (call.name === "sqlite_query") {
-      const databasePath = await assertNotSymlinkEscape(call.arguments.path, projectPath);
+      const databasePath = await resolveWritableToolPath(call.arguments.path, projectPath, allowOutsideWorkspace);
       const query = getString(call.arguments.query, "query").trim();
       if (!query) throw new Error("query is required");
       const readOnly = isReadOnlySql(query);
@@ -646,13 +666,13 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         database.close();
       }
     } else if (call.name === "git_status" || call.name === "git_diff") {
-      const cwd = call.arguments.cwd ? (await assertPathInsideWorkspace(call.arguments.cwd, projectPath)).canonicalPath : getWorkspaceRoot(projectPath);
+      const cwd = call.arguments.cwd ? (await resolveReadableToolPath(call.arguments.cwd, projectPath, allowOutsideWorkspace)).canonicalPath : getWorkspaceRoot(projectPath);
       const command = call.name === "git_status" ? "git status --short --branch" : `git diff ${call.arguments.staged ? "--staged" : ""}`;
-      executorResult = await portableExecutor.run({ command, cwd, projectPath });
+      executorResult = await portableExecutor.run({ command, cwd, projectPath, allowOutsideWorkspace });
       exitCode = executorResult.exitCode;
       result = buildExecutorToolResult(call, executorResult, context);
     } else if (call.name === "git_branch" || call.name === "git_stage" || call.name === "git_commit" || call.name === "git_push") {
-      const cwd = call.arguments.cwd ? (await assertPathInsideWorkspace(call.arguments.cwd, projectPath)).canonicalPath : getWorkspaceRoot(projectPath);
+      const cwd = call.arguments.cwd ? (await resolveReadableToolPath(call.arguments.cwd, projectPath, allowOutsideWorkspace)).canonicalPath : getWorkspaceRoot(projectPath);
       let command: string;
       if (call.name === "git_branch") {
         const branch = shellQuote(getString(call.arguments.name, "name"));
@@ -660,7 +680,7 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
       } else if (call.name === "git_stage") {
         const paths = Array.isArray(call.arguments.paths) ? call.arguments.paths.map(String) : [];
         if (paths.length === 0) throw new Error("paths is required");
-        for (const item of paths) await assertPathInsideWorkspace(item, projectPath);
+        for (const item of paths) await resolveReadableToolPath(item, projectPath, allowOutsideWorkspace);
         command = `git add -- ${paths.map(shellQuote).join(" ")}`;
       } else if (call.name === "git_commit") {
         command = `git commit -m ${shellQuote(getString(call.arguments.message, "message"))}`;
@@ -669,7 +689,7 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         const branch = typeof call.arguments.branch === "string" ? ` ${shellQuote(call.arguments.branch)}` : "";
         command = `git push${call.arguments.setUpstream ? " --set-upstream" : ""} ${remote}${branch}`;
       }
-      executorResult = await portableExecutor.run({ command, cwd, projectPath });
+      executorResult = await portableExecutor.run({ command, cwd, projectPath, allowOutsideWorkspace });
       exitCode = executorResult.exitCode;
       result = buildExecutorToolResult(call, executorResult, context);
     } else {

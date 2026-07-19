@@ -1,7 +1,6 @@
 import { App as CapacitorApp } from "@capacitor/app";
 import { Capacitor } from "@capacitor/core";
 import {
-  Activity,
   ArrowLeft,
   Bot,
   Brain,
@@ -13,8 +12,6 @@ import {
   Code2,
   Cpu,
   Folder,
-  Gauge,
-  History,
   Image,
   KeyRound,
   LayoutGrid,
@@ -29,6 +26,7 @@ import {
   Settings,
   ShieldCheck,
   Smartphone,
+  Square,
   SquarePen,
   Terminal,
   Wrench,
@@ -40,7 +38,6 @@ import {
   ApiError,
   AuthResult,
   createId,
-  generateWorkImage,
   GeneratedImage,
   readCachedUser,
   readLocalState,
@@ -58,8 +55,9 @@ import {
   writeToken
 } from "./api";
 import { ConnectionState, RemoteController } from "./remote";
+import { requestedImageModel } from "./image-model";
 
-type Screen = "work" | "projects" | "sessions" | "console" | "activity" | "settings";
+type Screen = "work" | "code" | "console" | "settings";
 type RunMode = "default" | "plan" | "workspace_write" | "custom" | "full_access";
 type ThinkingMode = "fast" | "balanced" | "deep";
 type WorkPicker = "provider" | "model" | "thinking" | null;
@@ -435,9 +433,8 @@ export function App() {
   const selectedApproval = approval && selectedCommands.some((command) => command.id === approval.commandId) ? approval : undefined;
 
   let activeScreen = screen;
-  if ((activeScreen === "projects" || activeScreen === "sessions" || activeScreen === "console") && !selectedDevice) activeScreen = "work";
-  if ((activeScreen === "sessions" || activeScreen === "console") && !selectedProject) activeScreen = "projects";
-  if (activeScreen === "console" && !selectedSession) activeScreen = "sessions";
+  if ((activeScreen === "code" || activeScreen === "console") && (!selectedDevice || !selectedProject)) activeScreen = "work";
+  if (activeScreen === "console" && !selectedSession) activeScreen = "code";
   activeScreenRef.current = activeScreen;
 
   const navigate = useCallback((next: Screen) => {
@@ -450,15 +447,23 @@ export function App() {
     window.requestAnimationFrame(() => window.scrollTo({ top: 0, left: 0, behavior: "auto" }));
   }, [setDrawer, setModeMenu, setWorkPicker]);
 
+  const switchModeInDrawer = useCallback((next: "work" | "code") => {
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+    activeScreenRef.current = next;
+    setModeMenu(false);
+    setWorkPicker(null);
+    setScreen(next);
+    window.requestAnimationFrame(() => window.scrollTo({ top: 0, left: 0, behavior: "auto" }));
+  }, [setModeMenu, setWorkPicker]);
+
   const goBack = useCallback(() => {
     const current = activeScreenRef.current;
     if (workPickerRef.current) setWorkPicker(null);
     else if (modeMenuOpenRef.current) setModeMenu(false);
     else if (drawerOpenRef.current) setDrawer(false);
-    else if (current === "console") navigate("sessions");
-    else if (current === "sessions") navigate("projects");
-    else if (current === "projects") navigate("work");
-    else if (current === "activity" || current === "settings") navigate("work");
+    else if (current === "console") navigate("code");
+    else if (current === "code") navigate("work");
+    else if (current === "settings") navigate("work");
     else if (current === "work" && Capacitor.isNativePlatform()) void CapacitorApp.minimizeApp();
   }, [navigate, setDrawer, setModeMenu, setWorkPicker]);
 
@@ -689,11 +694,11 @@ export function App() {
     }
   }
 
-  function createSession() {
-    if (!selectedDevice || !selectedProject) return;
+  function createSessionForProject(project: RemoteWorkspaceProject) {
+    if (!selectedDevice) return;
     const session: SavedSession = {
       deviceId: selectedDevice.id,
-      projectId: selectedProject.id,
+      projectId: project.id,
       id: createId("mobile-session"),
       title: "新会话",
       updatedAt: new Date().toISOString(),
@@ -701,6 +706,7 @@ export function App() {
       model: currentProvider?.model || selectedDevice.workspace?.defaultModel || models[0]
     };
     updateSavedSession(session);
+    setSelectedProjectId(project.id);
     setSelectedSessionId(session.id);
     navigate("console");
   }
@@ -728,7 +734,7 @@ export function App() {
     setWorkSessions((current) => current.map((session) => session.id === activeWorkSession.id ? { ...session, ...options, updatedAt: Date.now() } : session));
   }
 
-  function openCodeProjects() {
+  function openCodeMode(keepDrawerOpen: boolean) {
     const device = snapshot.devices.find((item) => item.id === selectedDeviceId && item.online && item.ready)
       || snapshot.devices.find((item) => item.online && item.ready);
     if (!device) {
@@ -741,9 +747,15 @@ export function App() {
     const nextProject = availableProjects.find((project) => project.id === selectedProjectId)
       || availableProjects.find((project) => project.id === device.workspace?.activeProjectId)
       || availableProjects[0];
+    if (!nextProject) {
+      setError("电脑端还没有可用项目");
+      navigate("work");
+      return;
+    }
     setSelectedProjectId(nextProject?.id || "");
     setSelectedSessionId("");
-    navigate("projects");
+    if (keepDrawerOpen) switchModeInDrawer("code");
+    else navigate("code");
   }
 
   async function logout() {
@@ -765,13 +777,11 @@ export function App() {
   if (booting) return <Splash />;
   if (!user) return <AuthScreen onAuthenticated={(session) => setUser(session.user)} />;
 
-  const title = activeScreen === "projects" ? "Code"
-    : activeScreen === "sessions" ? selectedProject?.name || "会话"
+  const title = activeScreen === "code" ? "Code"
       : activeScreen === "console" ? selectedSession?.title || "新会话"
-        : activeScreen === "activity" ? "任务"
-          : activeScreen === "settings" ? "设置" : "聊天";
-  const isRootScreen = activeScreen === "work" || activeScreen === "projects" || activeScreen === "activity" || activeScreen === "settings";
-  const isModeRoot = activeScreen === "work" || activeScreen === "projects";
+        : activeScreen === "settings" ? "设置" : "聊天";
+  const isRootScreen = activeScreen === "work" || activeScreen === "code" || activeScreen === "console" || activeScreen === "settings";
+  const isModeRoot = activeScreen === "work" || activeScreen === "code";
   const recentWorkSessions = [...workSessions].filter((session) => session.messages.length > 0).sort((left, right) => right.updatedAt - left.updatedAt).slice(0, 12);
 
   return (
@@ -781,14 +791,21 @@ export function App() {
         user={user}
         active={activeScreen}
         codeAvailable={codeAvailable}
-        running={snapshot.commands.filter((command) => command.status === "queued" || command.status === "running" || command.status === "awaiting_approval").length}
         activeWorkSessionId={activeWorkSession?.id || ""}
+        activeCodeSessionId={selectedSessionId}
         sessions={recentWorkSessions}
+        codeDevice={selectedDevice}
+        codeProjects={projects}
+        savedCodeSessions={savedSessions}
+        codeCommands={snapshot.commands}
         onClose={() => setDrawer(false)}
         onNewWork={newWorkSession}
         onNavigate={navigate}
-        onOpenCode={openCodeProjects}
+        onSwitchChat={() => switchModeInDrawer("work")}
+        onOpenCode={() => openCodeMode(true)}
         onOpenSession={(session) => { setActiveWorkSessionId(session.id); navigate("work"); }}
+        onNewCodeSession={createSessionForProject}
+        onOpenCodeSession={(project, session) => { setSelectedProjectId(project.id); setSelectedSessionId(session.id); navigate("console"); }}
       />
       <header className="topBar">
         <div className="topBarSide">
@@ -797,7 +814,6 @@ export function App() {
         <div className="topBarTitle">{isModeRoot ? <button className="topModelButton" onClick={() => setModeMenu(!modeMenuOpen)} aria-haspopup="menu" aria-expanded={modeMenuOpen}><strong>{activeScreen === "work" ? "聊天" : "Code"}</strong><ChevronDown className={modeMenuOpen ? "open" : ""} size={14} /></button> : <strong>{title}</strong>}<span className={activeScreen === "work" ? (workConfig.configured ? "online" : "offline") : connection}>{activeScreen === "work" ? (activeWorkSession?.model || workConfig.model || (workConfig.configured ? "云端可用" : "待配置")) : activeScreen === "console" ? currentModel : connectionCopy(connection)}</span></div>
         <div className="topBarSide right">
           {activeScreen === "work" && <button className="iconButton" onClick={newWorkSession} aria-label="新建聊天"><SquarePen size={21} /></button>}
-          {activeScreen === "sessions" && <button className="iconButton" onClick={createSession} aria-label="新建会话"><Plus size={22} /></button>}
         </div>
       </header>
 
@@ -809,10 +825,10 @@ export function App() {
             <span><strong>聊天</strong><small>云端 AI · 随时可用</small></span>
             {activeScreen === "work" && <Check size={17} />}
           </button>
-          <button className={activeScreen === "projects" || activeScreen === "sessions" || activeScreen === "console" ? "active" : ""} role="menuitem" onClick={openCodeProjects} disabled={!codeAvailable}>
+          <button className={activeScreen === "code" || activeScreen === "console" ? "active" : ""} role="menuitem" onClick={() => openCodeMode(false)} disabled={!codeAvailable}>
             <Code2 size={19} />
             <span><strong>Code</strong><small>{codeAvailable ? "电脑在线 · 项目模式" : "电脑离线 · 已锁定"}</small></span>
-            {activeScreen === "projects" || activeScreen === "sessions" || activeScreen === "console" ? <Check size={17} /> : !codeAvailable ? <LockKeyhole size={15} /> : null}
+            {activeScreen === "code" || activeScreen === "console" ? <Check size={17} /> : !codeAvailable ? <LockKeyhole size={15} /> : null}
           </button>
         </div>
       </div>}
@@ -836,16 +852,7 @@ export function App() {
         onError={setError}
       />}
 
-      {activeScreen === "projects" && selectedDevice && <ProjectScreen device={selectedDevice} projects={projects} commands={snapshot.commands} onSelect={(project) => {
-        setSelectedProjectId(project.id);
-        setSelectedSessionId("");
-        navigate("sessions");
-      }} />}
-
-      {activeScreen === "sessions" && selectedDevice && selectedProject && <SessionScreen sessions={sessions} commands={snapshot.commands.filter((command) => command.deviceId === selectedDevice.id && command.projectId === selectedProject.id)} onCreate={createSession} onSelect={(session) => {
-        setSelectedSessionId(session.id);
-        navigate("console");
-      }} />}
+      {activeScreen === "code" && selectedDevice && selectedProject && <CodeHomeScreen device={selectedDevice} project={selectedProject} />}
 
       {activeScreen === "console" && selectedDevice && selectedProject && selectedSession && <ChatScreen
         device={selectedDevice}
@@ -904,27 +911,10 @@ export function App() {
         }}
       />}
 
-      {activeScreen === "activity" && <ActivityScreen commands={snapshot.commands} devices={snapshot.devices} onOpen={(command) => {
-        const device = snapshot.devices.find((item) => item.id === command.deviceId);
-        const project = device ? fallbackProjects(device).find((item) => item.id === command.projectId) : undefined;
-        const session = project?.sessions.find((item) => item.id === command.sessionId)
-          || savedSessions.find((item) => item.deviceId === command.deviceId && item.projectId === command.projectId && item.id === command.sessionId);
-        if (!device?.online || !device.ready || !project || !session) {
-          setError("电脑当前不在线，请先使用聊天模式");
-          navigate("work");
-          return;
-        }
-        setSelectedDeviceId(device.id);
-        setSelectedProjectId(project.id);
-        setSelectedSessionId(session.id);
-        navigate("console");
-      }} />}
-
       {activeScreen === "settings" && <SettingsScreen
         user={user}
         apiBase={API_BASE}
         devices={snapshot.devices}
-        commands={snapshot.commands}
         preferences={preferences}
         workConfig={workConfig}
         onPreferencesChange={setPreferences}
@@ -975,19 +965,8 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (session: AuthResult
   </main>;
 }
 
-function ProjectScreen({ device, projects, commands, onSelect }: { device: RemoteDevice; projects: RemoteWorkspaceProject[]; commands: RemoteCommand[]; onSelect: (project: RemoteWorkspaceProject) => void }) {
-  return <section className="detailPage"><div className="contextStrip"><span className={device.online ? "onlineDot active" : "onlineDot"} />{device.name}<small>{device.online ? "电脑在线" : "电脑离线"}</small></div><div className="sectionHeading"><p className="overline">PROJECTS</p><h1>选择项目</h1><p>任务会在所选电脑的本机项目中执行。</p></div>{projects.length === 0 ? <EmptyState icon={<Folder size={30} />} title="没有可用项目" copy="请先在电脑端 Rcode 中打开一个本地项目。" /> : <div className="wechatList">{projects.map((project, index) => {
-    const projectCommands = commands.filter((command) => command.deviceId === device.id && command.projectId === project.id);
-    const latest = projectCommands[0];
-    return <button className="wechatRow" key={project.id} onClick={() => onSelect(project)}><div className="rowIndex">{String(index + 1).padStart(2, "0")}</div><div className="rowBody"><div><strong>{project.name}</strong><time>{project.sessions.length} 个会话</time></div><p>{latest?.summary || "进入项目查看会话"}</p></div><ChevronRight size={18} /></button>;
-  })}</div>}</section>;
-}
-
-function SessionScreen({ sessions, commands, onSelect, onCreate }: { sessions: ClientSession[]; commands: RemoteCommand[]; onSelect: (session: ClientSession) => void; onCreate: () => void }) {
-  return <section className="detailPage sessionsPage"><div className="sectionHeading"><p className="overline">CONVERSATIONS</p><h1>会话</h1><p>每个会话保留独立上下文、模型和任务记录。</p></div>{sessions.length === 0 ? <EmptyState icon={<MessageCircle size={30} />} title="还没有会话" copy="新建会话后，就可以像发消息一样给电脑安排工作。" action="新建会话" onAction={onCreate} /> : <div className="wechatList">{sessions.map((session) => {
-    const latest = commands.find((command) => command.sessionId === session.id);
-    return <button className="wechatRow" key={session.id} onClick={() => onSelect(session)}><div className="rowAvatar chat"><MessageCircle size={23} /></div><div className="rowBody"><div><strong>{session.title}</strong><time>{shortTime(session.updatedAt)}</time></div><p>{latest?.summary || session.model || "开始新的远程任务"}</p></div>{latest && ["running", "queued", "awaiting_approval"].includes(latest.status) ? <span className="unreadDot" /> : <ChevronRight size={18} />}</button>;
-  })}</div>}</section>;
+function CodeHomeScreen({ device, project }: { device: RemoteDevice; project: RemoteWorkspaceProject }) {
+  return <section className="codeHomePage"><div className="codeHomeMark"><Folder size={30} fill="currentColor" /></div><p className="overline">CODE WORKSPACE</p><h1>{project.name}</h1><p>从左侧项目文件夹中选择会话，或点击文件夹右侧的加号创建新会话。</p><div className="codeHomeDevice"><span className={device.online ? "onlineDot active" : "onlineDot"} /><span>{device.name}</span><small>{device.online ? "电脑在线" : "电脑离线"}</small></div></section>;
 }
 
 function ChatScreen({ device, project, commands, events, approval, providers, providerId, models, model, canSend, initialMode, initialThinkingMode, onProviderChange, onModelChange, onPreferencesChange, onSend, onApproval }: { device: RemoteDevice; project: RemoteWorkspaceProject; commands: RemoteCommand[]; events: LiveEvent[]; approval?: ApprovalRequest; providers: WorkAiProvider[]; providerId: string; models: string[]; model: string; canSend: boolean; initialMode: RunMode; initialThinkingMode: ThinkingMode; onProviderChange: (providerId: string) => void; onModelChange: (model: string) => void; onPreferencesChange: (preferences: MobilePreferences) => void; onSend: (prompt: string, mode: RunMode, thinkingMode: ThinkingMode) => boolean; onApproval: (allow: boolean, mode: RunMode, thinkingMode: ThinkingMode) => void }) {
@@ -1046,7 +1025,7 @@ function ChatScreen({ device, project, commands, events, approval, providers, pr
         <label className="compactSelect"><Brain size={13} /><select aria-label="思考强度" value={thinkingMode} onChange={(event) => updateThinkingMode(event.target.value as ThinkingMode)}>{THINKING_MODES.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select><ChevronDown size={12} /></label>
         <span>{canSend ? "电脑在线" : "电脑不可用"}</span>
       </div>
-      <div className="composerRow"><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={1} placeholder={canSend ? "发送消息…" : "等待电脑上线"} disabled={!canSend} /><button aria-label="发送" disabled={!canSend || !prompt.trim()}><Send size={19} /></button></div>
+      <div className="composerRow"><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={1} placeholder={canSend ? "发送消息" : "等待电脑上线"} disabled={!canSend} /><button aria-label="发送" disabled={!canSend || !prompt.trim()}><Send size={19} /></button></div>
     </form>
   </section>;
 }
@@ -1078,15 +1057,16 @@ function WorkScreen({ config, loadingConfig, messages, initialProviderId, initia
   const [busy, setBusy] = useState(false);
   const [providerId, setProviderId] = useState(initialProvider?.id || "");
   const [model, setModel] = useState(initialProvider?.models.includes(initialModel || "") ? initialModel! : initialProvider?.model || config.model || "");
-  const [imageMode, setImageMode] = useState(false);
   const [imageModel, setImageModel] = useState(initialProvider?.imageModels?.includes(initialImageModel || "") ? initialImageModel! : initialProvider?.defaultImageModel || initialProvider?.imageModels?.[0] || "");
   const [thinkingMode, setThinkingMode] = useState<ThinkingMode>(initialThinkingMode);
+  const [previewImage, setPreviewImage] = useState<GeneratedImage | null>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
   const selectedProvider = providers.find((provider) => provider.id === providerId) || providers[0];
   const availableTextModels = selectedProvider?.models?.length ? selectedProvider.models : selectedProvider?.model ? [selectedProvider.model] : [];
-  const availableImageModels = selectedProvider?.imageModels?.length ? selectedProvider.imageModels : selectedProvider?.defaultImageModel ? [selectedProvider.defaultImageModel] : [];
-  const availableModels = imageMode ? availableImageModels : availableTextModels;
-  const activeModel = imageMode ? imageModel : model;
+  const availableModels = availableTextModels;
+  const activeModel = model;
+  const imageMode = false;
 
   useEffect(() => {
     const nextProvider = providers.find((provider) => provider.id === providerId)
@@ -1101,12 +1081,20 @@ function WorkScreen({ config, loadingConfig, messages, initialProviderId, initia
     if (nextProvider.id !== providerId) setProviderId(nextProvider.id);
     setModel((current) => nextProvider.models.includes(current) ? current : nextProvider.model);
     setImageModel((current) => nextProvider.imageModels?.includes(current) ? current : nextProvider.defaultImageModel || nextProvider.imageModels?.[0] || "");
-    if (imageMode && !nextProvider.defaultImageModel && !nextProvider.imageModels?.length) setImageMode(false);
-  }, [config.selectedProviderId, imageMode, providerId, providers]);
+  }, [config.selectedProviderId, providerId, providers]);
 
   useEffect(() => {
     timelineRef.current?.scrollTo({ top: timelineRef.current.scrollHeight, behavior: "auto" });
   }, [messages.length, messages[messages.length - 1]?.content.length, messages[messages.length - 1]?.images?.length, busy]);
+
+  useEffect(() => {
+    if (!previewImage) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setPreviewImage(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [previewImage]);
 
   function selectProvider(nextProviderId: string) {
     const nextProvider = providers.find((provider) => provider.id === nextProviderId);
@@ -1115,18 +1103,16 @@ function WorkScreen({ config, loadingConfig, messages, initialProviderId, initia
       setModel(nextProvider.model);
       const nextImageModel = nextProvider.defaultImageModel || nextProvider.imageModels?.[0] || "";
       setImageModel(nextImageModel);
-      if (imageMode && !nextImageModel) setImageMode(false);
       onSessionOptionsChange({ providerId: nextProvider.id, model: nextProvider.model, imageModel: nextImageModel, thinkingMode });
     }
   }
 
   function selectModel(nextModel: string) {
-    if (imageMode) setImageModel(nextModel);
-    else setModel(nextModel);
+    setModel(nextModel);
     if (selectedProvider) onSessionOptionsChange({
       providerId: selectedProvider.id,
-      model: imageMode ? model : nextModel,
-      imageModel: imageMode ? nextModel : imageModel,
+      model: nextModel,
+      imageModel,
       thinkingMode
     });
   }
@@ -1136,25 +1122,26 @@ function WorkScreen({ config, loadingConfig, messages, initialProviderId, initia
     if (selectedProvider && model) onSessionOptionsChange({ providerId: selectedProvider.id, model, imageModel, thinkingMode: nextMode });
   }
 
-  function toggleImageMode() {
-    if (!imageMode && availableImageModels.length === 0) {
-      onError("当前接口尚未配置图片模型，请先在电脑端 AI 接口中添加");
-      return;
-    }
-    setImageMode((current) => !current);
-    onPickerChange(null);
-    onError("");
-  }
-
   function openConfiguration() {
     onPickerChange(null);
     onConfigure();
+  }
+
+  function stopResponse() {
+    streamAbortRef.current?.abort();
   }
 
   async function submit(event: FormEvent) {
     event.preventDefault();
     const content = prompt.trim();
     if (!content || busy || !config.configured || !selectedProvider || !activeModel) return;
+    const configuredImageModels = [...new Set([selectedProvider.defaultImageModel, ...(selectedProvider.imageModels ?? [])].filter((candidate): candidate is string => Boolean(candidate)))];
+    const requestedImage = requestedImageModel(content, configuredImageModels);
+    if (requestedImage.reference && !requestedImage.model) {
+      onError(`图片模型“${requestedImage.reference}”未在当前接口配置`);
+      return;
+    }
+    const requestImageModel = requestedImage.model || imageModel;
     const userMessage: WorkChatMessage = { id: createId("work-user"), role: "user", content, createdAt: Date.now() };
     const nextMessages = [...messages, userMessage].slice(-60);
     onSessionOptionsChange({ providerId: selectedProvider.id, model, imageModel, thinkingMode });
@@ -1170,43 +1157,44 @@ function WorkScreen({ config, loadingConfig, messages, initialProviderId, initia
     setPrompt("");
     setBusy(true);
     onError("");
+    const streamController = new AbortController();
+    streamAbortRef.current = streamController;
     try {
-      if (imageMode) {
-        const result = await generateWorkImage({
-          prompt: content,
-          providerId: selectedProvider.id,
-          model: imageModel,
-          count: 1
-        });
-        if (!result.images.length) throw new Error("AI 服务未返回图片");
-        assistantMessage = {
-          ...assistantMessage,
-          content: result.images[0]?.revisedPrompt || "图片已生成",
-          model: result.model || imageModel,
-          images: result.images
-        };
-        publish();
-        return;
-      }
       await streamWorkChat({
         providerId: selectedProvider.id,
         model,
+        imageModel: requestImageModel,
+        autoImage: true,
         thinkingMode,
         messages: nextMessages.slice(-20).map((message) => ({ role: message.role, content: message.content }))
       }, (streamEvent) => {
         if (streamEvent.type === "delta") {
           assistantMessage = { ...assistantMessage, content: assistantMessage.content + streamEvent.delta };
           publish();
+        } else if (streamEvent.type === "image") {
+          assistantMessage = {
+            ...assistantMessage,
+            content: streamEvent.images[0]?.revisedPrompt || "图片已生成",
+            model: streamEvent.model || requestImageModel,
+            images: streamEvent.images
+          };
+          publish();
         } else if (streamEvent.type === "done") {
           assistantMessage = { ...assistantMessage, model: streamEvent.model || model, usage: streamEvent.usage };
           publish();
         }
-      });
-      if (!assistantMessage.content.trim()) throw new Error("AI 服务未返回文本内容");
+      }, streamController.signal);
+      if (!assistantMessage.content.trim() && !assistantMessage.images?.length) throw new Error("AI 服务未返回内容");
     } catch (reason) {
+      if (reason instanceof Error && reason.name === "AbortError") {
+        if (!assistantMessage.content.trim()) onMessagesChange(nextMessages);
+        onError("");
+        return;
+      }
       if (!assistantMessage.content) onMessagesChange(nextMessages);
       onError(reason instanceof Error ? reason.message : "聊天请求失败");
     } finally {
+      if (streamAbortRef.current === streamController) streamAbortRef.current = null;
       setBusy(false);
     }
   }
@@ -1217,33 +1205,37 @@ function WorkScreen({ config, loadingConfig, messages, initialProviderId, initia
         : messages.length === 0 ? <div className="workWelcome"><div><span>RC</span></div><h1>有什么可以帮忙的？</h1><p>选择接口和模型后，回复会实时显示。</p><div className="suggestionChips">{["整理今天的工作计划", "总结一段文字", "帮我分析一个问题"].map((text, index) => <button key={text} onClick={() => setPrompt(text)}><span>0{index + 1}</span>{text}<ChevronRight size={15} /></button>)}</div></div>
           : <div className="workMessages">{messages.map((message, index) => {
             const streaming = busy && message.role === "assistant" && index === messages.length - 1;
-            return <div className={`workMessage ${message.role}`} key={message.id}><div className="bubble">{message.images?.length ? <div className="workImageGrid">{message.images.map((generated) => <img key={generated.id} src={generated.dataUrl || generated.url} alt={generated.revisedPrompt || generated.name || "AI 生成图片"} loading="lazy" />)}</div> : null}{message.content ? <p>{message.content}</p> : streaming ? <div className="typing"><i /><i /><i /></div> : null}{message.role === "assistant" && <footer>{streaming ? <LoaderCircle className="spin" size={11} /> : message.images?.length ? <Image size={11} /> : <Cloud size={11} />}{streaming ? (imageMode ? "正在生成图片" : "实时回复中") : message.model || model}{message.usage?.totalTokens ? ` · ${message.usage.totalTokens.toLocaleString()} tokens` : ""}</footer>}</div></div>;
+            return <div className={`workMessage ${message.role}`} key={message.id}><div className="bubble">{message.images?.length ? <div className="workImageGrid">{message.images.map((generated) => <button type="button" key={generated.id} aria-label={`打开图片 ${generated.name}`} onClick={() => setPreviewImage(generated)}><img src={generated.dataUrl || generated.url} alt={generated.revisedPrompt || generated.name || "AI 生成图片"} loading="lazy" /></button>)}</div> : null}{message.content ? <p>{message.content}</p> : streaming ? <div className="typing"><i /><i /><i /></div> : null}{message.role === "assistant" && <footer>{streaming ? <LoaderCircle className="spin" size={11} /> : message.images?.length ? <Image size={11} /> : <Cloud size={11} />}{streaming ? "正在处理请求" : message.model || model}{message.usage?.totalTokens ? ` · ${message.usage.totalTokens.toLocaleString()} tokens` : ""}</footer>}</div></div>;
           })}</div>}
     </div>
-    <form className="workComposer" onSubmit={submit}><div className={`workComposerShell ${imageMode ? "imageMode" : ""}`}><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={1} placeholder={!config.configured ? "请先配置聊天 AI" : imageMode ? "描述你想生成的图片" : "发送消息"} disabled={!config.configured || busy} /><div className="workComposerFooter"><div className="workChatControls"><button type="button" className={`workImageModeButton ${imageMode ? "active" : ""}`} aria-label={imageMode ? "退出图片生成" : "使用图片模型"} aria-pressed={imageMode} onClick={toggleImageMode} disabled={!config.configured || busy}><Image size={14} /></button><button type="button" className="workChoicePill" aria-label="选择 AI 接口" aria-expanded={picker === "provider"} onClick={() => onPickerChange("provider")} disabled={!config.configured || providers.length === 0}><Cloud size={13} /><span>{selectedProvider?.displayName || "选择接口"}</span><ChevronDown size={11} /></button><button type="button" className="workChoicePill" aria-label={imageMode ? "选择图片模型" : "选择聊天模型"} aria-expanded={picker === "model"} onClick={() => onPickerChange("model")} disabled={!config.configured || availableModels.length === 0}>{imageMode ? <Image size={13} /> : <Bot size={13} />}<span>{activeModel || "选择模型"}</span><ChevronDown size={11} /></button>{!imageMode && <button type="button" className="workChoicePill thinkingPill" aria-label="选择思考强度" aria-expanded={picker === "thinking"} onClick={() => onPickerChange("thinking")} disabled={!config.configured}><Brain size={13} /><span>{THINKING_MODES.find((option) => option.id === thinkingMode)?.label}</span><ChevronDown size={11} /></button>}</div><button aria-label={imageMode ? "生成图片" : "发送聊天消息"} disabled={!config.configured || busy || !prompt.trim() || !selectedProvider || !activeModel}>{busy ? <LoaderCircle className="spin" size={18} /> : imageMode ? <Image size={18} /> : <Send size={18} />}</button></div></div><small>{busy ? (imageMode ? "图片生成中，请稍候…" : "正在实时接收回复…") : imageMode ? "图片由所选模型生成，请检查结果。" : "AI 可能会出错，请核对重要信息。"}</small></form>
-    {picker && <div className="workPickerLayer"><button type="button" className="workPickerScrim" aria-label="关闭选择面板" onClick={() => onPickerChange(null)} /><div className="workPickerSheet" role="dialog" aria-modal="true" aria-label={picker === "provider" ? "选择 AI 接口" : picker === "model" ? (imageMode ? "选择图片模型" : "选择聊天模型") : "选择思考强度"}><div className="workPickerHandle" /><header><div><h2>{picker === "provider" ? "选择接口" : picker === "model" ? (imageMode ? "选择图片模型" : "选择模型") : "思考强度"}</h2><p>{picker === "provider" ? `${providers.length} 个接口可用` : picker === "model" ? `${selectedProvider?.displayName || "当前接口"} · ${availableModels.length} 个模型` : "按任务复杂度选择本次对话的推理投入"}</p></div><button type="button" aria-label="关闭" onClick={() => onPickerChange(null)}><X size={18} /></button></header><div className="workPickerList">{picker === "provider" ? providers.map((provider) => <button type="button" className={provider.id === selectedProvider?.id ? "selected" : ""} key={provider.id} onClick={() => { selectProvider(provider.id); onPickerChange(null); }}><span className="workPickerIcon"><Cloud size={18} /></span><span className="workPickerCopy"><strong>{provider.displayName}</strong><small>{serviceHost(provider.baseUrl)} · {provider.models.length} 个文本模型 · {provider.imageModels?.length || 0} 个图片模型</small></span><span className="workPickerCheck">{provider.id === selectedProvider?.id && <Check size={16} />}</span></button>) : picker === "model" ? availableModels.map((option) => <button type="button" className={option === activeModel ? "selected" : ""} key={option} onClick={() => { selectModel(option); onPickerChange(null); }}><span className="workPickerIcon">{imageMode ? <Image size={18} /> : <Bot size={18} />}</span><span className="workPickerCopy"><strong>{option}</strong><small>{selectedProvider?.displayName || "当前接口"}</small></span><span className="workPickerCheck">{option === activeModel && <Check size={16} />}</span></button>) : THINKING_MODES.map((option) => <button type="button" className={option.id === thinkingMode ? "selected" : ""} key={option.id} onClick={() => { selectThinkingMode(option.id); onPickerChange(null); }}><span className="workPickerIcon"><Brain size={18} /></span><span className="workPickerCopy"><strong>{option.label}</strong><small>{option.description}</small></span><span className="workPickerCheck">{option.id === thinkingMode && <Check size={16} />}</span></button>)}</div>{picker !== "thinking" && <button type="button" className="workPickerManage" onClick={openConfiguration}><Settings size={17} /><span>{picker === "provider" ? "管理与添加接口" : "管理模型列表"}</span><ChevronRight size={15} /></button>}</div></div>}
+    <form className="workComposer" onSubmit={submit}>
+      <div className="workComposerTools">
+        <div className="workChatControls">
+          <button type="button" className="compactSelect workUnifiedModelButton" aria-label="选择接口或模型" aria-expanded={picker === "provider" || picker === "model"} onClick={() => onPickerChange(picker === "provider" || picker === "model" ? null : "provider")} disabled={!config.configured || providers.length === 0}><Bot size={13} /><span>{activeModel || "选择模型"}</span><ChevronDown size={11} /></button>
+          <button type="button" className="compactSelect workThinkingButton" aria-label="选择思考强度" aria-expanded={picker === "thinking"} onClick={() => onPickerChange("thinking")} disabled={!config.configured}><Brain size={13} /><span>{THINKING_MODES.find((option) => option.id === thinkingMode)?.label}</span><ChevronDown size={11} /></button>
+        </div>
+      </div>
+      <div className="workComposerShell">
+        <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={1} placeholder={!config.configured ? "请先配置聊天 AI" : "发送消息"} disabled={!config.configured || busy} />
+        <button type={busy ? "button" : "submit"} className={`workComposerSend ${busy ? "workStopButton" : ""}`} aria-label={busy ? "停止生成" : "发送消息"} onClick={busy ? stopResponse : undefined} disabled={!busy && (!config.configured || !prompt.trim() || !selectedProvider || !activeModel)}>{busy ? <Square size={15} fill="currentColor" /> : <Send size={18} />}</button>
+      </div>
+      <small>{busy ? "点击停止按钮可打断本次回复" : "图片需求会自动调用当前接口的生图模型。"}</small>
+    </form>
+    {picker && <div className="workPickerLayer">
+      <button type="button" className="workPickerScrim" aria-label="关闭选择面板" onClick={() => onPickerChange(null)} />
+      <div className="workPickerSheet" role="dialog" aria-modal="true" aria-label={picker === "thinking" ? "选择思考强度" : "接口与模型设置"}>
+        <div className="workPickerHandle" />
+        <header><div><h2>{picker === "thinking" ? "思考强度" : "接口与模型"}</h2><p>{picker === "thinking" ? "按任务复杂度选择本次对话的推理投入" : `${selectedProvider?.displayName || "当前接口"} · ${activeModel || "未选择模型"}`}</p></div><button type="button" aria-label="关闭" onClick={() => onPickerChange(null)}><X size={18} /></button></header>
+        {picker !== "thinking" && <div className="workPickerTabs" role="tablist" aria-label="接口与模型"><button type="button" className={picker === "provider" ? "active" : ""} role="tab" aria-selected={picker === "provider"} onClick={() => onPickerChange("provider")}><Cloud size={15} />接口</button><button type="button" className={picker === "model" ? "active" : ""} role="tab" aria-selected={picker === "model"} onClick={() => onPickerChange("model")}><Bot size={15} />模型</button></div>}
+        <div className="workPickerList">{picker === "provider" ? providers.map((provider) => <button type="button" className={provider.id === selectedProvider?.id ? "selected" : ""} key={provider.id} onClick={() => { selectProvider(provider.id); onPickerChange("model"); }}><span className="workPickerIcon"><Cloud size={18} /></span><span className="workPickerCopy"><strong>{provider.displayName}</strong><small>{serviceHost(provider.baseUrl)} · {provider.models.length} 个文本模型 · {provider.imageModels?.length || 0} 个图片模型</small></span><span className="workPickerCheck">{provider.id === selectedProvider?.id && <Check size={16} />}</span></button>) : picker === "model" ? availableModels.map((option) => <button type="button" className={option === activeModel ? "selected" : ""} key={option} onClick={() => { selectModel(option); onPickerChange(null); }}><span className="workPickerIcon"><Bot size={18} /></span><span className="workPickerCopy"><strong>{option}</strong><small>{selectedProvider?.displayName || "当前接口"}</small></span><span className="workPickerCheck">{option === activeModel && <Check size={16} />}</span></button>) : THINKING_MODES.map((option) => <button type="button" className={option.id === thinkingMode ? "selected" : ""} key={option.id} onClick={() => { selectThinkingMode(option.id); onPickerChange(null); }}><span className="workPickerIcon"><Brain size={18} /></span><span className="workPickerCopy"><strong>{option.label}</strong><small>{option.description}</small></span><span className="workPickerCheck">{option.id === thinkingMode && <Check size={16} />}</span></button>)}</div>
+        {picker !== "thinking" && <button type="button" className="workPickerManage" onClick={openConfiguration}><Settings size={17} /><span>管理接口与模型</span><ChevronRight size={15} /></button>}
+      </div>
+    </div>}
+    {previewImage && <div className="workImagePreview" role="dialog" aria-modal="true" aria-label={`查看图片 ${previewImage.name}`} onClick={() => setPreviewImage(null)}><div className="workImagePreviewDialog" onClick={(event) => event.stopPropagation()}><header><div><strong>{previewImage.name}</strong><small>{previewImage.mimeType}</small></div><button type="button" aria-label="关闭图片预览" onClick={() => setPreviewImage(null)}><X size={20} /></button></header><div><img src={previewImage.dataUrl || previewImage.url} alt={previewImage.revisedPrompt || previewImage.name} /></div></div></div>}
   </section>;
 }
 
-function ActivityScreen({ commands, devices, onOpen }: { commands: RemoteCommand[]; devices: RemoteDevice[]; onOpen: (command: RemoteCommand) => void }) {
-  const sorted = [...commands].sort((left, right) => right.updatedAt - left.updatedAt);
-  const running = sorted.filter((command) => command.status === "running" || command.status === "queued" || command.status === "awaiting_approval").length;
-  return <section className="rootPage activityPage">
-    <div className="pageHero"><p className="overline">REMOTE ACTIVITY</p><h1>任务</h1><p>查看所有电脑上的运行记录和实时状态。</p></div>
-    <div className="metricStrip"><div><strong>{running}</strong><span>进行中</span></div><div><strong>{sorted.filter((item) => item.status === "completed").length}</strong><span>已完成</span></div><div><strong>{sorted.length}</strong><span>全部任务</span></div></div>
-    {sorted.length === 0 ? <EmptyState icon={<History size={28} />} title="还没有任务" copy="从工作区进入一个会话并发送消息，任务会出现在这里。" /> : <div className="taskList">{sorted.map((command) => {
-      const device = devices.find((item) => item.id === command.deviceId);
-      const canOpen = Boolean(command.projectId && command.sessionId);
-      return <button key={command.id} className="taskRow" disabled={!canOpen} onClick={() => onOpen(command)}>
-        <span className={`taskState ${command.status}`}><Activity size={17} /></span>
-        <span className="taskCopy"><strong>{command.summary || (command.action === "agent.approve" ? "远程审批" : "远程任务")}</strong><small>{device?.name || "未知电脑"} · {commandStatusCopy(command.status)}</small></span>
-        <time>{shortTime(command.updatedAt)}</time>
-      </button>;
-    })}</div>}
-  </section>;
-}
-
-function SettingsScreen({ user, apiBase, devices, commands, preferences, workConfig, onPreferencesChange, onWorkConfigChange, onLogout }: { user: User; apiBase: string; devices: RemoteDevice[]; commands: RemoteCommand[]; preferences: MobilePreferences; workConfig: WorkAiConfig; onPreferencesChange: (preferences: MobilePreferences) => void; onWorkConfigChange: (config: WorkAiConfig) => void; onLogout: () => void }) {
+function SettingsScreen({ user, apiBase, devices, preferences, workConfig, onPreferencesChange, onWorkConfigChange, onLogout }: { user: User; apiBase: string; devices: RemoteDevice[]; preferences: MobilePreferences; workConfig: WorkAiConfig; onPreferencesChange: (preferences: MobilePreferences) => void; onWorkConfigChange: (config: WorkAiConfig) => void; onLogout: () => void }) {
   const models = [...new Set(devices.flatMap((device) => device.workspace?.models ?? []))];
   const online = devices.filter((device) => device.online).length;
   return <section className="rootPage settingsPage">
@@ -1260,7 +1252,6 @@ function SettingsScreen({ user, apiBase, devices, commands, preferences, workCon
       <div><LayoutGrid size={18} /><strong>{devices.reduce((total, device) => total + (device.workspace?.projects.length ?? 0), 0)}</strong><span>项目</span></div>
       <div><MessageCircle size={18} /><strong>{devices.reduce((total, device) => total + (device.workspace?.projects.reduce((count, project) => count + project.sessions.length, 0) ?? 0), 0)}</strong><span>会话</span></div>
       <div><Cpu size={18} /><strong>{models.length}</strong><span>模型</span></div>
-      <div><Gauge size={18} /><strong>{commands.length}</strong><span>任务</span></div>
     </div><div className="featureRows">
       <div><Cloud size={18} /><span><strong>聊天模式</strong><small>电脑离线时由云端 AI 继续对话</small></span><Check size={16} /></div>
       <div><Terminal size={18} /><span><strong>Code 模式</strong><small>电脑同时在线时使用项目和工具</small></span>{online > 0 ? <Check size={16} /> : <LockKeyhole size={16} />}</div>
@@ -1303,18 +1294,42 @@ function WorkAiSettings({ config, onChange }: { config: WorkAiConfig; onChange: 
   </section>;
 }
 
-function SideDrawer({ open, user, active, codeAvailable, running, activeWorkSessionId, sessions, onClose, onNewWork, onNavigate, onOpenCode, onOpenSession }: { open: boolean; user: User; active: Screen; codeAvailable: boolean; running: number; activeWorkSessionId: string; sessions: WorkChatSession[]; onClose: () => void; onNewWork: () => void; onNavigate: (screen: Screen) => void; onOpenCode: () => void; onOpenSession: (session: WorkChatSession) => void }) {
+function SideDrawer({ open, user, active, codeAvailable, activeWorkSessionId, activeCodeSessionId, sessions, codeDevice, codeProjects, savedCodeSessions, codeCommands, onClose, onNewWork, onNavigate, onSwitchChat, onOpenCode, onOpenSession, onNewCodeSession, onOpenCodeSession }: { open: boolean; user: User; active: Screen; codeAvailable: boolean; activeWorkSessionId: string; activeCodeSessionId: string; sessions: WorkChatSession[]; codeDevice?: RemoteDevice; codeProjects: RemoteWorkspaceProject[]; savedCodeSessions: SavedSession[]; codeCommands: RemoteCommand[]; onClose: () => void; onNewWork: () => void; onNavigate: (screen: Screen) => void; onSwitchChat: () => void; onOpenCode: () => void; onOpenSession: (session: WorkChatSession) => void; onNewCodeSession: (project: RemoteWorkspaceProject) => void; onOpenCodeSession: (project: RemoteWorkspaceProject, session: ClientSession) => void }) {
+  const [collapsedCodeFolders, setCollapsedCodeFolders] = useState<string[]>([]);
+  const codeMode = active === "code" || active === "console";
+
+  function projectSessions(project: RemoteWorkspaceProject): ClientSession[] {
+    if (!codeDevice) return [];
+    const saved = savedCodeSessions.filter((session) => session.deviceId === codeDevice.id && session.projectId === project.id);
+    const savedById = new Map(saved.map((session) => [session.id, session]));
+    const remote = project.sessions.map((session) => ({ ...session, providerId: savedById.get(session.id)?.providerId, model: savedById.get(session.id)?.model }));
+    const remoteIds = new Set(remote.map((session) => session.id));
+    return [...remote, ...saved.filter((session) => !remoteIds.has(session.id))]
+      .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime());
+  }
+
+  function toggleCodeFolder(projectId: string) {
+    setCollapsedCodeFolders((current) => current.includes(projectId) ? current.filter((id) => id !== projectId) : [...current, projectId]);
+  }
+
   return <div className={`drawerLayer ${open ? "open" : ""}`} aria-hidden={!open}>
     <button className="drawerScrim" aria-label="关闭菜单" onClick={onClose} tabIndex={open ? 0 : -1} />
     <aside className="sideDrawer" aria-label="对话与模式">
-      <header><div className="drawerBrand"><span>RC</span><strong>Rcode</strong></div><button aria-label="收起菜单" onClick={onClose}><PanelLeftClose size={20} /></button></header>
-      <button className="newChatButton" onClick={onNewWork}><SquarePen size={18} /><span>新对话</span></button>
+      <header><button className={`drawerProfileCard ${active === "settings" ? "active" : ""}`} aria-label={`打开 ${user.displayName} 的个人设置`} onClick={() => onNavigate("settings")}><span className="drawerProfileAvatar">{user.displayName.slice(0, 1).toUpperCase()}</span><span className="drawerProfileCopy"><strong>{user.displayName}</strong><small>@{user.username}</small><small>{user.email}</small></span><ChevronRight size={15} /></button><button aria-label="收起菜单" onClick={onClose}><PanelLeftClose size={20} /></button></header>
+      {codeMode ? <div className="drawerCodeDevice"><span className={codeDevice?.online ? "onlineDot active" : "onlineDot"} /><span>{codeDevice?.name || "Code 工作区"}</span><small>{codeDevice?.online ? "在线" : "离线"}</small></div> : <button className="newChatButton" onClick={onNewWork}><SquarePen size={18} /><span>新对话</span></button>}
       <nav className="modeNavigation">
-        <button className={active === "work" ? "active" : ""} onClick={() => onNavigate("work")}><MessageCircle size={18} /><span><strong>聊天</strong><small>云端 AI · 随时可用</small></span></button>
-        <button className={active === "projects" || active === "sessions" || active === "console" ? "active" : ""} onClick={onOpenCode} disabled={!codeAvailable}><Code2 size={18} /><span><strong>Code</strong><small>{codeAvailable ? "电脑在线 · 项目模式" : "电脑离线 · 已锁定"}</small></span>{!codeAvailable && <LockKeyhole size={14} />}</button>
+        <button className={active === "work" ? "active" : ""} onClick={onSwitchChat}><MessageCircle size={18} /><span><strong>聊天</strong><small>云端 AI · 随时可用</small></span></button>
+        <button className={codeMode ? "active" : ""} onClick={onOpenCode} disabled={!codeAvailable}><Code2 size={18} /><span><strong>Code</strong><small>{codeAvailable ? "电脑在线 · 项目模式" : "电脑离线 · 已锁定"}</small></span>{!codeAvailable && <LockKeyhole size={14} />}</button>
       </nav>
-      <section className="drawerHistory"><p>最近对话</p>{sessions.map((session) => <button className={active === "work" && session.id === activeWorkSessionId ? "selected" : ""} key={session.id} onClick={() => onOpenSession(session)}><MessageCircle size={16} /><span><strong>{session.title}</strong><small>{session.model || "聊天"} · {relativeTime(session.updatedAt)}</small></span></button>)}{sessions.length === 0 && <span className="emptyHistory">还没有聊天对话</span>}</section>
-      <footer><button onClick={() => onNavigate("activity")}><Activity size={18} /><span>任务</span>{running > 0 && <i>{running}</i>}</button><button onClick={() => onNavigate("settings")}><Settings size={18} /><span>{user.displayName}</span><small>@{user.username}</small></button></footer>
+      <section className={`drawerHistory ${codeMode ? "drawerCodeHistory" : ""}`}><p>{codeMode ? "项目与会话" : "最近对话"}</p>{codeMode ? <div className="drawerFolderTree">{codeProjects.map((project) => {
+        const folderSessions = projectSessions(project);
+        const expanded = !collapsedCodeFolders.includes(project.id);
+        return <div className={`drawerFolder ${expanded ? "expanded" : ""}`} key={project.id}><div className="drawerFolderHeader"><button type="button" aria-expanded={expanded} onClick={() => toggleCodeFolder(project.id)}><Folder size={17} fill="currentColor" /><span><strong>{project.name}</strong><small>{folderSessions.length} 个会话</small></span><ChevronDown size={14} /></button><button type="button" aria-label={`在 ${project.name} 中新建会话`} onClick={() => onNewCodeSession(project)}><Plus size={15} /></button></div>{expanded && <div className="drawerFolderSessions">{folderSessions.map((session) => {
+          const latest = codeCommands.find((command) => command.deviceId === codeDevice?.id && command.projectId === project.id && command.sessionId === session.id);
+          const running = latest && ["running", "queued", "awaiting_approval"].includes(latest.status);
+          return <button type="button" className={session.id === activeCodeSessionId ? "selected" : ""} key={session.id} onClick={() => onOpenCodeSession(project, session)}><MessageCircle size={15} /><span><strong>{session.title}</strong><small>{latest?.summary || session.model || "Code 会话"} · {shortTime(session.updatedAt)}</small></span>{running ? <i /> : null}</button>;
+        })}{folderSessions.length === 0 && <button type="button" className="drawerFolderEmpty" onClick={() => onNewCodeSession(project)}><Plus size={14} /><span>新建会话</span></button>}</div>}</div>;
+      })}{codeProjects.length === 0 && <span className="emptyHistory">还没有可用项目</span>}</div> : <>{sessions.map((session) => <button className={active === "work" && session.id === activeWorkSessionId ? "selected" : ""} key={session.id} onClick={() => onOpenSession(session)}><MessageCircle size={16} /><span><strong>{session.title}</strong><small>{session.model || "聊天"} · {relativeTime(session.updatedAt)}</small></span></button>)}{sessions.length === 0 && <span className="emptyHistory">还没有聊天对话</span>}</>}</section>
     </aside>
   </div>;
 }

@@ -40,6 +40,27 @@ const knownCompatSuffixes = [
   "/claude"
 ];
 
+const imageModelPattern = /(?:^|[-_.\/])(gpt-image|dall-e|image|imagen|flux|sdxl|stable-diffusion|recraft|seedream)(?:$|[-_.\/\d])/i;
+
+export function inferImageModels(models: Array<string | undefined>) {
+  return [...new Set(models
+    .map((model) => model?.trim())
+    .filter((model): model is string => Boolean(model) && imageModelPattern.test(model!)))];
+}
+
+function withInferredImageModels(provider: AiProviderConfig): AiProviderConfig {
+  const imageModels = [...new Set([
+    provider.defaultImageModel,
+    ...(provider.imageModels ?? []),
+    ...inferImageModels([provider.defaultModel, ...(provider.fallbackModels ?? [])])
+  ].filter((model): model is string => Boolean(model)))].slice(0, 40);
+  return {
+    ...provider,
+    defaultImageModel: provider.defaultImageModel || imageModels[0],
+    imageModels
+  };
+}
+
 function previewSecret(value: string | undefined) {
   if (!value) return undefined;
   if (value.length <= 8) return "********";
@@ -51,7 +72,7 @@ function resolveProviderApiKey(provider: Pick<AiProviderConfig, "apiKey" | "apiK
 }
 
 function providerEntryToConfig(id: string, provider: ProviderEntry, source: "builtin" | "user"): AiProviderConfig {
-  return {
+  return withInferredImageModels({
     id,
     displayName: provider.displayName,
     type: provider.type,
@@ -69,12 +90,13 @@ function providerEntryToConfig(id: string, provider: ProviderEntry, source: "bui
     reasoningDialect: provider.reasoningDialect,
     enabled: provider.enabled !== false,
     source
-  };
+  });
 }
 
 export function toPublicAiProvider(provider: AiProviderConfig, activeProviderId: string): PublicAiProvider {
-  const configured = Boolean(resolveProviderApiKey(provider));
-  const { apiKey: _apiKey, ...rest } = provider;
+  const normalized = withInferredImageModels(provider);
+  const configured = Boolean(resolveProviderApiKey(normalized));
+  const { apiKey: _apiKey, ...rest } = normalized;
   return {
     ...rest,
     active: provider.id === activeProviderId,
@@ -149,6 +171,10 @@ export function normalizeAiProviderInput(input: Partial<AiProviderConfig>) {
   const defaultModel = typeof input.defaultModel === "string" ? input.defaultModel.trim() : "";
   if (!baseUrl) throw new Error("baseUrl is required");
   if (!defaultModel) throw new Error("defaultModel is required");
+  const fallbackModels = Array.isArray(input.fallbackModels) ? input.fallbackModels.map(String).filter(Boolean) : [];
+  const configuredImageModels = Array.isArray(input.imageModels) ? input.imageModels.map(String).map((model) => model.trim()).filter(Boolean) : [];
+  const inferredImageModels = inferImageModels([defaultModel, ...fallbackModels]);
+  const imageModels = [...new Set([...configuredImageModels, ...inferredImageModels])];
   return {
     id,
     displayName: typeof input.displayName === "string" && input.displayName.trim() ? input.displayName.trim() : id,
@@ -165,9 +191,9 @@ export function normalizeAiProviderInput(input: Partial<AiProviderConfig>) {
     modelsPath: typeof input.modelsPath === "string" && input.modelsPath.trim() ? input.modelsPath.trim() : "/models",
     balancePath: typeof input.balancePath === "string" && input.balancePath.trim() ? input.balancePath.trim() : undefined,
     defaultModel,
-    fallbackModels: Array.isArray(input.fallbackModels) ? input.fallbackModels.map(String).filter(Boolean) : [],
-    defaultImageModel: typeof input.defaultImageModel === "string" && input.defaultImageModel.trim() ? input.defaultImageModel.trim() : undefined,
-    imageModels: Array.isArray(input.imageModels) ? input.imageModels.map(String).map((model) => model.trim()).filter(Boolean) : [],
+    fallbackModels,
+    defaultImageModel: typeof input.defaultImageModel === "string" && input.defaultImageModel.trim() ? input.defaultImageModel.trim() : imageModels[0],
+    imageModels,
     reasoningDialect: (input.reasoningDialect === "sub2api" || input.reasoningDialect === "openai-compatible"
       ? input.reasoningDialect
       : "auto") as AiProviderConfig["reasoningDialect"],
@@ -244,7 +270,7 @@ function resolveProviderForTest(id: string): AiProviderConfig {
     return providerEntryToConfig(id, builtinProvider, builtinProvider.source ?? "builtin");
   }
   const userProvider = getUserAiProvider(id);
-  if (userProvider) return userProvider;
+  if (userProvider) return withInferredImageModels(userProvider);
   throw new Error(`AI provider "${id}" was not found`);
 }
 

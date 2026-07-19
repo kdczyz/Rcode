@@ -168,7 +168,7 @@ app.get("/api/health", (_request, response) => {
     ok: true,
     provider: runtimeConfig.providerName,
     providerDisplayName: runtimeConfig.provider.displayName,
-    model: process.env.AI_MODEL ?? runtimeConfig.provider.defaultModel,
+    model: runtimeConfig.provider.defaultModel || process.env.AI_MODEL || "",
     providerConfigured,
     localApiProtected: Boolean(localApiToken),
     executor: "portable-guarded-execution",

@@ -7,6 +7,7 @@ const LOCAL_PREFIX = "rcode.mobile.";
 const REQUEST_TIMEOUT_MS = 15_000;
 const WORK_REQUEST_TIMEOUT_MS = 65_000;
 const WORK_STREAM_TIMEOUT_MS = 125_000;
+const WORK_IMAGE_STREAM_TIMEOUT_MS = 195_000;
 
 export class ApiError extends Error {
   constructor(message: string, public readonly status: number, public readonly code?: string) {
@@ -160,6 +161,7 @@ export async function request<T>(path: string, init: RequestInit = {}, authentic
 
 export type WorkStreamEvent =
   | { type: "delta"; delta: string }
+  | { type: "image"; model: string; images: GeneratedImage[] }
   | { type: "done"; model: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }
   | { type: "error"; error: string };
 
@@ -187,14 +189,17 @@ export async function generateWorkImage(payload: {
 }
 
 export async function streamWorkChat(
-  payload: { messages: Array<{ role: "user" | "assistant"; content: string }>; providerId?: string; model?: string; thinkingMode?: "fast" | "balanced" | "deep" },
-  onEvent: (event: WorkStreamEvent) => void
+  payload: { messages: Array<{ role: "user" | "assistant"; content: string }>; providerId?: string; model?: string; imageModel?: string; thinkingMode?: "fast" | "balanced" | "deep"; autoImage?: boolean },
+  onEvent: (event: WorkStreamEvent) => void,
+  signal?: AbortSignal
 ): Promise<void> {
   const headers = new Headers({ "content-type": "application/json", accept: "text/event-stream" });
   const token = await readToken();
   if (token) headers.set("authorization", `Bearer ${token}`);
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), WORK_STREAM_TIMEOUT_MS);
+  const timeout = window.setTimeout(() => controller.abort(), payload.autoImage ? WORK_IMAGE_STREAM_TIMEOUT_MS : WORK_STREAM_TIMEOUT_MS);
+  const abort = () => controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
   try {
     const response = await fetch(`${API_BASE}/v1/work/chat`, {
       method: "POST",
@@ -247,11 +252,13 @@ export async function streamWorkChat(
     if (!completed) throw new Error("实时回复提前结束，请重试");
   } catch (reason) {
     if (reason instanceof ApiError) throw reason;
+    if (signal?.aborted) throw new DOMException("对话已停止", "AbortError");
     if (controller.signal.aborted) throw new Error("实时回复超时，请稍后重试");
     if (reason instanceof TypeError) throw new Error("无法连接到 Rcode 服务，请检查网络后重试");
     throw reason instanceof Error ? reason : new Error("实时回复失败，请稍后重试");
   } finally {
     window.clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
   }
 }
 

@@ -32,6 +32,7 @@ export interface StartManagedProcessInput {
   command: string;
   cwd?: unknown;
   projectPath?: string;
+  allowOutsideWorkspace?: boolean;
   label?: string;
   startupWaitMs?: number;
   secretRefs?: unknown;
@@ -139,9 +140,14 @@ export class ManagedProcessManager {
   async start(input: StartManagedProcessInput) {
     const projectPath = getWorkspaceRoot(input.projectPath);
     const analysis = await analyzeShellCommand(input.command, input.cwd, projectPath);
-    const blockedReason = analysis.blockedReason ??
-      (!analysis.cwdInsideWorkspace ? "Command cwd is outside the workspace." : undefined) ??
-      (analysis.redirectsOutsideWorkspace ? "Command redirects output outside the workspace." : undefined) ??
+    const boundaryReason = input.allowOutsideWorkspace
+      ? undefined
+      : (!analysis.cwdInsideWorkspace ? "Command cwd is outside the workspace." : undefined) ??
+        (analysis.redirectsOutsideWorkspace ? "Command redirects output outside the workspace." : undefined);
+    const blockedReason = (analysis.blockedReason === "Command cwd is outside the workspace." && input.allowOutsideWorkspace
+      ? undefined
+      : analysis.blockedReason) ??
+      boundaryReason ??
       (analysis.backgroundProcess ? "Do not use &, nohup, or disown; start_process manages the process lifecycle." : undefined) ??
       (analysis.interactive ? "Interactive terminal applications are not supported by managed process sessions." : undefined) ??
       (analysis.leaksEnvironment ? "Command may expose sensitive environment variables." : undefined);

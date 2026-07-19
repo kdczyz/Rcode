@@ -10,6 +10,7 @@ export interface ExecutorRunInput {
   command: string;
   cwd?: unknown;
   projectPath?: string;
+  allowOutsideWorkspace?: boolean;
   timeoutMs?: number;
   maxBuffer?: number;
   secretRefs?: unknown;
@@ -27,10 +28,12 @@ function safeEnvironment() {
   return env;
 }
 
-function blockedByPortableGuard(analysis: ShellAnalysis) {
-  if (analysis.blockedReason) return analysis.blockedReason;
-  if (!analysis.cwdInsideWorkspace) return "Command cwd is outside the workspace.";
-  if (analysis.redirectsOutsideWorkspace) return "Command redirects output outside the workspace.";
+function blockedByPortableGuard(analysis: ShellAnalysis, allowOutsideWorkspace = false) {
+  if (analysis.blockedReason && !(allowOutsideWorkspace && analysis.blockedReason === "Command cwd is outside the workspace.")) {
+    return analysis.blockedReason;
+  }
+  if (!allowOutsideWorkspace && !analysis.cwdInsideWorkspace) return "Command cwd is outside the workspace.";
+  if (!allowOutsideWorkspace && analysis.redirectsOutsideWorkspace) return "Command redirects output outside the workspace.";
   if (analysis.backgroundProcess) return "Background shell commands are not allowed.";
   if (analysis.interactive) return "Interactive shell commands are not allowed.";
   if (analysis.leaksEnvironment) return "Command may expose sensitive environment variables.";
@@ -49,7 +52,7 @@ export class PortableExecutor {
     const analysis = await this.analyze(input);
     const secrets = resolveSecretEnvironment(input.secretRefs);
     const argv = ["zsh", "-lc", input.command];
-    const blockedReason = blockedByPortableGuard(analysis);
+    const blockedReason = blockedByPortableGuard(analysis, input.allowOutsideWorkspace);
     if (blockedReason) {
       return {
         ok: false,

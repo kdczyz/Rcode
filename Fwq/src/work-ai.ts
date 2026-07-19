@@ -114,14 +114,17 @@ function normalizedProviderId(value: unknown): string {
   return requiredString(value ?? "default", "接口 ID", { max: 100, pattern: /^[a-zA-Z0-9._:-]+$/ });
 }
 
-function normalizedModels(value: unknown, defaultModel: string): string[] {
+function normalizedModelList(value: unknown): string[] {
   const raw = Array.isArray(value) ? value : [];
-  const models = raw
+  return [...new Set(raw
     .filter((item): item is string => typeof item === "string")
     .map((item) => item.trim())
     .filter((item) => item.length > 0 && item.length <= 160)
-    .slice(0, 80);
-  return [...new Set([defaultModel, ...models])];
+    .slice(0, 80))];
+}
+
+function normalizedModels(value: unknown, defaultModel: string): string[] {
+  return [...new Set([defaultModel, ...normalizedModelList(value)])];
 }
 
 function discoveredModels(value: Record<string, unknown> | undefined): string[] {
@@ -132,6 +135,45 @@ function discoveredModels(value: Record<string, unknown> | undefined): string[] 
     if (isObject(item) && typeof item.name === "string") return [item.name.trim()];
     return [];
   }).filter((model) => model.length > 0 && model.length <= 160))].slice(0, 80);
+}
+
+const imageModelPattern = /(?:^|[-_.\/])(gpt-image|dall-e|image|imagen|flux|sdxl|stable-diffusion|recraft|seedream)(?:$|[-_.\/\d])/i;
+
+export function inferWorkImageModels(models: string[]): string[] {
+  return [...new Set(models.map((model) => model.trim()).filter((model) => model && imageModelPattern.test(model)))];
+}
+
+function compactModelReference(value: string): string {
+  return value.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function modelAliases(model: string): string[] {
+  const tail = model.split(/[\/:]/).pop() || model;
+  const compact = compactModelReference(model);
+  const compactTail = compactModelReference(tail);
+  const shortTail = compactTail.replace(/^(?:openai|gpt)/, "");
+  return [...new Set([compact, compactTail, shortTail].filter((alias) => alias.length >= 4))];
+}
+
+function looksLikeImageModel(reference: string): boolean {
+  const compact = compactModelReference(reference);
+  return /^(?:gpt)?image|dalle|imagen|flux|sdxl|stablediffusion|recraft|seedream|midjourney/.test(compact)
+    || (/[a-z]/.test(compact) && /\d/.test(compact));
+}
+
+function isDirectImageRequest(prompt: string): boolean {
+  return /(?:生图|(?:用|使用|通过).{0,48}(?:生成|画|绘制|创作|渲染|制作|出图))|(?:using|with).{0,48}(?:generate|create|draw|paint|render)/i.test(prompt);
+}
+
+export function requestedWorkImageModel(prompt: string, models: string[]): { model?: string; reference?: string } {
+  const references = prompt.normalize("NFKC").match(/[A-Za-z0-9][A-Za-z0-9._:/-]*/g) ?? [];
+  const compactReferences = new Set(references.map(compactModelReference));
+  for (const model of models) {
+    if (modelAliases(model).some((alias) => compactReferences.has(alias))) return { model, reference: model };
+  }
+
+  const explicit = prompt.match(/(?:用|使用|通过|using|with)\s*[“”"'`]?([A-Za-z0-9][A-Za-z0-9._:/-]*)/i)?.[1];
+  return explicit && looksLikeImageModel(explicit) && isDirectImageRequest(prompt) ? { reference: explicit } : {};
 }
 
 function providerIdFor(baseUrl: string): string {
@@ -154,25 +196,28 @@ function rowModels(row: WorkAiProviderRow): string[] {
 }
 
 function rowImageModels(row: WorkAiProviderRow): string[] {
-  if (!row.default_image_model) return [];
+  let configured: string[] = [];
   try {
-    return normalizedModels(JSON.parse(row.image_models_json), row.default_image_model);
-  } catch {
-    return [row.default_image_model];
-  }
+    configured = row.default_image_model
+      ? normalizedModels(JSON.parse(row.image_models_json), row.default_image_model)
+      : [];
+  } catch { configured = row.default_image_model ? [row.default_image_model] : []; }
+  return [...new Set([...configured, ...inferWorkImageModels(rowModels(row))])];
 }
 
 function publicProvider(row: WorkAiProviderRow) {
+  const imageModels = rowImageModels(row);
+  const models = rowModels(row).filter((model) => !imageModels.includes(model));
   return {
     id: row.provider_id,
     displayName: row.display_name,
     baseUrl: row.base_url,
     chatCompletionsPath: row.chat_completions_path,
     imageGenerationPath: row.image_generation_path,
-    model: row.model,
-    models: rowModels(row),
-    defaultImageModel: row.default_image_model ?? undefined,
-    imageModels: rowImageModels(row),
+    model: models.includes(row.model) ? row.model : models[0] || row.model,
+    models,
+    defaultImageModel: row.default_image_model ?? imageModels[0],
+    imageModels,
     apiKeyPreview: row.api_key_preview,
     updatedAt: new Date(row.updated_at).toISOString()
   };
@@ -253,14 +298,22 @@ export async function discoverWorkAiModels(request: Request, env: WorkEnv): Prom
       lastError = "上游未返回可用模型";
       continue;
     }
+    const imageModels = inferWorkImageModels(models);
+    const textModels = models.filter((model) => !imageModels.includes(model));
+    if (textModels.length === 0) {
+      lastError = "上游未返回可用聊天模型";
+      continue;
+    }
     const hostname = new URL(baseUrl).hostname;
     return json({
       providerId: providerIdFor(baseUrl),
       displayName: hostname.replace(/^api\./, ""),
       baseUrl,
       chatCompletionsPath: "/chat/completions",
-      model: models[0],
-      models
+      model: textModels[0],
+      models: textModels,
+      defaultImageModel: imageModels[0],
+      imageModels
     });
   }
 
@@ -274,15 +327,20 @@ export async function saveWorkAiConfig(request: Request, env: WorkEnv): Promise<
   const baseUrl = normalizedBaseUrl(body.baseUrl);
   const chatCompletionsPath = normalizedPath(body.chatCompletionsPath);
   const imageGenerationPath = normalizedImagePath(body.imageGenerationPath);
-  const model = requiredString(body.model, "模型", { max: 160 });
+  const requestedModel = requiredString(body.model, "模型", { max: 160 });
   const displayName = typeof body.displayName === "string" && body.displayName.trim()
     ? requiredString(body.displayName, "接口名称", { max: 120 })
     : new URL(baseUrl).hostname;
-  const models = normalizedModels(body.models, model);
-  const defaultImageModel = typeof body.defaultImageModel === "string" && body.defaultImageModel.trim()
+  const discovered = normalizedModels(body.models, requestedModel);
+  const configuredDefaultImageModel = typeof body.defaultImageModel === "string" && body.defaultImageModel.trim()
     ? requiredString(body.defaultImageModel, "图片模型", { max: 160 })
     : undefined;
-  const imageModels = defaultImageModel ? normalizedModels(body.imageModels, defaultImageModel) : [];
+  const configuredImageModels = normalizedModelList(body.imageModels);
+  const imageModels = [...new Set([configuredDefaultImageModel, ...configuredImageModels, ...inferWorkImageModels(discovered)].filter((candidate): candidate is string => Boolean(candidate)))];
+  const models = discovered.filter((candidate) => !imageModels.includes(candidate));
+  const model = models.includes(requestedModel) ? requestedModel : models[0];
+  if (!model) throw new HttpError(400, "当前接口没有可用聊天模型", "chat_model_not_configured");
+  const defaultImageModel = configuredDefaultImageModel || imageModels[0];
   const current = await providerForUser(env.DB, auth.user.id, providerId);
   const suppliedKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
   if (!current && suppliedKey.length < 8) throw new HttpError(400, "首次配置必须填写 API Key", "api_key_required");
@@ -354,6 +412,23 @@ function parseMessages(value: unknown): WorkMessage[] {
     if (total > 48_000) throw new HttpError(413, "聊天上下文过长", "context_too_large");
     return { role, content };
   });
+}
+
+export function shouldGenerateWorkImage(content: string): boolean {
+  const prompt = content.trim();
+  if (!prompt) return false;
+  if (/(?:流程图|架构图|时序图|图表|曲线图|统计图|mermaid|flowchart|sequence diagram)/i.test(prompt)) return false;
+
+  const visualNoun = /(?:图片|图像|插画|海报|壁纸|头像|照片|画面|场景|夜景|风景|概念图|效果图|宣传图|封面|logo|标志|image|picture|photo|illustration|poster|wallpaper|portrait|scene|landscape|artwork|logo)/i;
+  const directChineseDrawing = /(?:生图|来一张|出一张)|(?:^|[，。！？\s])(?:请|帮我|给我|为我|替我|直接|现在|马上)?\s*(?:画|绘制)(?!法)[^，。！？\n]{1,40}/i;
+  const directChineseVisual = /(?:生成|创作|渲染|制作|设计|创建|做)(?:一|1|几|多)?(?:张|幅|个|套)?[^，。！？\n]{0,16}(?:图片|图像|插画|海报|壁纸|头像|照片|画面|场景|夜景|风景|概念图|效果图|宣传图|封面|logo|标志)/i;
+  const directEnglish = /\b(?:generate|create|draw|paint|render|design|make)\b[^.!?\n]{0,28}\b(?:image|picture|photo|illustration|poster|wallpaper|portrait|scene|landscape|artwork|logo)\b/i;
+  const isDirectRequest = directEnglish.test(prompt) || directChineseDrawing.test(prompt) || (directChineseVisual.test(prompt) && visualNoun.test(prompt));
+  if (!isDirectRequest) return false;
+
+  const asksAboutGeneration = /(?:怎么|如何|为什么|教程|文档|代码|接口|api|模型|功能|按钮|报错|错误|解释|分析|介绍|原理|配置|调用).{0,18}(?:生图|生成|画|绘制)|(?:生图|生成图片|生成图像|绘制图片).{0,18}(?:怎么|如何|教程|代码|接口|api|模型|原理)|\b(?:how|why|tutorial|documentation|code|api|model|explain|configure)\b[^.!?\n]{0,36}\b(?:generate|create|draw|image generation)\b/i;
+  const imperative = /^(?:请|帮我|给我|为我|替我|直接|现在|马上)?\s*(?:生成|画|绘制|创作|渲染|制作|设计|创建|做|生图|来一张|出一张)|^(?:please\s+)?(?:generate|create|draw|paint|render|design|make)\b/i;
+  return !asksAboutGeneration.test(prompt) || imperative.test(prompt);
 }
 
 function assistantContent(value: unknown): string | undefined {
@@ -475,6 +550,17 @@ function completedStream(completion: { content: string; model: string; usage?: T
   }), { headers: streamHeaders() });
 }
 
+function completedImageStream(result: { providerId: string; model: string; images: ReturnType<typeof generatedImages> }): Response {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encodeEvent(encoder, { type: "image", model: result.model, images: result.images }));
+      controller.enqueue(encodeEvent(encoder, { type: "done", model: result.model }));
+      controller.close();
+    }
+  }), { headers: streamHeaders() });
+}
+
 function relayCompletionStream(upstream: Response, fallbackModel: string): Response {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
@@ -573,6 +659,19 @@ export async function workChat(request: Request, env: WorkEnv): Promise<Response
   const wantsStream = body.stream === true;
   const selectedThinkingMode = thinkingMode(body.thinkingMode);
   const apiKey = await decryptApiKey(config, env);
+  const latestUserPrompt = [...messages].reverse().find((message) => message.role === "user")?.content || "";
+  if (body.autoImage === true && shouldGenerateWorkImage(latestUserPrompt)) {
+    const requestedImage = requestedWorkImageModel(latestUserPrompt, rowImageModels(config));
+    if (requestedImage.reference && !requestedImage.model) {
+      throw new HttpError(400, `图片模型“${requestedImage.reference}”未在当前接口配置`, "invalid_image_model_reference");
+    }
+    const result = await generateImagesForProvider(config, apiKey, {
+      prompt: latestUserPrompt,
+      model: requestedImage.model || (typeof body.imageModel === "string" ? body.imageModel : undefined)
+    });
+    if (wantsStream) return completedImageStream(result);
+    return json({ content: result.images[0]?.revisedPrompt || "图片已生成", ...result });
+  }
   const endpoint = `${config.base_url}${config.chat_completions_path}`;
   const basePayload = { model: selectedModel, messages, stream: wantsStream, ...(wantsStream ? { stream_options: { include_usage: true } } : {}) };
   const controls = reasoningControls(config.base_url, selectedModel, selectedThinkingMode);
@@ -642,23 +741,21 @@ function generatedImages(value: Record<string, unknown> | undefined, format: "jp
   });
 }
 
-export async function workGenerateImage(request: Request, env: WorkEnv): Promise<Response> {
-  const auth = await authenticated(request, env);
-  const body = await readJsonObject(request);
-  const providerId = typeof body.providerId === "string" && body.providerId.trim() ? normalizedProviderId(body.providerId) : undefined;
-  const config = await providerForUser(env.DB, auth.user.id, providerId);
-  if (!config) throw new HttpError(409, providerId ? "所选 AI 接口不存在" : "请先配置图片 AI 接口", "work_ai_not_configured");
+async function generateImagesForProvider(
+  config: WorkAiProviderRow,
+  apiKey: string,
+  input: { prompt?: unknown; model?: unknown; size?: unknown; quality?: unknown }
+) {
   const allowedModels = rowImageModels(config);
   if (allowedModels.length === 0) throw new HttpError(409, "当前接口尚未配置图片模型", "image_model_not_configured");
-  const model = typeof body.model === "string" && body.model.trim()
-    ? requiredString(body.model, "图片模型", { max: 160 })
-    : config.default_image_model!;
+  const model = typeof input.model === "string" && input.model.trim()
+    ? requiredString(input.model, "图片模型", { max: 160 })
+    : config.default_image_model || allowedModels[0]!;
   if (!allowedModels.includes(model)) throw new HttpError(400, "所选图片模型不在接口允许列表中", "invalid_image_model");
-  const prompt = requiredString(body.prompt, "生图提示词", { max: 8_000 });
-  const size = typeof body.size === "string" && IMAGE_SIZES.has(body.size) ? body.size : "auto";
-  const quality = typeof body.quality === "string" && IMAGE_QUALITIES.has(body.quality) ? body.quality : "auto";
+  const prompt = requiredString(input.prompt, "生图提示词", { max: 8_000 });
+  const size = typeof input.size === "string" && IMAGE_SIZES.has(input.size) ? input.size : "auto";
+  const quality = typeof input.quality === "string" && IMAGE_QUALITIES.has(input.quality) ? input.quality : "auto";
   const count = 1;
-  const apiKey = await decryptApiKey(config, env);
   const endpoint = `${config.base_url}${config.image_generation_path || "/images/generations"}`;
   const basePayload = { model, prompt, n: count, size, quality };
   const payloads = [{ ...basePayload, output_format: "jpeg", output_compression: 85 }, basePayload];
@@ -684,8 +781,18 @@ export async function workGenerateImage(request: Request, env: WorkEnv): Promise
     }
     const images = generatedImages(result, "output_format" in payload ? "jpeg" : "png");
     if (images.length === 0) throw new HttpError(502, "图片服务没有返回可显示的图片", "invalid_image_response");
-    return json({ providerId: config.provider_id, model, images });
+    return { providerId: config.provider_id, model, images };
   }
 
   throw new HttpError(502, lastError, "image_upstream_error");
+}
+
+export async function workGenerateImage(request: Request, env: WorkEnv): Promise<Response> {
+  const auth = await authenticated(request, env);
+  const body = await readJsonObject(request);
+  const providerId = typeof body.providerId === "string" && body.providerId.trim() ? normalizedProviderId(body.providerId) : undefined;
+  const config = await providerForUser(env.DB, auth.user.id, providerId);
+  if (!config) throw new HttpError(409, providerId ? "所选 AI 接口不存在" : "请先配置图片 AI 接口", "work_ai_not_configured");
+  const apiKey = await decryptApiKey(config, env);
+  return json(await generateImagesForProvider(config, apiKey, body));
 }

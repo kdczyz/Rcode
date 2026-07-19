@@ -1,4 +1,4 @@
-import { Brain, Check, ChevronDown, FileText, Image, LoaderCircle, Paperclip, RefreshCw, Send, Square, TerminalSquare, X } from "lucide-react";
+import { Brain, Check, ChevronDown, FileText, Image, LoaderCircle, Paperclip, Plug, RefreshCw, Send, Square, TerminalSquare, X } from "lucide-react";
 import { ChangeEvent, ClipboardEvent, DragEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
 import type { ManagedProcessView } from "./ToolCallGroup";
 
@@ -22,13 +22,24 @@ interface PermissionOption {
   description: string;
 }
 
+export interface ComposerProviderOption {
+  id: string;
+  displayName: string;
+  defaultModel: string;
+  configured: boolean;
+  enabled?: boolean;
+}
+
 interface ChatComposerProps {
   prompt: string;
   modelName: string;
   modelOptions: string[];
   modelMenuOpen: boolean;
-  imageMode: boolean;
-  imageGenerationAvailable: boolean;
+  providerId: string;
+  providerName: string;
+  providerOptions: ComposerProviderOption[];
+  providerMenuOpen: boolean;
+  providerSwitchingId?: string;
   thinkingMode: ThinkingMode;
   permissionMode: PermissionMode;
   permissionOptions: PermissionOption[];
@@ -47,7 +58,8 @@ interface ChatComposerProps {
   onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onToggleModelMenu: () => void;
   onSelectModel: (model: string) => void;
-  onToggleImageMode: () => void;
+  onToggleProviderMenu: () => void;
+  onSelectProvider: (providerId: string) => void;
   onThinkingModeChange: (mode: ThinkingMode) => void;
   onTogglePermissionMenu: () => void;
   onSelectPermission: (mode: PermissionMode) => void;
@@ -302,7 +314,7 @@ export function ChatComposer(props: ChatComposerProps) {
           onChange={(event: ChangeEvent<HTMLTextAreaElement>) => props.onPromptChange(event.target.value)}
           onKeyDown={props.onKeyDown}
           onPaste={handlePaste}
-          placeholder={props.imageMode ? "描述你想生成的画面、风格、构图和文字" : isPlanMode ? "描述目标，我会先检查上下文并给出可执行计划" : "描述任务，或输入 / 查看可用命令"}
+          placeholder={isPlanMode ? "描述目标，我会先检查上下文并给出可执行计划" : "描述任务，或输入 / 查看可用命令"}
           rows={1}
         />
         <button className={`sendButton ${props.isRunning ? "stopping" : ""}`} type="button" onClick={props.onSend} disabled={!props.isRunning && !props.prompt.trim() && props.attachments.length === 0} aria-label={props.isRunning ? "停止回复" : "发送"}>
@@ -326,16 +338,53 @@ export function ChatComposer(props: ChatComposerProps) {
             <Paperclip size={14} />
             <span>附件</span>
           </button>
-          <button
-            className={`attachmentPickerButton ${props.imageMode ? "active" : ""}`}
-            type="button"
-            onClick={props.onToggleImageMode}
-            disabled={!props.imageGenerationAvailable || props.isRunning}
-            title={props.imageGenerationAvailable ? "切换文本对话与图片生成" : "请先在当前 AI 接口中配置图片模型"}
-          >
-            <Image size={14} />
-            <span>{props.imageMode ? "生图中" : "生图"}</span>
-          </button>
+          <div className="providerPicker">
+            <button
+              className={`providerPickerButton ${props.providerMenuOpen ? "active" : ""}`}
+              type="button"
+              aria-expanded={props.providerMenuOpen}
+              aria-haspopup="listbox"
+              title={`当前接口：${props.providerName || "未选择"}`}
+              onClick={props.onToggleProviderMenu}
+            >
+              <Plug size={14} />
+              <span>{props.providerName || "接口"}</span>
+              <ChevronDown size={12} />
+            </button>
+            {props.providerMenuOpen && (
+              <div className="providerMenu" role="listbox" aria-label="选择 AI 接口">
+                <header>
+                  <strong>AI 接口</strong>
+                  <span>切换后自动使用该接口的默认模型</span>
+                </header>
+                {props.providerOptions.map((provider) => {
+                  const isActive = provider.id === props.providerId;
+                  const isSwitching = provider.id === props.providerSwitchingId;
+                  const unavailable = provider.enabled === false || !provider.configured;
+                  return (
+                    <button
+                      className={isActive ? "active" : ""}
+                      key={provider.id}
+                      type="button"
+                      role="option"
+                      aria-selected={isActive}
+                      disabled={unavailable || Boolean(props.providerSwitchingId)}
+                      onClick={() => props.onSelectProvider(provider.id)}
+                    >
+                      <span className="providerMenuCopy">
+                        <strong>{provider.displayName}</strong>
+                        <small>{provider.defaultModel || "未设置默认模型"}</small>
+                      </span>
+                      <span className="providerMenuState">
+                        {isSwitching ? <LoaderCircle size={14} className="toolStatusSpinner" /> : isActive ? <Check size={15} /> : unavailable ? "未配置" : ""}
+                      </span>
+                    </button>
+                  );
+                })}
+                {props.providerOptions.length === 0 && <p>请先在设置中添加 AI 接口。</p>}
+              </div>
+            )}
+          </div>
           <div className="modelPicker">
             <button className="modelPickerButton" type="button" onClick={props.onToggleModelMenu}><span>{props.modelName}</span><ChevronDown size={14} /></button>
             {props.modelMenuOpen && (
@@ -470,7 +519,7 @@ export function ChatComposer(props: ChatComposerProps) {
           {props.queueLength > 0 && <span className="queueBadge">队列 {props.queueLength}</span>}
         </div>
         <div className="composerActions">
-          <span className={`composerHint ${attachmentError ? "error" : ""}`}>{attachmentError || (props.imageMode ? "Enter 生成 · 图片会保存到本机" : "Enter 发送 · 可粘贴图片或文件")}</span>
+          <span className={`composerHint ${attachmentError ? "error" : ""}`}>{attachmentError || "Enter 发送 · 可粘贴图片或文件"}</span>
           <div className="permissionPicker">
             <button className="permissionModeButton" type="button" title={props.selectedPermission.description} onClick={props.onTogglePermissionMenu}>
               <span>{props.selectedPermission.label}</span><ChevronDown size={14} />

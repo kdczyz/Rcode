@@ -1,6 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizeProviderBalanceResponse } from "./aiProviderRegistry";
+import { inferImageModels, normalizeAiProviderInput, normalizeProviderBalanceResponse } from "./aiProviderRegistry";
+
+test("detects image models and assigns them to the image capability", () => {
+  assert.deepEqual(inferImageModels([
+    "gpt-5.4",
+    "gpt-image-1.5",
+    "gpt-image-2",
+    "black-forest-labs/flux-1.1-pro"
+  ]), ["gpt-image-1.5", "gpt-image-2", "black-forest-labs/flux-1.1-pro"]);
+
+  const provider = normalizeAiProviderInput({
+    id: "test",
+    displayName: "Test",
+    baseUrl: "https://api.example.com/v1",
+    defaultModel: "gpt-5.4",
+    fallbackModels: ["gpt-5.4-mini", "gpt-image-2"]
+  });
+  assert.equal(provider.defaultImageModel, "gpt-image-2");
+  assert.deepEqual(provider.imageModels, ["gpt-image-2"]);
+});
 
 test("normalizes DeepSeek multi-currency balance responses", () => {
   assert.deepEqual(normalizeProviderBalanceResponse({

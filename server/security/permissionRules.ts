@@ -18,7 +18,7 @@ const managedRules: PermissionRule[] = [
   { id: "managed-deny-keychains", effect: "deny", targetType: "path", pattern: "**/Library/Keychains/**", scope: "managed", enabled: true },
   { id: "managed-deny-browser-passwords", effect: "deny", targetType: "path", pattern: "**/Library/Application Support/**/Login Data", scope: "managed", enabled: true },
   { id: "managed-ask-web", effect: "ask", targetType: "tool", pattern: "web_fetch", scope: "managed", enabled: true },
-  { id: "managed-ask-image-generation", effect: "ask", targetType: "tool", pattern: "generate_image", scope: "managed", enabled: true },
+  { id: "managed-allow-requested-image-generation", effect: "allow", targetType: "tool", pattern: "generate_image", scope: "managed", enabled: true },
   { id: "managed-ask-shell-network", effect: "ask", targetType: "command", pattern: "curl", scope: "managed", enabled: true },
   { id: "managed-ask-git-branch", effect: "ask", targetType: "tool", pattern: "git_branch", scope: "managed", enabled: true },
   { id: "managed-ask-git-stage", effect: "ask", targetType: "tool", pattern: "git_stage", scope: "managed", enabled: true },
@@ -140,10 +140,12 @@ export async function evaluatePermission(
     });
   }
 
-  for (const value of values.filter((item) => item.targetType === "path")) {
-    const resolved = await resolveWorkspacePath(value.value, projectPath);
-    if (!resolved.insideWorkspace) {
-      return decision("deny", "Personal files outside the workspace are denied by default.", { enforcement: "denied", requiresApproval: false });
+  if (mode !== "full_access") {
+    for (const value of values.filter((item) => item.targetType === "path")) {
+      const resolved = await resolveWorkspacePath(value.value, projectPath);
+      if (!resolved.insideWorkspace) {
+        return decision("deny", "Personal files outside the workspace are denied by default.", { enforcement: "denied", requiresApproval: false });
+      }
     }
   }
 
@@ -188,14 +190,19 @@ export async function evaluatePermission(
   if (toolCall.name === "run_shell" || toolCall.name === "start_process") {
     const command = typeof toolCall.arguments.command === "string" ? toolCall.arguments.command : "";
     const analysis = await analyzeShellCommand(command, toolCall.arguments.cwd, projectPath);
-    if (analysis.blockedReason || analysis.redirectsOutsideWorkspace || analysis.leaksEnvironment || analysis.backgroundProcess || analysis.interactive || analysis.credentialAccess) {
-      return decision("deny", analysis.blockedReason ?? `Shell command blocked by portable guard: ${analysis.riskFlags.join(", ")}`, {
+    const hardBlockedReason = analysis.blockedReason === "Command cwd is outside the workspace."
+      ? undefined
+      : analysis.blockedReason;
+    const workspaceBoundaryBlocked = mode !== "full_access" && (
+      !analysis.cwdInsideWorkspace || analysis.redirectsOutsideWorkspace || analysis.mentionsOutsideWorkspace
+    );
+    if (hardBlockedReason || workspaceBoundaryBlocked || analysis.leaksEnvironment || analysis.backgroundProcess || analysis.interactive || analysis.credentialAccess) {
+      return decision("deny", hardBlockedReason ?? (workspaceBoundaryBlocked
+        ? "Shell commands may not access personal files outside the workspace."
+        : `Shell command blocked by portable guard: ${analysis.riskFlags.join(", ")}`), {
         enforcement: "denied",
         requiresApproval: false
       });
-    }
-    if (analysis.mentionsOutsideWorkspace) {
-      return decision("deny", "Shell commands may not access personal files outside the workspace.", { enforcement: "denied", requiresApproval: false });
     }
     const secretRefs = Array.isArray(toolCall.arguments.secretRefs) ? toolCall.arguments.secretRefs : [];
     if (secretRefs.length > 0) {

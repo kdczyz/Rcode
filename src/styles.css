@@ -8027,6 +8027,103 @@ strong.streaming {
   box-shadow: none;
 }
 
+/* Composer provider control: interface first, then the model offered by it. */
+.providerPicker {
+  position: relative;
+  min-width: 0;
+  flex: 0 0 auto;
+}
+
+.providerPickerButton {
+  display: inline-flex;
+  min-height: 30px;
+  max-width: 170px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 0 8px;
+  color: var(--muted);
+  background: var(--surface-2);
+  font: inherit;
+  font-weight: var(--weight-semibold);
+}
+
+.providerPickerButton span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.providerPickerButton:hover,
+.providerPickerButton.active {
+  border-color: var(--border);
+  color: var(--text);
+  background: var(--surface-3);
+}
+
+.providerMenu {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  z-index: 90;
+  display: grid;
+  width: min(360px, 78vw);
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  padding: 6px;
+  color: var(--text);
+  background: var(--surface-1);
+  box-shadow: var(--glass-shadow-lg);
+  animation: menuReveal 0.18s var(--ease-out-expo) both;
+}
+
+.providerMenu header {
+  display: grid;
+  gap: 3px;
+  padding: 8px 9px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  margin-bottom: 4px;
+}
+
+.providerMenu header strong { font-size: 12px; }
+.providerMenu header span { color: var(--faint); font-size: 10.5px; }
+
+.providerMenu > button {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 48px;
+  border: 0;
+  border-radius: 8px;
+  padding: 7px 9px;
+  color: var(--muted);
+  text-align: left;
+  background: transparent;
+}
+
+.providerMenu > button:hover:not(:disabled),
+.providerMenu > button.active {
+  color: var(--selected-text);
+  background: var(--selected);
+}
+
+.providerMenu > button:disabled:not(.active) { opacity: .58; }
+.providerMenuCopy { display: grid; min-width: 0; gap: 3px; }
+.providerMenuCopy strong,
+.providerMenuCopy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.providerMenuCopy strong { font-size: 12px; }
+.providerMenuCopy small { color: currentColor; opacity: .7; font-size: 10.5px; }
+.providerMenuState { display: inline-flex; align-items: center; justify-content: center; min-width: 34px; font-size: 10px; }
+.providerMenu > p { margin: 0; padding: 14px 10px; color: var(--faint); font-size: 11px; }
+
+@media (max-width: 760px) {
+  .providerPickerButton { max-width: 132px; }
+}
+
 .sidebarResizeHandle {
   background: var(--surface);
 }
@@ -9675,6 +9772,45 @@ strong.streaming {
   background: color-mix(in srgb, var(--surface-3) 78%, black);
 }
 
+.messageAttachmentImageButton {
+  position: relative;
+  display: block;
+  width: 100%;
+  border: 0;
+  border-radius: 8px;
+  padding: 0;
+  overflow: hidden;
+  color: white;
+  background: transparent;
+  cursor: zoom-in;
+}
+
+.messageAttachmentImageButton > span {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  border-radius: 7px;
+  padding: 5px 8px;
+  opacity: 0;
+  color: #fff;
+  background: rgba(10, 12, 16, 0.72);
+  font-size: 11px;
+  font-weight: 600;
+  transform: translateY(4px);
+  transition: opacity 150ms ease, transform 150ms ease;
+}
+
+.messageAttachmentImageButton:hover > span,
+.messageAttachmentImageButton:focus-visible > span {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.messageAttachmentImageButton:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .messageAttachmentFileIcon {
   display: grid;
   place-items: center;
@@ -9702,11 +9838,107 @@ strong.streaming {
 .messageAttachment strong { font-size: 12px; }
 .messageAttachment small { color: var(--faint); font-size: 10px; }
 
+.imagePreviewOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: rgba(5, 7, 10, 0.76);
+  backdrop-filter: blur(12px);
+  animation: fadeIn 160ms ease-out;
+}
+
+.imagePreviewDialog {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(1120px, 94vw);
+  height: min(860px, 90vh);
+  border: 1px solid color-mix(in srgb, var(--border) 78%, white 12%);
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--surface-1);
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.48);
+}
+
+.imagePreviewHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 54px;
+  border-bottom: 1px solid var(--border-soft);
+  padding: 9px 10px 9px 16px;
+}
+
+.imagePreviewHeader > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.imagePreviewHeader strong,
+.imagePreviewHeader small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.imagePreviewHeader strong { color: var(--text); font-size: 13px; }
+.imagePreviewHeader small { color: var(--faint); font-size: 10px; }
+
+.imagePreviewActions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.imagePreviewActions a,
+.imagePreviewActions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 10px;
+  color: var(--text);
+  background: var(--surface-2);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.imagePreviewActions button { width: 34px; padding: 0; }
+.imagePreviewActions :is(a, button):hover { background: var(--surface-3); }
+
+.imagePreviewCanvas {
+  display: grid;
+  place-items: center;
+  min-height: 0;
+  padding: 18px;
+  overflow: auto;
+  background: color-mix(in srgb, var(--surface-3) 42%, black);
+}
+
+.imagePreviewCanvas img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
 @media (max-width: 760px) {
   .composerAttachment { grid-template-columns: 32px minmax(0, 96px) 22px; min-width: 156px; }
   .composerHint { display: none; }
   .attachmentPickerButton span { display: none; }
   .attachmentPickerButton { width: 30px; justify-content: center; padding: 0; }
+  .imagePreviewOverlay { padding: 10px; }
+  .imagePreviewDialog { width: 100%; height: 92vh; }
+  .imagePreviewActions a { width: 34px; padding: 0; font-size: 0; }
 }
 .diffLine.add,
 .diffSplitContent.add,

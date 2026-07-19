@@ -82,6 +82,7 @@ const toolNames: Record<string, string> = {
   project_diagnostics: "项目诊断",
   list_files: "浏览目录",
   inspect_tree: "检查目录",
+  generate_image: "生成图片",
   web_fetch: "获取网页",
   docker_compose: "Docker Compose",
   sqlite_query: "SQLite 查询",

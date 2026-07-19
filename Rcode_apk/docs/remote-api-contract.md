@@ -85,7 +85,7 @@
 }
 ```
 
-`mode` 目前为 `workspace_write` 或 `plan`。审批使用 `action: agent.approve`，payload 为 `{ approvalId, originCommandId, allow }`。
+`mode` 目前为 `default`、`plan`、`workspace_write`、`custom` 或 `full_access`。远程 Agent 必须按该字段执行；`full_access` 允许访问当前项目外的普通本机路径，但仍保留凭据、密钥泄露和破坏性操作等强制保护。审批使用 `action: agent.approve`，payload 为 `{ approvalId, originCommandId, allow, mode }`。
 
 服务端接受或更新任务时发送 `command.accepted` / `command.updated`，并携带：
 

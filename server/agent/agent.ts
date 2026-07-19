@@ -429,6 +429,7 @@ async function* processToolCallQueueStream(
     const result = await executeTool(toolCall, options.projectPath, {
       conversationId: conversation.id,
       providerId: options.providerId,
+      permissionMode: mode,
       permissionEffect: approvalDecision.effect,
       permissionReason: approvalDecision.reason
     });
@@ -541,6 +542,7 @@ export async function* approveToolCallStream(input: {
       ? await executeTool(approval.toolCall, approval.projectPath ?? input.projectPath, {
           conversationId: conversation.id,
           providerId: input.providerId,
+          permissionMode: input.mode,
           permissionEffect: "allow",
           permissionReason: "User approved this tool call."
         })
@@ -610,6 +612,7 @@ export async function* approveToolCallStream(input: {
     ? await executeTool(storedApproval.toolCall, projectPath, {
         conversationId: conversation.id,
         providerId: input.providerId,
+        permissionMode: input.mode,
         permissionEffect: "allow",
         permissionReason: "User approved this recovered tool call."
       })

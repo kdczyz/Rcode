@@ -74,6 +74,17 @@ test("permission policy allows routine checks and asks for risky mutations", asy
   assert.equal(destructive.effect, "ask");
 });
 
+test("permission policy automatically allows user-requested image generation", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "agent-console-"));
+  const image = await evaluatePermission("workspace_write", {
+    id: "image",
+    name: "generate_image",
+    arguments: { prompt: "A quiet city at night" }
+  }, root);
+  assert.equal(image.effect, "allow");
+  assert.equal(image.requiresApproval, false);
+});
+
 test("permission policy denies credential and personal-file access", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agent-console-"));
   const credential = await evaluatePermission("full_access", {
@@ -88,6 +99,43 @@ test("permission policy denies credential and personal-file access", async () =>
   }, root);
   assert.equal(credential.effect, "deny");
   assert.equal(outside.effect, "deny");
+});
+
+test("full access allows ordinary paths and shell commands outside the workspace", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "agent-console-"));
+  const outside = await mkdtemp(path.join(os.tmpdir(), "agent-console-outside-"));
+  const outsideFile = path.join(outside, "note.txt");
+  await writeFile(outsideFile, "visible from full access", "utf8");
+
+  const fileDecision = await evaluatePermission("full_access", {
+    id: "outside-file",
+    name: "read_file",
+    arguments: { path: outsideFile }
+  }, root);
+  const shellDecision = await evaluatePermission("full_access", {
+    id: "outside-shell",
+    name: "run_shell",
+    arguments: { command: `/bin/ls -la ${outside}` }
+  }, root);
+  const fileResult = await executeTool({
+    id: "outside-file-execution",
+    name: "read_file",
+    arguments: { path: outsideFile }
+  }, root, { permissionMode: "full_access", permissionEffect: "allow" });
+  const shellResult = await portableExecutor.run({
+    command: "pwd",
+    cwd: outside,
+    projectPath: root,
+    allowOutsideWorkspace: true
+  });
+
+  assert.equal(fileDecision.effect, "allow");
+  assert.equal(fileDecision.requiresApproval, false);
+  assert.equal(shellDecision.effect, "allow");
+  assert.equal(fileResult.ok, true);
+  assert.equal(fileResult.content, "visible from full access");
+  assert.equal(shellResult.ok, true);
+  assert.equal(shellResult.stdout.trim(), await realpath(outside));
 });
 
 test("analyzeShellCommand marks cwd outside workspace as blocked", async () => {

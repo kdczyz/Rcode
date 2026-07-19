@@ -1,6 +1,7 @@
 import { exports } from "cloudflare:workers";
 import { env } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
+import { requestedWorkImageModel, shouldGenerateWorkImage } from "../src/work-ai";
 
 interface JsonMessage {
   type?: string;
@@ -43,6 +44,21 @@ function nextMessage(socket: WebSocket, type: string): Promise<JsonMessage> {
 }
 
 describe("Rcode remote server", () => {
+  it("distinguishes direct image requests from image-related questions", () => {
+    expect(shouldGenerateWorkImage("生成一个安静的湖边夜景")).toBe(true);
+    expect(shouldGenerateWorkImage("帮我画一只戴围巾的猫")).toBe(true);
+    expect(shouldGenerateWorkImage("Create a cinematic night scene image")).toBe(true);
+    expect(shouldGenerateWorkImage("解释怎么通过 API 生成图片")).toBe(false);
+    expect(shouldGenerateWorkImage("用 Mermaid 画一个系统架构图")).toBe(false);
+  });
+
+  it("resolves an explicitly requested image model alias", () => {
+    const models = ["gpt-image-1", "gpt-image-2"];
+    expect(requestedWorkImageModel("用 image2 生成一个日出的照片", models)).toEqual({ model: "gpt-image-2", reference: "gpt-image-2" });
+    expect(requestedWorkImageModel("using gpt-image-1 create a photo", models)).toEqual({ model: "gpt-image-1", reference: "gpt-image-1" });
+    expect(requestedWorkImageModel("用 image3 生成一张照片", models)).toEqual({ reference: "image3" });
+  });
+
   it("encrypts per-user Work AI configuration and never returns the API key", async () => {
     const register = await call("/v1/auth/register", {
       method: "POST",
@@ -62,7 +78,7 @@ describe("Rcode remote server", () => {
     expect(await responseJson(empty)).toEqual({ configured: false, providers: [] });
 
     const discoveryUpstream = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({
-      data: [{ id: "work-model" }, { id: "work-model-mini" }, { id: "work-model" }]
+      data: [{ id: "work-model" }, { id: "gpt-image-test" }, { id: "work-model-mini" }, { id: "work-model" }]
     }), { headers: { "content-type": "application/json" } }));
     const discovered = await call("/v1/work/ai-discover", {
       method: "POST",
@@ -76,7 +92,9 @@ describe("Rcode remote server", () => {
       baseUrl: "https://api.example.com/v1",
       chatCompletionsPath: "/chat/completions",
       model: "work-model",
-      models: ["work-model", "work-model-mini"]
+      models: ["work-model", "work-model-mini"],
+      defaultImageModel: "gpt-image-test",
+      imageModels: ["gpt-image-test"]
     });
     expect(String(discoveryUpstream.mock.calls[0]?.[0])).toBe("https://api.example.com/v1/models");
     expect(JSON.stringify(discoveredBody)).not.toContain("sk-sensitive-test-key");
@@ -94,7 +112,7 @@ describe("Rcode remote server", () => {
         model: "work-model",
         models: ["work-model", "work-model-mini"],
         defaultImageModel: "gpt-image-test",
-        imageModels: ["gpt-image-test"],
+        imageModels: ["gpt-image-test", "gpt-image-2"],
         apiKey: "sk-sensitive-test-key"
       })
     });
@@ -107,7 +125,7 @@ describe("Rcode remote server", () => {
       model: "work-model",
       models: ["work-model", "work-model-mini"],
       defaultImageModel: "gpt-image-test",
-      imageModels: ["gpt-image-test"],
+      imageModels: ["gpt-image-test", "gpt-image-2"],
       apiKeyPreview: "••••-key"
     });
     expect(savedBody.providers).toHaveLength(1);
@@ -167,6 +185,30 @@ describe("Rcode remote server", () => {
     expect(String(imageUpstream.mock.calls[0]?.[0])).toBe("https://api.example.com/v1/images/generations");
     expect(String(imageUpstream.mock.calls[0]?.[1]?.body)).toContain('"output_format":"jpeg"');
     imageUpstream.mockRestore();
+
+    const automaticImageUpstream = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({
+      data: [{ b64_json: encodedImage, revised_prompt: "A quiet lake at night" }]
+    }), { headers: { "content-type": "application/json" } }));
+    const automaticImage = await call("/v1/work/chat", {
+      method: "POST",
+      headers: authorization,
+      body: JSON.stringify({
+        providerId: "desktop-main",
+        model: "work-model-mini",
+        imageModel: "gpt-image-test",
+        autoImage: true,
+        stream: true,
+        messages: [{ role: "user", content: "用 image2 生成一个安静的湖边夜景" }]
+      })
+    });
+    expect(automaticImage.status).toBe(200);
+    const automaticImageStream = await automaticImage.text();
+    expect(automaticImageStream).toContain('"type":"image"');
+    expect(automaticImageStream).toContain('"model":"gpt-image-2"');
+    expect(automaticImageStream).toContain(`data:image/jpeg;base64,${encodedImage}`);
+    expect(String(automaticImageUpstream.mock.calls[0]?.[0])).toBe("https://api.example.com/v1/images/generations");
+    expect(String(automaticImageUpstream.mock.calls[0]?.[1]?.body)).toContain('"model":"gpt-image-2"');
+    automaticImageUpstream.mockRestore();
 
     const removed = await call("/v1/work/ai-config", { method: "DELETE", headers: authorization });
     expect(await responseJson(removed)).toEqual({ configured: false, providers: [] });
