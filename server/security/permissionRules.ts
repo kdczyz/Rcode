@@ -149,6 +149,30 @@ export async function evaluatePermission(
     }
   }
 
+  // Full access is an explicit user choice: approval-only policy rules must not
+  // pause execution in this mode. Mandatory denials above still apply, and the
+  // portable shell guard continues to reject credential access and other
+  // commands that cannot be executed safely at all.
+  if (mode === "full_access") {
+    if (toolCall.name === "run_shell" || toolCall.name === "start_process") {
+      const command = typeof toolCall.arguments.command === "string" ? toolCall.arguments.command : "";
+      const analysis = await analyzeShellCommand(command, toolCall.arguments.cwd, projectPath);
+      const hardBlockedReason = analysis.blockedReason === "Command cwd is outside the workspace."
+        ? undefined
+        : analysis.blockedReason;
+      if (hardBlockedReason || analysis.leaksEnvironment || analysis.backgroundProcess || analysis.interactive || analysis.credentialAccess) {
+        return decision("deny", hardBlockedReason ?? `Shell command blocked by portable guard: ${analysis.riskFlags.join(", ")}`, {
+          enforcement: "denied",
+          requiresApproval: false
+        });
+      }
+    }
+    return decision("allow", "Full access mode executes directly without approval after mandatory safety checks.", {
+      enforcement: "guarded",
+      requiresApproval: false
+    });
+  }
+
   if (mode === "plan") {
     const effect: PermissionEffect = toolCall.name === "read_file" || toolCall.name === "list_files" || toolCall.name === "search_text" || toolCall.name === "inspect_tree" || toolCall.name === "project_diagnostics" || toolCall.name === "git_status" || toolCall.name === "git_diff" || toolCall.name === "read_process" || toolCall.name === "list_processes"
       ? "allow"
@@ -193,9 +217,7 @@ export async function evaluatePermission(
     const hardBlockedReason = analysis.blockedReason === "Command cwd is outside the workspace."
       ? undefined
       : analysis.blockedReason;
-    const workspaceBoundaryBlocked = mode !== "full_access" && (
-      !analysis.cwdInsideWorkspace || analysis.redirectsOutsideWorkspace || analysis.mentionsOutsideWorkspace
-    );
+    const workspaceBoundaryBlocked = !analysis.cwdInsideWorkspace || analysis.redirectsOutsideWorkspace || analysis.mentionsOutsideWorkspace;
     if (hardBlockedReason || workspaceBoundaryBlocked || analysis.leaksEnvironment || analysis.backgroundProcess || analysis.interactive || analysis.credentialAccess) {
       return decision("deny", hardBlockedReason ?? (workspaceBoundaryBlocked
         ? "Shell commands may not access personal files outside the workspace."
@@ -240,10 +262,6 @@ export async function evaluatePermission(
       enforcement: matchedRule.effect === "allow" ? "guarded" : matchedRule.effect === "ask" ? "requires_approval" : "denied",
       requiresApproval: matchedRule.effect === "ask"
     });
-  }
-
-  if (mode === "full_access") {
-    return decision("allow", "Full access mode allows this tool call after mandatory safety rules.", { enforcement: "guarded", requiresApproval: false });
   }
 
   return decision("allow", "Workspace-write default policy allows this tool call.", { requiresApproval: false });

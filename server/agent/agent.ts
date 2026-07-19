@@ -431,7 +431,8 @@ async function* processToolCallQueueStream(
       providerId: options.providerId,
       permissionMode: mode,
       permissionEffect: approvalDecision.effect,
-      permissionReason: approvalDecision.reason
+      permissionReason: approvalDecision.reason,
+      signal: options.signal
     });
     await runHooks("PostToolUse", {
       projectPath: options.projectPath,

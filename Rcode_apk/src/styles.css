@@ -3896,6 +3896,12 @@ select:focus-visible {
   background: #242428;
 }
 
+.composerRow > button.codeStopButton,
+.composerRow > button.codeStopButton:active {
+  color: #fff;
+  background: #242428;
+}
+
 @media (max-width: 390px) {
   .workComposer {
     padding-right: 22px;

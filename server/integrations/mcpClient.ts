@@ -359,12 +359,18 @@ function extractMcpToolResult(result: unknown): { ok: boolean; content: string; 
   };
 }
 
-export async function executeMcpTool(call: ToolCall): Promise<{ ok: boolean; content: string; attachments?: AgentAttachment[] }> {
+export async function executeMcpTool(call: ToolCall, signal?: AbortSignal): Promise<{ ok: boolean; content: string; attachments?: AgentAttachment[] }> {
   const parsed = splitMcpToolName(call.name);
   if (!parsed) throw new Error(`Invalid MCP tool name: ${call.name}`);
-  const result = await requestServer(parsed.serverId, "tools/call", {
+  if (signal?.aborted) throw new DOMException("MCP tool call aborted", "AbortError");
+  const request = requestServer(parsed.serverId, "tools/call", {
     name: parsed.toolName,
     arguments: call.arguments
   });
+  const result = signal ? await new Promise<unknown>((resolve, reject) => {
+    const abort = () => reject(new DOMException("MCP tool call aborted", "AbortError"));
+    signal.addEventListener("abort", abort, { once: true });
+    request.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  }) : await request;
   return extractMcpToolResult(result);
 }

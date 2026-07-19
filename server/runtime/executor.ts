@@ -14,6 +14,7 @@ export interface ExecutorRunInput {
   timeoutMs?: number;
   maxBuffer?: number;
   secretRefs?: unknown;
+  signal?: AbortSignal;
 }
 
 function safeEnvironment() {
@@ -72,7 +73,8 @@ export class PortableExecutor {
         cwd: analysis.cwd,
         timeout: input.timeoutMs ?? 30000,
         maxBuffer: input.maxBuffer ?? 1024 * 1024,
-        env: { ...safeEnvironment(), ...secrets.env }
+        env: { ...safeEnvironment(), ...secrets.env },
+        signal: input.signal
       });
       return {
         ok: true,
@@ -92,7 +94,7 @@ export class PortableExecutor {
         ok: false,
         exitCode,
         stdout: redactSecrets(err.stdout ?? "", secrets.values),
-        stderr: redactSecrets(err.stderr ?? err.message, secrets.values),
+        stderr: redactSecrets(err.stderr || err.message, secrets.values),
         durationMs: Date.now() - startedAt,
         riskFlags: analysis.riskFlags,
         cwd: analysis.cwd,

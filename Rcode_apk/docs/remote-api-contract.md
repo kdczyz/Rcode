@@ -85,7 +85,9 @@
 }
 ```
 
-`mode` 目前为 `default`、`plan`、`workspace_write`、`custom` 或 `full_access`。远程 Agent 必须按该字段执行；`full_access` 允许访问当前项目外的普通本机路径，但仍保留凭据、密钥泄露和破坏性操作等强制保护。审批使用 `action: agent.approve`，payload 为 `{ approvalId, originCommandId, allow, mode }`。
+`mode` 目前为 `default`、`plan`、`workspace_write`、`custom` 或 `full_access`。远程 Agent 必须按该字段执行；`full_access` 在强制安全拒绝之外直接执行，不产生审批请求。审批使用 `action: agent.approve`，payload 为 `{ approvalId, originCommandId, allow, mode }`。
+
+运行中的任务通过独立控制消息终止，不进入任务队列：控制端发送 `{ type: "command.stop", deviceId, targetCommandId, targetRequestId }`，中转端立即把目标任务收敛为终态并向电脑端转发 `{ type: "command.stop", commandId, requestId }`。
 
 服务端接受或更新任务时发送 `command.accepted` / `command.updated`，并携带：
 

@@ -275,6 +275,7 @@ interface ToolExecutionContext {
   permissionReason?: string;
   permissionMode?: PermissionMode;
   providerId?: string;
+  signal?: AbortSignal;
 }
 
 async function resolveReadableToolPath(input: unknown, projectPath: string | undefined, allowOutsideWorkspace: boolean) {
@@ -467,7 +468,7 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
     }
 
     if (call.name.startsWith("mcp__")) {
-      const mcpResult = await executeMcpTool(call);
+      const mcpResult = await executeMcpTool(call, context?.signal);
       const summarized = summarizeWithArtifacts(mcpResult.content, context);
       result = {
         toolCallId: call.id,
@@ -535,7 +536,7 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
       const cwd = call.arguments.cwd ? (await resolveReadableToolPath(call.arguments.cwd, projectPath, allowOutsideWorkspace)).canonicalPath : getWorkspaceRoot(projectPath);
       const kind = typeof call.arguments.kind === "string" ? call.arguments.kind : "typecheck";
       const command = await diagnosticCommand(cwd, kind);
-      executorResult = await portableExecutor.run({ command, cwd, projectPath, allowOutsideWorkspace });
+      executorResult = await portableExecutor.run({ command, cwd, projectPath, allowOutsideWorkspace, signal: context?.signal });
       exitCode = executorResult.exitCode;
       result = buildExecutorToolResult(call, executorResult, context);
     } else if (call.name === "generate_image") {
@@ -545,7 +546,8 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         model: typeof call.arguments.model === "string" ? call.arguments.model : undefined,
         size: typeof call.arguments.size === "string" ? call.arguments.size as ImageSize : undefined,
         quality: typeof call.arguments.quality === "string" ? call.arguments.quality as ImageQuality : undefined,
-        count: getNumber(call.arguments.count, 1)
+        count: getNumber(call.arguments.count, 1),
+        signal: context?.signal
       });
       result = {
         toolCallId: call.id,
@@ -574,7 +576,7 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
       };
     } else if (call.name === "web_fetch") {
       const url = getString(call.arguments.url, "url");
-      const response = await fetch(url);
+      const response = await fetch(url, { signal: context?.signal });
       const text = await response.text();
       result = { toolCallId: call.id, name: call.name, ok: response.ok, exitCode: response.status, content: text.slice(0, 12000) };
     } else if (call.name === "run_shell") {
@@ -582,7 +584,7 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         throw new Error("Computer control shell is disabled by config/agent.toml");
       }
       const command = getString(call.arguments.command, "command");
-      executorResult = await portableExecutor.run({ command, cwd: call.arguments.cwd, projectPath, allowOutsideWorkspace, secretRefs: call.arguments.secretRefs });
+      executorResult = await portableExecutor.run({ command, cwd: call.arguments.cwd, projectPath, allowOutsideWorkspace, secretRefs: call.arguments.secretRefs, signal: context?.signal });
       exitCode = executorResult.exitCode;
       result = buildExecutorToolResult(call, executorResult, context);
     } else if (call.name === "start_process") {
@@ -644,7 +646,7 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
       const tail = Math.max(1, Math.min(getNumber(call.arguments.tail, 200), 2_000));
       const actionArgs = action === "logs" ? `logs --no-color --tail ${tail}` : action === "up" ? "up --detach" : action;
       const command = `docker compose ${actionArgs}${serviceArgs ? ` ${serviceArgs}` : ""}`;
-      executorResult = await portableExecutor.run({ command, cwd, projectPath, allowOutsideWorkspace });
+      executorResult = await portableExecutor.run({ command, cwd, projectPath, allowOutsideWorkspace, signal: context?.signal });
       exitCode = executorResult.exitCode;
       result = buildExecutorToolResult(call, executorResult, context);
     } else if (call.name === "sqlite_query") {
@@ -668,7 +670,7 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
     } else if (call.name === "git_status" || call.name === "git_diff") {
       const cwd = call.arguments.cwd ? (await resolveReadableToolPath(call.arguments.cwd, projectPath, allowOutsideWorkspace)).canonicalPath : getWorkspaceRoot(projectPath);
       const command = call.name === "git_status" ? "git status --short --branch" : `git diff ${call.arguments.staged ? "--staged" : ""}`;
-      executorResult = await portableExecutor.run({ command, cwd, projectPath, allowOutsideWorkspace });
+      executorResult = await portableExecutor.run({ command, cwd, projectPath, allowOutsideWorkspace, signal: context?.signal });
       exitCode = executorResult.exitCode;
       result = buildExecutorToolResult(call, executorResult, context);
     } else if (call.name === "git_branch" || call.name === "git_stage" || call.name === "git_commit" || call.name === "git_push") {
@@ -689,7 +691,7 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         const branch = typeof call.arguments.branch === "string" ? ` ${shellQuote(call.arguments.branch)}` : "";
         command = `git push${call.arguments.setUpstream ? " --set-upstream" : ""} ${remote}${branch}`;
       }
-      executorResult = await portableExecutor.run({ command, cwd, projectPath, allowOutsideWorkspace });
+      executorResult = await portableExecutor.run({ command, cwd, projectPath, allowOutsideWorkspace, signal: context?.signal });
       exitCode = executorResult.exitCode;
       result = buildExecutorToolResult(call, executorResult, context);
     } else {

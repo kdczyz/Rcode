@@ -20,8 +20,12 @@ let remoteHeartbeatTimer;
 let remoteConnectionWanted = false;
 let remoteWorkspace = { projects: [], models: [], defaultModel: undefined, activeProjectId: undefined };
 let remoteCommandRunning = false;
+let activeRemoteCommand;
+let activeRemoteAbortController;
 const remoteCommandQueue = [];
 const receivedRemoteCommandIds = new Set();
+const remoteReliableOutbox = [];
+const REMOTE_STREAM_IDLE_TIMEOUT_MS = 5 * 60_000;
 const preferencesPath = () => path.join(app.getPath("userData"), "preferences.json");
 const authSessionPath = () => path.join(app.getPath("userData"), "auth-session.bin");
 const githubMcpSessionPath = () => path.join(app.getPath("userData"), "github-mcp-oauth.bin");
@@ -418,6 +422,20 @@ function sendRemote(value) {
   }
 }
 
+function sendRemoteReliable(value) {
+  if (sendRemote(value)) return true;
+  remoteReliableOutbox.push(value);
+  if (remoteReliableOutbox.length > 100) remoteReliableOutbox.splice(0, remoteReliableOutbox.length - 100);
+  return false;
+}
+
+function flushRemoteOutbox() {
+  while (remoteReliableOutbox.length > 0) {
+    if (!sendRemote(remoteReliableOutbox[0])) return;
+    remoteReliableOutbox.shift();
+  }
+}
+
 function publicRemoteWorkspace() {
   return {
     projects: remoteWorkspace.projects.map((project) => ({
@@ -543,7 +561,25 @@ function publicRemoteEvent(event) {
   return undefined;
 }
 
-async function consumeLocalAgentStream(command) {
+function isAbortError(error) {
+  return error instanceof Error && (error.name === "AbortError" || /aborted|终止/i.test(error.message));
+}
+
+async function readRemoteStreamChunk(reader) {
+  let timeout;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("电脑端工具调用长时间没有响应，已自动结束")), REMOTE_STREAM_IDLE_TIMEOUT_MS);
+      })
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function consumeLocalAgentStream(command, signal) {
   const payload = command?.payload && typeof command.payload === "object" ? command.payload : {};
   const action = command?.action;
   if (action !== "agent.run" && action !== "agent.approve") throw new Error("不支持的远程指令");
@@ -592,7 +628,8 @@ async function consumeLocalAgentStream(command) {
   const response = await fetch(`${localAgentApiUrl()}${endpoint}`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-agent-token": localApiToken },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    signal
   });
   if (!response.ok || !response.body) {
     const details = await response.json().catch(() => ({}));
@@ -605,25 +642,36 @@ async function consumeLocalAgentStream(command) {
   let summary = "";
   let sawApproval = false;
   let failed = false;
-  while (true) {
-    const { value, done } = await reader.read();
-    buffer += decoder.decode(value, { stream: !done });
-    const blocks = buffer.split("\n\n");
-    buffer = blocks.pop() || "";
-    for (const block of blocks) {
-      const line = block.split("\n").find((candidate) => candidate.startsWith("data:"));
-      if (!line) continue;
-      let event;
-      try { event = JSON.parse(line.slice(5).trim()); } catch { continue; }
-      const safeEvent = publicRemoteEvent(event);
-      if (!safeEvent) continue;
-      if (safeEvent.type === "approval_required") sawApproval = true;
-      if (safeEvent.type === "error") failed = true;
-      if (safeEvent.type === "completed") summary = safeEvent.answer;
-      if (safeEvent.type === "error") summary = safeEvent.message;
+  const processBlock = (block) => {
+    const line = block.split(/\r?\n/).find((candidate) => candidate.startsWith("data:"));
+    if (!line) return;
+    let event;
+    try { event = JSON.parse(line.slice(5).trim()); } catch { return; }
+    const safeEvent = publicRemoteEvent(event);
+    if (!safeEvent) return;
+    if (safeEvent.type === "approval_required") sawApproval = true;
+    if (safeEvent.type === "error") failed = true;
+    if (safeEvent.type === "completed") summary = safeEvent.answer;
+    if (safeEvent.type === "error") summary = safeEvent.message;
+    if (safeEvent.type === "completed" || safeEvent.type === "error") {
+      sendRemoteReliable({ type: "command.event", commandId: command.id, event: safeEvent });
+    } else {
       sendRemote({ type: "command.event", commandId: command.id, event: safeEvent });
     }
-    if (done) break;
+  };
+  try {
+    while (true) {
+      const { value, done } = await readRemoteStreamChunk(reader);
+      buffer += decoder.decode(value, { stream: !done });
+      const blocks = buffer.split(/\r?\n\r?\n/);
+      buffer = blocks.pop() || "";
+      for (const block of blocks) processBlock(block);
+      if (done) break;
+    }
+    if (buffer.trim()) processBlock(buffer);
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
   }
   return { ok: !failed, summary: summary || (sawApproval ? "等待远程审批" : "任务已完成"), sawApproval };
 }
@@ -636,22 +684,29 @@ async function drainRemoteCommandQueue() {
       const command = remoteCommandQueue.shift();
       if (!command?.id) continue;
       sendRemote({ type: "command.updated", command: { id: command.id, status: "running" } });
+      const abortController = new AbortController();
+      activeRemoteCommand = command;
+      activeRemoteAbortController = abortController;
       try {
-        const result = await consumeLocalAgentStream(command);
+        const result = await consumeLocalAgentStream(command, abortController.signal);
         if (!result.sawApproval) {
           const status = result.ok ? "completed" : "failed";
-          sendRemote({ type: "command.updated", command: { id: command.id, status, summary: result.summary } });
+          sendRemoteReliable({ type: "command.updated", command: { id: command.id, status, summary: result.summary } });
           const originCommandId = command.action === "agent.approve" && typeof command.payload?.originCommandId === "string"
             ? command.payload.originCommandId.slice(0, 128)
             : "";
           if (originCommandId) {
-            sendRemote({ type: "command.updated", command: { id: originCommandId, status, summary: result.summary } });
+            sendRemoteReliable({ type: "command.updated", command: { id: originCommandId, status, summary: result.summary } });
           }
         }
       } catch (error) {
+        if (abortController.signal.aborted || isAbortError(error)) continue;
         const message = error instanceof Error ? error.message : "远程任务执行失败";
-        sendRemote({ type: "command.event", commandId: command.id, event: { type: "error", message } });
-        sendRemote({ type: "command.updated", command: { id: command.id, status: "failed", summary: message } });
+        sendRemoteReliable({ type: "command.event", commandId: command.id, event: { type: "error", message } });
+        sendRemoteReliable({ type: "command.updated", command: { id: command.id, status: "failed", summary: message } });
+      } finally {
+        if (activeRemoteCommand?.id === command.id) activeRemoteCommand = undefined;
+        if (activeRemoteAbortController === abortController) activeRemoteAbortController = undefined;
       }
     }
   } finally {
@@ -668,6 +723,16 @@ function queueRemoteCommand(command) {
   }
   remoteCommandQueue.push(command);
   void drainRemoteCommandQueue();
+}
+
+function stopRemoteCommand(commandId, requestId) {
+  for (let index = remoteCommandQueue.length - 1; index >= 0; index--) {
+    const queued = remoteCommandQueue[index];
+    if (queued?.id === commandId || queued?.requestId === requestId) remoteCommandQueue.splice(index, 1);
+  }
+  if (activeRemoteCommand?.id === commandId || activeRemoteCommand?.requestId === requestId) {
+    activeRemoteAbortController?.abort(new DOMException("已从手机端终止", "AbortError"));
+  }
 }
 
 async function sendRemoteDeviceUpdate() {
@@ -724,6 +789,7 @@ async function startRemoteAgentConnection() {
       clearTimeout(remoteReconnectTimer);
       remoteHeartbeatTimer = setInterval(() => sendRemote({ type: "ping" }), 25_000);
       void sendRemoteDeviceUpdate();
+      flushRemoteOutbox();
     });
     socket.addEventListener("message", (message) => {
       if (remoteSocket !== socket) return;
@@ -735,6 +801,8 @@ async function startRemoteAgentConnection() {
         && body.payload && typeof body.payload === "object" && !Array.isArray(body.payload)
       ) {
         queueRemoteCommand({ ...body.command, payload: body.payload });
+      } else if (body?.type === "command.stop" && (typeof body.commandId === "string" || typeof body.requestId === "string")) {
+        stopRemoteCommand(body.commandId, body.requestId);
       } else if (body?.type === "remote.error") {
         console.warn("Remote server rejected a message:", body.error || "unknown error");
       }

@@ -263,6 +263,7 @@ function eventDescription(event: Record<string, unknown>) {
   if (event.type === "learning_result") return Number(event.recordsSaved || 0) > 0 ? `已保存 ${Number(event.recordsSaved)} 条学习记录` : "自动学习检查完成";
   if (event.type === "permission_decision") return typeof event.reason === "string" ? event.reason : "权限检查完成";
   if (event.type === "completed") return typeof event.answer === "string" ? event.answer : "任务已完成";
+  if (event.type === "stopped") return typeof event.message === "string" ? event.message : "已终止本次会话";
   if (event.type === "error") return typeof event.message === "string" ? event.message : "任务执行失败";
   if (event.type === "approval_required") return typeof event.reason === "string" ? event.reason : "需要你的批准";
   return "";
@@ -694,6 +695,27 @@ export function App() {
     }
   }
 
+  function stopCommand(command: RemoteCommand) {
+    try {
+      const controller = controllerRef.current;
+      if (!controller) throw new Error("远程连接尚未就绪");
+      controller.stopCommand(selectedDeviceId, command.id, command.requestId);
+      const now = Date.now();
+      mergeCommand({ ...command, status: "failed", summary: "已终止", updatedAt: now });
+      setEvents((current) => [...current.slice(-499), {
+        id: `${command.id}:stopped:${now}`,
+        commandId: command.id,
+        type: "stopped",
+        text: "已终止本次会话",
+        at: now
+      }]);
+      setApproval((current) => current?.commandId === command.id ? undefined : current);
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法终止当前会话");
+    }
+  }
+
   function createSessionForProject(project: RemoteWorkspaceProject) {
     if (!selectedDevice) return;
     const session: SavedSession = {
@@ -909,6 +931,7 @@ export function App() {
             thinkingMode
           })) setApproval(undefined);
         }}
+        onStop={stopCommand}
       />}
 
       {activeScreen === "settings" && <SettingsScreen
@@ -969,12 +992,13 @@ function CodeHomeScreen({ device, project }: { device: RemoteDevice; project: Re
   return <section className="codeHomePage"><div className="codeHomeMark"><Folder size={30} fill="currentColor" /></div><p className="overline">CODE WORKSPACE</p><h1>{project.name}</h1><p>从左侧项目文件夹中选择会话，或点击文件夹右侧的加号创建新会话。</p><div className="codeHomeDevice"><span className={device.online ? "onlineDot active" : "onlineDot"} /><span>{device.name}</span><small>{device.online ? "电脑在线" : "电脑离线"}</small></div></section>;
 }
 
-function ChatScreen({ device, project, commands, events, approval, providers, providerId, models, model, canSend, initialMode, initialThinkingMode, onProviderChange, onModelChange, onPreferencesChange, onSend, onApproval }: { device: RemoteDevice; project: RemoteWorkspaceProject; commands: RemoteCommand[]; events: LiveEvent[]; approval?: ApprovalRequest; providers: WorkAiProvider[]; providerId: string; models: string[]; model: string; canSend: boolean; initialMode: RunMode; initialThinkingMode: ThinkingMode; onProviderChange: (providerId: string) => void; onModelChange: (model: string) => void; onPreferencesChange: (preferences: MobilePreferences) => void; onSend: (prompt: string, mode: RunMode, thinkingMode: ThinkingMode) => boolean; onApproval: (allow: boolean, mode: RunMode, thinkingMode: ThinkingMode) => void }) {
+function ChatScreen({ device, project, commands, events, approval, providers, providerId, models, model, canSend, initialMode, initialThinkingMode, onProviderChange, onModelChange, onPreferencesChange, onSend, onApproval, onStop }: { device: RemoteDevice; project: RemoteWorkspaceProject; commands: RemoteCommand[]; events: LiveEvent[]; approval?: ApprovalRequest; providers: WorkAiProvider[]; providerId: string; models: string[]; model: string; canSend: boolean; initialMode: RunMode; initialThinkingMode: ThinkingMode; onProviderChange: (providerId: string) => void; onModelChange: (model: string) => void; onPreferencesChange: (preferences: MobilePreferences) => void; onSend: (prompt: string, mode: RunMode, thinkingMode: ThinkingMode) => boolean; onApproval: (allow: boolean, mode: RunMode, thinkingMode: ThinkingMode) => void; onStop: (command: RemoteCommand) => void }) {
   const [prompt, setPrompt] = useState("");
   const [mode, setMode] = useState<RunMode>(initialMode);
   const [thinkingMode, setThinkingMode] = useState<ThinkingMode>(initialThinkingMode);
   const timelineRef = useRef<HTMLDivElement>(null);
   const runs = commands.filter((command) => command.action === "agent.run").sort((a, b) => a.createdAt - b.createdAt);
+  const activeRun = [...runs].reverse().find((command) => ["queued", "running", "awaiting_approval"].includes(command.status));
 
   useEffect(() => {
     const timeline = timelineRef.current;
@@ -985,7 +1009,7 @@ function ChatScreen({ device, project, commands, events, approval, providers, pr
   function submit(event: FormEvent) {
     event.preventDefault();
     const value = prompt.trim();
-    if (!value || !canSend) return;
+    if (!value || !canSend || activeRun) return;
     if (onSend(value, mode, thinkingMode)) setPrompt("");
   }
 
@@ -1006,6 +1030,7 @@ function ChatScreen({ device, project, commands, events, approval, providers, pr
         const runEvents = events.filter((event) => event.commandId === command.id);
         const completed = [...runEvents].reverse().find((event) => event.type === "completed");
         const failed = [...runEvents].reverse().find((event) => event.type === "error");
+        const stopped = [...runEvents].reverse().find((event) => event.type === "stopped");
         const deltas = runEvents.filter((event) => event.type === "text_delta").map((event) => event.text).join("");
         const assistantText = failed?.text || completed?.text || deltas;
         const trace = [...runEvents].reverse().find((event) => event.type === "workflow_state" || event.type === "tool_call");
@@ -1014,7 +1039,7 @@ function ChatScreen({ device, project, commands, events, approval, providers, pr
         return <div className="messageRun" key={command.id}>
           <div className="messageRow user"><div className="bubble">{command.summary || "远程任务"}</div></div>
           {runDetails.length > 0 && <div className="runTrace">{runDetails.map((event) => <div key={event.id}>{active && event === runDetails[runDetails.length - 1] ? <LoaderCircle className="spin" size={12} /> : <Check size={12} />}<span>{event.text}</span></div>)}</div>}
-          {(assistantText || active) && <div className="messageRow assistant"><div className="assistantAvatar"><Bot size={17} /></div><div className={`bubble ${failed ? "failed" : ""}`}>{assistantText ? <p>{assistantText}</p> : <div className="typing"><i /><i /><i /></div>}<footer>{active ? <><LoaderCircle className="spin" size={12} />{trace?.text || commandStatusCopy(command.status)}</> : <><Check size={12} />{commandStatusCopy(command.status)} · {command.model || model}</>}</footer></div></div>}
+          {(assistantText || active || stopped) && <div className="messageRow assistant"><div className="assistantAvatar"><Bot size={17} /></div><div className={`bubble ${failed ? "failed" : ""}`}>{assistantText ? <p>{assistantText}</p> : stopped ? <p>{stopped.text}</p> : <div className="typing"><i /><i /><i /></div>}<footer>{active ? <><LoaderCircle className="spin" size={12} />{trace?.text || commandStatusCopy(command.status)}</> : stopped ? <><Square size={11} fill="currentColor" />已终止 · {command.model || model}</> : <><Check size={12} />{commandStatusCopy(command.status)} · {command.model || model}</>}</footer></div></div>}
         </div>;
       })}
       {approval && <div className="approvalCard"><div className="approvalHeading"><ShieldCheck size={20} /><div><strong>电脑请求授权</strong><span>{approval.risk === "high" ? "高风险操作" : approval.risk === "medium" ? "需要注意" : "低风险操作"}</span></div></div><p>{approval.reason}</p>{approval.toolName && <code>{approval.toolName}</code>}<div className="approvalActions"><button onClick={() => onApproval(false, mode, thinkingMode)}><X size={16} />拒绝</button><button className="approve" onClick={() => onApproval(true, mode, thinkingMode)}><Check size={16} />允许一次</button></div></div>}
@@ -1023,9 +1048,9 @@ function ChatScreen({ device, project, commands, events, approval, providers, pr
       <div className="composerTools">
         <label className="compactSelect"><ShieldCheck size={13} /><select aria-label="权限模式" value={mode} onChange={(event) => updateMode(event.target.value as RunMode)}>{RUN_MODES.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select><ChevronDown size={12} /></label>
         <label className="compactSelect"><Brain size={13} /><select aria-label="思考强度" value={thinkingMode} onChange={(event) => updateThinkingMode(event.target.value as ThinkingMode)}>{THINKING_MODES.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select><ChevronDown size={12} /></label>
-        <span>{canSend ? "电脑在线" : "电脑不可用"}</span>
+        <span>{activeRun ? "正在执行 · 可随时终止" : canSend ? "电脑在线" : "电脑不可用"}</span>
       </div>
-      <div className="composerRow"><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={1} placeholder={canSend ? "发送消息" : "等待电脑上线"} disabled={!canSend} /><button aria-label="发送" disabled={!canSend || !prompt.trim()}><Send size={19} /></button></div>
+      <div className="composerRow"><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={1} placeholder={activeRun ? "电脑正在执行任务" : canSend ? "发送消息" : "等待电脑上线"} disabled={!canSend || Boolean(activeRun)} /><button type={activeRun ? "button" : "submit"} className={activeRun ? "codeStopButton" : undefined} aria-label={activeRun ? "终止会话" : "发送"} onClick={activeRun ? () => onStop(activeRun) : undefined} disabled={!activeRun && (!canSend || !prompt.trim())}>{activeRun ? <Square size={15} fill="currentColor" /> : <Send size={19} />}</button></div>
     </form>
   </section>;
 }

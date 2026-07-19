@@ -305,4 +305,60 @@ describe("Rcode remote server", () => {
     agent.close(1000, "done");
     controller.close(1000, "done");
   });
+
+  it("stops an active remote task immediately without queueing another command", async () => {
+    const register = await call("/v1/auth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        email: "stop@example.com",
+        username: "stop_user",
+        displayName: "Stop User",
+        password: "StrongPass123"
+      })
+    });
+    const session = await responseJson(register);
+    const authorization = { authorization: `Bearer ${String(session.token)}`, "content-type": "application/json" };
+    const controllerTicket = await responseJson(await call("/v1/remote/ticket", {
+      method: "POST", headers: authorization, body: JSON.stringify({ role: "controller" })
+    }));
+    const controller = await connectTicket(String(controllerTicket.url));
+    await nextMessage(controller, "remote.ready");
+    const agentTicket = await responseJson(await call("/v1/remote/ticket", {
+      method: "POST",
+      headers: authorization,
+      body: JSON.stringify({ role: "agent", device: { id: "mac-stop", name: "Mac", platform: "darwin", ready: true } })
+    }));
+    const agent = await connectTicket(String(agentTicket.url));
+    await nextMessage(agent, "remote.ready");
+
+    const acceptedPromise = nextMessage(controller, "command.accepted");
+    const executePromise = nextMessage(agent, "command.execute");
+    controller.send(JSON.stringify({
+      type: "command.create",
+      requestId: "request-stop",
+      deviceId: "mac-stop",
+      action: "agent.run",
+      payload: { prompt: "长时间任务" }
+    }));
+    const accepted = await acceptedPromise;
+    await executePromise;
+    const command = accepted.command as Record<string, unknown>;
+
+    const stoppedUpdatePromise = nextMessage(controller, "command.updated");
+    const stoppedEventPromise = nextMessage(controller, "command.event");
+    const stopRelayPromise = nextMessage(agent, "command.stop");
+    controller.send(JSON.stringify({
+      type: "command.stop",
+      deviceId: "mac-stop",
+      targetCommandId: command.id,
+      targetRequestId: command.requestId
+    }));
+    expect(await stoppedUpdatePromise).toMatchObject({ command: { id: command.id, status: "failed", summary: "已终止" } });
+    expect(await stoppedEventPromise).toMatchObject({ commandId: command.id, event: { type: "stopped" } });
+    expect(await stopRelayPromise).toMatchObject({ commandId: command.id, requestId: command.requestId });
+
+    agent.close(1000, "done");
+    controller.close(1000, "done");
+  });
 });

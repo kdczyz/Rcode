@@ -17,6 +17,7 @@ export interface GenerateImageInput {
   size?: ImageSize;
   quality?: ImageQuality;
   count?: number;
+  signal?: AbortSignal;
 }
 
 export interface GeneratedImageResult {
@@ -125,7 +126,7 @@ export async function generateImage(input: GenerateImageInput): Promise<Generate
         method: "POST",
         headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json", accept: "application/json", "user-agent": "Rcode" },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(180_000)
+        signal: input.signal ? AbortSignal.any([input.signal, AbortSignal.timeout(180_000)]) : AbortSignal.timeout(180_000)
       });
     } catch (error) {
       throw new Error(error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError") ? "图片生成超时" : "无法连接图片生成服务");

@@ -91,6 +91,17 @@ export class RemoteController {
     };
   }
 
+  stopCommand(deviceId: string, targetCommandId: string, targetRequestId: string): void {
+    const socket = this.socket;
+    if (!deviceId || !targetCommandId || !socket || socket.readyState !== WebSocket.OPEN) throw new Error("远程连接尚未就绪");
+    socket.send(JSON.stringify({
+      type: "command.stop",
+      deviceId,
+      targetCommandId,
+      targetRequestId
+    }));
+  }
+
   private readonly handleOnline = () => {
     if (!this.wanted) return;
     this.attempt = 0;

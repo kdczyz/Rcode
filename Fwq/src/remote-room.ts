@@ -238,6 +238,10 @@ export class RemoteRoom extends DurableObject<Env> {
       await this.createCommand(socket, attachment, message);
       return;
     }
+    if (attachment.role === "controller" && message.type === "command.stop") {
+      await this.stopCommand(socket, attachment, message);
+      return;
+    }
     if (attachment.role === "agent" && message.type === "device.announce") {
       const device = parseDevice(message.device);
       if (!device || device.id !== attachment.deviceId) {
@@ -436,6 +440,57 @@ export class RemoteRoom extends DurableObject<Env> {
     `).bind(userId, requestId).first<CommandRow>();
   }
 
+  private async stopCommand(socket: WebSocket, attachment: ConnectionAttachment, message: Record<string, unknown>): Promise<void> {
+    const deviceId = stringField(message.deviceId, 128);
+    const targetCommandId = stringField(message.targetCommandId, 128);
+    const targetRequestId = stringField(message.targetRequestId, 128);
+    if (!deviceId || (!targetCommandId && !targetRequestId)) {
+      safeSend(socket, { type: "remote.error", error: "终止任务参数不正确" });
+      return;
+    }
+
+    let target = targetCommandId
+      ? await this.env.DB.prepare(`
+          SELECT id, request_id, device_id, action, status, summary, payload_json, created_at, updated_at
+            FROM commands WHERE id = ? AND user_id = ? AND device_id = ?
+        `).bind(targetCommandId, attachment.userId, deviceId).first<CommandRow>()
+      : null;
+    if (!target && targetRequestId) {
+      target = await this.env.DB.prepare(`
+          SELECT id, request_id, device_id, action, status, summary, payload_json, created_at, updated_at
+            FROM commands WHERE request_id = ? AND user_id = ? AND device_id = ?
+        `).bind(targetRequestId, attachment.userId, deviceId).first<CommandRow>();
+    }
+    if (!target) {
+      safeSend(socket, { type: "remote.error", error: "找不到需要终止的任务" });
+      return;
+    }
+    if (target.status === "completed" || target.status === "failed") {
+      safeSend(socket, { type: "command.updated", command: commandFromRow(target) });
+      return;
+    }
+
+    const now = Date.now();
+    const stoppedEvent = { type: "stopped", message: "已从手机端终止本次会话" };
+    await this.env.DB.batch([
+      this.env.DB.prepare(
+        "UPDATE commands SET status = 'failed', summary = ?, updated_at = ? WHERE id = ? AND user_id = ?"
+      ).bind("已终止", now, target.id, attachment.userId),
+      this.env.DB.prepare(`
+        INSERT INTO command_events (id, command_id, user_id, type, event_json, created_at)
+        VALUES (?, ?, ?, 'stopped', ?, ?)
+      `).bind(crypto.randomUUID(), target.id, attachment.userId, JSON.stringify(stoppedEvent), now)
+    ]);
+
+    const stoppedCommand = commandFromRow({ ...target, status: "failed", summary: "已终止", updated_at: now });
+    this.broadcastToControllers({ type: "command.updated", command: stoppedCommand });
+    this.broadcastToControllers({ type: "command.event", commandId: target.id, event: stoppedEvent });
+    const agents = this.ctx.getWebSockets(`device:${deviceId}`).filter((candidate) => candidate.readyState === WebSocket.OPEN);
+    for (const agent of agents) {
+      safeSend(agent, { type: "command.stop", commandId: target.id, requestId: target.request_id });
+    }
+  }
+
   private async updateCommand(socket: WebSocket, attachment: ConnectionAttachment, message: Record<string, unknown>): Promise<void> {
     const value = message.command;
     if (!isObject(value)) {
@@ -455,6 +510,12 @@ export class RemoteRoom extends DurableObject<Env> {
     `).bind(id, attachment.userId, attachment.deviceId ?? "").first<CommandRow>();
     if (!existing) {
       safeSend(socket, { type: "remote.error", error: "找不到对应任务" });
+      return;
+    }
+    // A late local error/completion after a remote stop must not resurrect the
+    // command or replace its terminal stopped state.
+    if (existing.status === "failed" && existing.summary === "已终止") {
+      safeSend(socket, { type: "command.updated", command: commandFromRow(existing) });
       return;
     }
     const updatedAt = Date.now();
@@ -486,6 +547,10 @@ export class RemoteRoom extends DurableObject<Env> {
     `).bind(commandId, attachment.userId, attachment.deviceId ?? "").first<CommandRow>();
     if (!existing) {
       safeSend(socket, { type: "remote.error", error: "找不到对应任务" });
+      return;
+    }
+    if (existing.status === "failed" && existing.summary === "已终止") {
+      safeSend(socket, { type: "command.updated", command: commandFromRow(existing) });
       return;
     }
     const now = Date.now();

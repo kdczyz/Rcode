@@ -64,14 +64,22 @@ test("shell analysis classifies approval-bound operations", async () => {
   assert.equal(packageRunner.installsDependencies, true);
 });
 
-test("permission policy allows routine checks and asks for risky mutations", async () => {
+test("permission policy asks for risky workspace mutations and never asks in full access", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agent-console-"));
   const routine = await evaluatePermission("workspace_write", { id: "routine", name: "run_shell", arguments: { command: "npm run typecheck" } }, root);
   const install = await evaluatePermission("workspace_write", { id: "install", name: "run_shell", arguments: { command: "npm install" } }, root);
   const destructive = await evaluatePermission("full_access", { id: "delete", name: "run_shell", arguments: { command: "rm -rf data/cache" } }, root);
   assert.equal(routine.effect, "allow");
   assert.equal(install.effect, "ask");
-  assert.equal(destructive.effect, "ask");
+  assert.equal(destructive.effect, "allow");
+  assert.equal(destructive.requiresApproval, false);
+
+  const gitPush = await evaluatePermission("full_access", { id: "push", name: "git_push", arguments: {} }, root);
+  const web = await evaluatePermission("full_access", { id: "web", name: "web_fetch", arguments: { url: "https://example.com" } }, root);
+  assert.equal(gitPush.effect, "allow");
+  assert.equal(gitPush.requiresApproval, false);
+  assert.equal(web.effect, "allow");
+  assert.equal(web.requiresApproval, false);
 });
 
 test("permission policy automatically allows user-requested image generation", async () => {
@@ -159,6 +167,22 @@ test("portable executor blocks unsafe cwd before spawning shell", async () => {
   const result = await portableExecutor.run({ command: "pwd", cwd: outside, projectPath: root });
   assert.equal(result.ok, false);
   assert.equal(result.blockedReason, "Command cwd is outside the workspace.");
+});
+
+test("portable executor aborts an active shell process", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "agent-console-"));
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const pending = portableExecutor.run({
+    command: "node -e \"setTimeout(() => {}, 10000)\"",
+    projectPath: root,
+    signal: controller.signal
+  });
+  setTimeout(() => controller.abort(), 50);
+  const result = await pending;
+  assert.equal(result.ok, false);
+  assert.ok(Date.now() - startedAt < 2_000);
+  assert.match(result.stderr, /abort/i);
 });
 
 test("portable executor injects allowlisted secret references and redacts output", async () => {
