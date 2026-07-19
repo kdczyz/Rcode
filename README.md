@@ -1,32 +1,86 @@
-# Agent Permission Framework
+<div align="center">
 
-一个可以连接 AI 的本地 agent 桌面框架，目标是向 Codex / Claude Code 一类成熟 coding agent 靠拢。
+# ⌁ Rcode
 
-当前重点能力：
+### 本地优先、权限可控的 AI Coding Agent
 
-- 跨平台受控执行默认策略：项目内自主执行，联网、越界和危险操作请求审批或阻止；当前不宣称 OS 级沙箱。
-- 本地 API token：桌面客户端启动时生成一次性 token，保护 agent 执行接口。
-- Cloudflare 账号：Worker + D1 提供注册、登录、会话恢复和退出；桌面端使用系统安全存储保存会话 Token。
-- 权限规则：支持 `allow` / `ask` / `deny`，并按 `deny > ask > allow` 处理。
-- 工具注册表：内置文件读取、目录检查、文本搜索、patch、shell、长期进程会话、web fetch、git status/diff/branch/stage/commit，并可动态接入 MCP tools。
-- SQLite 状态：保存会话消息、审批、审计事件、MCP 配置和 memory。
-- 项目上下文：加载 `AGENTS.md`、`.agent/rules/*.md` 和项目 memory。
-- 长会话上下文：按用户轮次保留最近消息、压缩早期对话，并截断大型工具输出而不拆散工具调用链。
-- 任务工作流：SSE 输出准备、规划、检查、执行、审批和完成阶段；计划模式只暴露只读工具，并可确认计划后一键进入执行。
-- MCP / Skills / Hooks 入口：支持 MCP server 配置管理、工具发现/调用、skills 激活和受信任 command hooks。
+让 AI 在明确的工作区边界与审批策略内，完成代码理解、文件编辑、测试构建、Git 工作流、桌面操作和跨设备协作。
 
-七类能力的启用方式、强制审批层级和密钥引用机制见 [能力与权限基线](docs/capabilities-and-permissions.md)。
+[![Desktop](https://img.shields.io/badge/Desktop-macOS-111827?style=for-the-badge&logo=apple&logoColor=white)](#-运行端)
+[![Mobile](https://img.shields.io/badge/Mobile-Android-3DDC84?style=for-the-badge&logo=android&logoColor=white)](#-运行端)
+[![Runtime](https://img.shields.io/badge/Runtime-Node.js-339933?style=for-the-badge&logo=nodedotjs&logoColor=white)](#-快速开始)
+[![Language](https://img.shields.io/badge/Language-TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](#-技术栈)
 
-## 快速开始
+`本地执行` · `逐级审批` · `多模型接入` · `图片生成` · `手机远程` · `MCP 扩展`
 
-项目按运行端分为电脑客户端、手机端和服务端。根目录提供统一命令，日常开发不需要在多个目录之间来回切换。
+</div>
+
+---
+
+## ✦ 项目简介
+
+Rcode 是一个面向真实开发工作的本地 AI Agent 框架。它通过桌面客户端连接 OpenAI-compatible 模型，在项目工作区内调用文件、终端、Git、浏览器与桌面自动化工具，并以 `allow / ask / deny` 权限规则控制操作范围。
+
+项目同时包含 Android 客户端与 Cloudflare 远程服务：电脑在线时，可从手机进入公开的项目和会话继续执行 Agent 任务；电脑离线时，Work 模式仍可通过云端代理聊天或生成图片。
+
+> [!IMPORTANT]
+> Rcode 依赖路径校验、命令分析、工具审批和审计记录提供便携式安全边界，但不宣称具备 OS 级沙箱。涉及生产环境、敏感数据或高权限命令时，仍应使用容器、专用账号或隔离主机。
+
+## ◈ 核心能力
+
+| 模块 | 能力 |
+| --- | --- |
+| 🤖 Agent 工作流 | SSE 实时呈现准备、规划、检查、执行、审批与完成阶段；支持仅规划后确认执行 |
+| 🧰 本地工具 | 文件读写、文本搜索、Patch、测试构建、长期进程、网页读取、Git 与项目诊断 |
+| 🛡️ 权限系统 | `allow / ask / deny` 规则、工作区边界、强制审批、敏感路径保护与审计记录 |
+| 🧠 上下文管理 | 加载 `AGENTS.md`、项目规则、Skills 与记忆；长会话自动压缩并保持工具调用链完整 |
+| 🔌 模型与 MCP | 多 OpenAI-compatible 接口、模型发现、思考强度切换及 MCP 工具动态接入 |
+| 🎨 图片生成 | 桌面端与手机端图片模式；支持图片模型选择、生成预览和本地文件保存 |
+| 🖥️ 桌面控制 | 通过 `native-devtools-mcp` 使用 Accessibility、截图/OCR 和 Chrome/Electron CDP |
+| 📱 跨设备协作 | Android 聊天、设备发现、项目/会话选择、远程任务、实时事件和单次审批 |
+| ☁️ 远程服务 | Cloudflare Workers + D1 + Durable Objects 提供账号、加密 AI 配置与 WebSocket 中继 |
+| ♻️ 自动学习 | 从已验证结果中沉淀可复用经验，并通过去重记录注入后续项目上下文 |
+
+## ⌘ 系统结构
+
+```mermaid
+flowchart LR
+    U[开发者] --> D[Rcode Desktop]
+    U --> M[Rcode Android]
+
+    D --> A[Local Agent Server]
+    A --> P[AI Providers]
+    A --> T[Files · Shell · Git]
+    A --> X[MCP · Desktop · Browser]
+    A --> S[(SQLite)]
+
+    M <-->|HTTPS / WebSocket| C[Cloudflare Remote]
+    D <-->|设备与任务通道| C
+    C --> W[Workers]
+    C --> DB[(D1)]
+    C --> DO[Durable Objects]
+    C --> P
+```
+
+## ▣ 运行端
 
 | 运行端 | 主要目录 | 开发 | 构建 / 验证 |
 | --- | --- | --- | --- |
 | 电脑客户端 | `src/`、`electron/`、`cli/` | `npm run desktop:dev` | `npm run desktop:build` |
-| 手机端 | `Rcode_apk/` | `npm run mobile:dev` | `npm run mobile:build` / `npm run mobile:apk` |
-| 本地 Agent 服务端 | `server/` | `npm run server:dev` | `npm run server:test` |
+| 本地 Agent 服务 | `server/` | `npm run server:dev` | `npm run server:test` |
+| Android 客户端 | `Rcode_apk/` | `npm run mobile:dev` | `npm run mobile:build` / `npm run mobile:apk` |
 | 云端账号与远程服务 | `Fwq/` | `npm run remote:dev` | `npm run remote:check` / `npm run remote:test` |
+
+## ▶ 快速开始
+
+### 环境要求
+
+- Node.js 20+
+- npm
+- macOS 桌面客户端开发环境
+- Android Studio（仅构建 Android APK 时需要）
+
+### 启动桌面开发环境
 
 ```bash
 npm install
@@ -34,189 +88,109 @@ cp .env.example .env
 npm run desktop:dev
 ```
 
-打开 Vite 输出的地址，通常是 `http://localhost:5173`。
+Vite 默认地址通常为 `http://localhost:5173`。
 
-## 长期进程会话
+### 配置 AI 接口
 
-开发服务器、文件监听器等不会自行退出的命令由 Rcode 托管，不需要也不允许在命令中添加 `&` 或 `nohup`。Agent 可以使用：
+后端兼容 Chat Completions 与 Images 风格的 OpenAI-compatible API：
+
+```env
+AI_API_KEY=your_api_key
+AI_BASE_URL=https://api.openai.com/v1
+AI_MODEL=gpt-4.1-mini
+```
+
+也可以在应用设置中维护多个接口、发现模型、选择默认文本/图片模型，并配置不同思考强度。API Key 应只保存在本机环境或应用安全配置中，不要提交到版本库。
+
+### 常用验证命令
+
+```bash
+npm test                 # 本地 Agent 服务测试
+npm run build            # 桌面 Web 构建
+npm run mobile:build     # Android Web 资源构建
+npm run remote:test      # Cloudflare 远程服务测试
+```
+
+## ⚙ 长期进程会话
+
+开发服务器、文件监听器等不会自行退出的命令由 Rcode 托管，无需添加 `&` 或 `nohup`：
 
 - `start_process`：启动长期进程并返回会话 ID、PID 和启动输出。
 - `read_process`：读取当前状态和最近输出。
-- `write_process`：向标准输入发送内容。
+- `write_process`：向进程标准输入发送内容。
 - `stop_process`：停止进程及其子进程树。
 - `list_processes`：列出当前项目的托管进程。
 
-聊天输入框底栏的“终端”按钮可查看当前项目的全部长期进程，包含状态、PID、命令、输出和停止操作；聊天中的进程卡片也会同步刷新。Rcode 服务退出时会清理仍在运行的托管进程，重启后不会自动恢复或重新执行旧命令。
+聊天输入框的“终端”入口可查看状态、PID、命令与输出。Rcode 服务退出时会清理仍在运行的托管进程，不会在重启后自动恢复旧命令。
 
-## macOS 桌面控制
+## ◉ macOS 桌面控制
 
-Rcode 可以通过本地 `native-devtools-mcp` 服务读取和操作 macOS 应用界面，支持 Accessibility 快照、截图与 OCR、鼠标点击/拖动/滚动、键盘输入与快捷键、窗口管理，以及 Chrome/Electron CDP。服务在本机运行，不需要额外 API Key。
+Rcode 可连接本地 `native-devtools-mcp`，读取和操作 macOS 应用界面：
 
 ```bash
 npm install -g native-devtools-mcp@0.10.1
 native-devtools-mcp setup
 ```
 
-在 Rcode 的 MCP 设置中添加 stdio 服务，命令使用 `native-devtools-mcp` 的绝对路径，并保持默认审批策略为 `ask`。macOS 还需要在“系统设置 → 隐私与安全性”中授权：
+在 MCP 设置中使用可执行文件的绝对路径添加 stdio 服务，并在“系统设置 → 隐私与安全性”中按需授权：
 
-- 屏幕录制：用于截图和 OCR。
-- 辅助功能：用于点击、输入、滚动、拖动和 Accessibility 元素操作。
+- **屏幕录制**：截图与 OCR。
+- **辅助功能**：点击、输入、滚动、拖动和 Accessibility 元素操作。
 
-用户级 skill 位于 `~/.agent/skills/macos-computer-use`。它会优先使用不移动鼠标的 Accessibility 操作，每次界面变化后重新观察；只读观察自动允许，修改界面的操作仍需审批。
+建议保持修改界面的操作为 `ask`。Agent 会优先采用不移动鼠标的 Accessibility 操作，并在界面发生变化后重新观察。
 
-## AI 配置
+## 🔐 权限与安全
 
-后端使用 OpenAI-compatible Chat Completions 接口。你可以在 `.env` 中配置：
+Rcode 采用“工作区边界 + 工具审批 + 审计记录”的分层策略：
 
-```bash
-AI_API_KEY=你的密钥
-AI_BASE_URL=https://api.openai.com/v1
-AI_MODEL=gpt-4.1-mini
+- 项目内读取、编辑、搜索、测试和构建可按策略自动执行。
+- 安装依赖、联网、迁移与容器修改会在执行前展示。
+- Git 提交/推送、部署和云资源修改必须确认。
+- 数据删除、生产操作及提权命令逐次确认。
+- `.env*`、SSH 私钥、钥匙串和浏览器登录数据库等敏感目标默认禁止。
+- 密钥通过允许列表引用注入，不进入工具参数，输出中的实际值会被脱敏。
+
+完整规则与安全边界参见 [能力与权限基线](docs/capabilities-and-permissions.md)。
+
+## ☁ 账号与远程协作
+
+`Fwq/` 提供 Cloudflare Workers 远程服务：
+
+- 注册、登录、会话恢复与退出。
+- D1 保存账号、会话、设备、任务和加密后的 AI 接口配置。
+- Durable Objects 协调同一账号下的实时设备连接。
+- 一次性 WebSocket ticket 和账号级房间隔离。
+- Work 模式在电脑离线时代理聊天与图片生成。
+- Code 模式仅访问电脑主动公开的项目 ID，不接受手机端传入任意本机路径。
+
+详细 API、部署方式与安全设计见 [`Fwq/README.md`](Fwq/README.md)；Android 能力与构建说明见 [`Rcode_apk/README.md`](Rcode_apk/README.md)。
+
+## ⧉ 技术栈
+
+- **桌面与 Web：** Electron、React 19、Vite、TypeScript
+- **本地服务：** Node.js、Express、SQLite
+- **移动端：** React、Capacitor、Android
+- **云端：** Cloudflare Workers、D1、Durable Objects
+- **协议与扩展：** SSE、WebSocket、MCP、OpenAI-compatible APIs
+
+## ◇ 项目目录
+
+```text
+Rcode/
+├── src/                 # 桌面端 React 界面
+├── electron/            # Electron 主进程与安全存储
+├── server/              # 本地 Agent、工具、权限与状态服务
+├── cli/                 # 命令行入口
+├── config/              # Agent 与模型供应商配置
+├── docs/                # 能力、权限和设计文档
+├── Rcode_apk/           # Android 客户端
+└── Fwq/                 # Cloudflare 账号与远程服务
 ```
 
-本项目也已经内置 Xiaomi MiMo 配置：
+---
 
-- `config/providers.json`：配置 `https://api.xiaomimimo.com/v1` 和默认模型。
-- `config/agent.toml`：配置客户端模式、权限策略和电脑控制工具。
-- `.env.local`：本地密钥文件，已加入 `.gitignore`。
+<div align="center">
 
-MiMo 的密钥变量名是：
+**Rcode · Code locally, approve explicitly, collaborate anywhere.**
 
-```bash
-AI_API_KEY=你的 MiMo API Key
-```
-
-如果没有配置 `AI_API_KEY`，应用仍可启动，并会提示框架已就绪。
-
-## GitHub MCP
-
-Rcode 预置了 GitHub 官方远程 MCP 服务器，默认停用，支持两种认证方式。
-
-推荐使用桌面端浏览器授权：
-
-1. 在 GitHub Developer Settings 创建 OAuth App。
-2. 将 Authorization callback URL 设为 `http://127.0.0.1/oauth/github/callback`。Rcode 会按 GitHub 的 loopback 规则在运行时附加随机本地端口。
-3. 在“设置 → MCP 服务器”填写 OAuth App 的 Client ID 和 Client Secret。
-4. 点击“浏览器授权”。GitHub 确认后会回调本机 Rcode；Rcode 验证 `state`、PKCE 和 GitHub 用户身份后自动聚焦应用并测试连接。
-
-Client Secret 只在本次 token 交换期间保存在内存中，不会写入配置或磁盘。OAuth access token 使用 Electron `safeStorage` 加密保存在系统安全存储中，只会同步到本机 MCP 进程内存。默认请求 `repo read:org` scope；组织可能还需要管理员批准或 SSO 授权。
-
-也可以继续使用环境变量 PAT。在 `.env.local` 中配置后重启 Rcode：
-
-```bash
-GITHUB_PERSONAL_ACCESS_TOKEN=你的_GitHub_PAT
-```
-
-PAT 只通过环境变量绑定，不会写入 MCP 配置或 SQLite。按实际任务授予最小仓库权限；MCP 工具默认仍需审批。
-
-## 架构
-
-电脑客户端：
-
-- `src/`：React 渲染进程；可复用界面按 `components/chat`、`layout`、`settings`、`sidebar` 分类。
-- `electron/`：Electron 主进程和预加载脚本。
-- `cli/`：轻量 CLI，可运行 `doctor`、`run`、`mcp`。
-
-手机端：
-
-- `Rcode_apk/src/`：React + Capacitor 手机界面、账号 API 与远程控制协议。
-- `Rcode_apk/android/`：Android 原生壳工程。
-- `artifacts/mobile/`：本地生成的 APK；属于构建产物，不纳入版本控制。
-
-服务端：
-
-- `server/`：随电脑客户端运行的本地 Agent API；内部按 `agent`、`providers`、`security`、`runtime`、`integrations`、`storage`、`shared` 分层。
-- `Fwq/`：当前生产使用的 Cloudflare Worker，统一提供账号、AI 配置、手机聊天与远程中继，D1 迁移在 `Fwq/migrations/`。
-
-项目公共内容：
-
-- `config/`：AI provider、Agent 权限与内置 skills 配置。
-- `scripts/`：构建、测试和清理脚本。
-- `docs/`：架构规划和补充文档。
-- `data/`：本地运行数据，不纳入版本控制。
-
-## CLI 终端
-
-```bash
-npm run build:server
-rcode
-```
-
-常用命令：
-
-```bash
-rcode doctor
-rcode run "检查这个项目"
-rcode tools
-rcode audit
-rcode mcp list
-rcode mcp add context7 "npx -y @upstash/context7-mcp"
-rcode mcp test context7
-rcode mcp tools context7
-rcode memory list
-rcode agents
-```
-
-交互模式内支持：
-
-- `/mode workspace_write`：切换权限模式。
-- `/project /path/to/project`：切换项目根目录。
-- `/model model-id`：切换模型。
-- `/tools`、`/audit`、`/mcp`、`/memory`、`/agents`、`/doctor`：查看平台状态。
-- `/clear`：清空当前 CLI 会话上下文。
-- `/exit`：退出。
-
-如果本地服务未启动，CLI 会优先尝试启动 `dist-server-bundle/index.cjs`；没有构建产物时会回退到 `npm run dev:server`。
-
-## 成熟化路线
-
-后续补齐 Codex / Claude Code 等主流 agent 能力的计划见：
-
-- [Rcode 成熟化补齐计划](docs/agent-maturity-plan.md)
-
-## API
-
-- `POST /api/agent/run`：运行一次 agent 任务。
-- `POST /api/agent/approve`：批准或拒绝待执行工具。
-- `GET /api/tools`：查看工具注册表。
-- `GET /api/processes`、`GET /api/processes/:id`：列出或读取托管进程。
-- `POST /api/processes/:id/input`、`POST /api/processes/:id/stop`：写入或停止托管进程。
-- `GET /api/audit`：查看本地审计事件。
-- `GET/POST/DELETE /api/mcp/servers`：管理 MCP server 配置。
-- `GET /api/mcp/servers/:id/tools`、`POST /api/mcp/servers/:id/test`、`POST /api/mcp/servers/:id/trust`：测试和信任 MCP server。
-- `GET /api/skills`：查看已发现的 skills。
-- `GET/POST/DELETE /api/memory`：管理项目 memory。
-- `GET /api/agents`：查看已发现的 subagents。
-- `GET /api/health`：查看服务和 AI 配置状态。
-
-Agent SSE 流除文本和工具事件外，还会返回 `workflow_state`、`context_snapshot` 和 `task_plan`，客户端可据此展示运行阶段、上下文预算和可确认的任务计划。
-
-受保护接口在桌面打包模式下需要 `x-agent-token` 或 bearer token；Electron 会自动注入。
-
-## Cloudflare 账号服务
-
-线上认证与远程连接服务：`https://lxqandlzy.me`
-
-电脑端登录后会把当前启用的 AI 接口加密同步到 Cloudflare 账号。相同账号的手机端可在电脑离线时使用聊天模式，电脑在线时还可使用 Code 模式远程选择项目和会话；聊天与 Code 共用同一套接口和模型目录，Code 的选择会随远程指令发送给电脑端执行。
-
-AI 接口设置同时支持图片生成路径、默认图片模型和图片模型列表。配置完成后，桌面聊天输入框与手机聊天均可切换到图片模式；Agent 也可在审批后调用 `generate_image` 工具。兼容接口默认请求 `POST /images/generations`，生成结果在桌面端保存到本地 `generated-images` 目录。
-
-```bash
-npm run remote:dev             # 本地 Worker
-npm run remote:migrate:local   # 应用本地 D1 迁移
-npm run remote:check           # 类型与配置检查
-npm run remote:deploy:dry      # 部署前检查
-npm run remote:deploy          # 发布 Worker
-npm run remote:migrate:remote  # 应用线上 D1 迁移
-```
-
-认证 API：
-
-- `POST /v1/auth/register`：创建账号并签发会话。
-- `POST /v1/auth/login`：邮箱或用户名登录。
-- `GET /v1/auth/me`：恢复当前会话。
-- `POST /v1/auth/logout`：撤销当前会话。
-
-本地调试可用 `VITE_AUTH_API_URL` 覆盖浏览器端地址；Electron 可用 `RCODE_AUTH_API_URL` 覆盖主进程地址。
-
-这个结构的目标是方便继续扩展：可以新增工具、接入更多模型供应商、把审批策略替换成更细的权限系统，或者封装成 Electron/Tauri 桌面应用。
+</div>
