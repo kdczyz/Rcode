@@ -98,7 +98,6 @@
     "@types/react": "^19.1.16",
     "@types/react-dom": "^19.1.9",
     "electron": "^43.0.0",
-    "electron-builder": "^26.15.3",
-    "wrangler": "^4.110.0"
+    "electron-builder": "^26.15.3"
   }
 }

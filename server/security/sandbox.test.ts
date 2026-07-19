@@ -58,7 +58,7 @@ test("shell analysis classifies approval-bound operations", async () => {
   assert.equal(analysis.databaseMigration, true);
   assert.equal(analysis.deployment, true);
   assert.equal(analysis.productionOperation, true);
-  const wrappedDeploy = await analyzeShellCommand("npm run auth:deploy", undefined, root);
+  const wrappedDeploy = await analyzeShellCommand("npm run remote:deploy", undefined, root);
   const packageRunner = await analyzeShellCommand("npx eslint .", undefined, root);
   assert.equal(wrappedDeploy.deployment, true);
   assert.equal(packageRunner.installsDependencies, true);
