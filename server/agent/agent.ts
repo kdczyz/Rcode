@@ -1,7 +1,7 @@
 import { nanoid } from "nanoid";
 import { callAiStream, type ThinkingMode } from "../providers/aiProvider";
 import { getToolCallRisk } from "../security/permissions";
-import { evaluatePermission, type PermissionDecision } from "../security/permissionRules";
+import { evaluatePermission } from "../security/permissionRules";
 import { executeTool } from "../runtime/tools";
 import { runHooks } from "./hooks";
 import { runAutoLearning } from "./autoLearning";
@@ -40,15 +40,18 @@ function toolWorkflowEvent(toolCall: ToolCall): StreamEvent {
   if (name === "read_file") return workflowEvent("inspecting", "正在读取文件");
   if (name === "list_files" || name === "inspect_tree") return workflowEvent("inspecting", "正在查看项目文件");
   if (name === "search_text") return workflowEvent("inspecting", "正在搜索代码");
+  if (name === "project_diagnostics") return workflowEvent("inspecting", "正在收集项目诊断");
+  if (name === "generate_image") return workflowEvent("executing", "正在生成图片");
   if (name === "write_file" || name === "apply_patch") return workflowEvent("executing", "正在编辑文件");
   if (name === "web_fetch") return workflowEvent("inspecting", "正在获取网页");
   if (name === "run_shell") return workflowEvent("executing", "正在执行操作");
+  if (name === "docker_compose" || name === "sqlite_query") return workflowEvent("executing", "正在执行受控开发工具");
   if (name === "start_process") return workflowEvent("executing", "正在启动进程");
   if (name === "read_process" || name === "list_processes") return workflowEvent("inspecting", "正在检查进程");
   if (name === "write_process") return workflowEvent("executing", "正在操作进程");
   if (name === "stop_process") return workflowEvent("executing", "正在停止进程");
   if (name === "git_status" || name === "git_diff") return workflowEvent("inspecting", "正在检查代码变更");
-  if (name === "git_branch" || name === "git_stage" || name === "git_commit") return workflowEvent("executing", "正在执行 Git 操作");
+  if (name === "git_branch" || name === "git_stage" || name === "git_commit" || name === "git_push") return workflowEvent("executing", "正在执行 Git 操作");
   if (name.startsWith("mcp__")) return workflowEvent("executing", "正在调用外部工具");
   return workflowEvent("executing", "正在调用工具");
 }
@@ -136,7 +139,9 @@ function appendToolResultMessage(conversation: Conversation, result: ToolResult)
   if (result.attachments?.length) {
     const visualResult: AgentMessage = {
       role: "user",
-      content: `Visual result returned by tool ${result.name}. Inspect the attached screenshot before deciding the next UI action.`,
+      content: result.name === "generate_image"
+        ? "The requested image was generated successfully. Use the attached result when responding to the user."
+        : `Visual result returned by tool ${result.name}. Inspect the attached screenshot before deciding the next UI action.`,
       attachments: result.attachments
     };
     conversation.messages.push(visualResult);
@@ -146,6 +151,9 @@ function appendToolResultMessage(conversation: Conversation, result: ToolResult)
 
 function toStreamToolResult(result: ToolResult): ToolResult {
   if (!result.attachments?.length) return result;
+  if (result.name === "generate_image") {
+    return { ...result, attachments: result.attachments.map(({ dataUrl: _dataUrl, text: _text, ...attachment }) => attachment) };
+  }
   return {
     ...result,
     attachments: result.attachments.map(({ dataUrl: _dataUrl, text: _text, ...attachment }) => attachment)
@@ -155,7 +163,7 @@ function toStreamToolResult(result: ToolResult): ToolResult {
 async function* continueConversationStream(
   conversation: Conversation,
   mode: PermissionMode,
-  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; requestId?: string; signal?: AbortSignal; messageInput?: string }
+  options: { providerId?: string; model?: string; thinkingMode?: ThinkingMode; projectPath?: string; requestId?: string; signal?: AbortSignal; messageInput?: string }
 ): AsyncGenerator<StreamEvent> {
   let step = 0;
   let billedPromptTokens = 0;
@@ -178,6 +186,8 @@ async function* continueConversationStream(
 
     let contentBuffer = "";
     let toolCalls: ToolCall[] = [];
+    let reasoningContent = "";
+    let reasoningDetails: Array<Record<string, unknown>> | undefined;
 
     // 流式调用 AI，逐 token 输出（带 429 重试）
     let aiRetries = 0;
@@ -190,6 +200,8 @@ async function* continueConversationStream(
             yield { type: "text_delta", content: event.content };
           } else if (event.type === "context_snapshot") {
             yield { type: "context_snapshot", snapshot: event.snapshot };
+          } else if (event.type === "reasoning_config") {
+            yield { type: "reasoning_config", config: event.config };
           } else if (event.type === "usage") {
             const providerUsage = normalizeProviderUsage(event.usage);
             const usage = {
@@ -239,6 +251,8 @@ async function* continueConversationStream(
             };
           } else if (event.type === "tool_calls") {
             toolCalls = event.toolCalls;
+            reasoningContent = event.reasoningContent ?? "";
+            reasoningDetails = event.reasoningDetails;
             // 当从文本提取工具调用时，用清理后的内容替换原始内容
             if (event.cleanContent !== undefined) {
               contentBuffer = event.cleanContent;
@@ -256,6 +270,8 @@ async function* continueConversationStream(
           await new Promise((r) => setTimeout(r, wait));
           contentBuffer = "";
           toolCalls = [];
+          reasoningContent = "";
+          reasoningDetails = undefined;
           continue;
         }
         throw error;
@@ -264,16 +280,15 @@ async function* continueConversationStream(
 
     console.log(`[Agent] AI returned: content=${contentBuffer.length}chars, toolCalls=${toolCalls.length}`);
 
-    conversation.messages.push({
+    const assistantMessage: AgentMessage = {
       role: "assistant",
       content: contentBuffer,
-      toolCalls
-    });
-    appendConversationMessage(conversation.id, {
-      role: "assistant",
-      content: contentBuffer,
-      toolCalls
-    });
+      toolCalls,
+      ...(reasoningContent ? { reasoningContent } : {}),
+      ...(reasoningDetails?.length ? { reasoningDetails } : {})
+    };
+    conversation.messages.push(assistantMessage);
+    appendConversationMessage(conversation.id, assistantMessage);
 
     if (toolCalls.length === 0) {
       if (mode === "plan") {
@@ -312,7 +327,7 @@ async function* continueConversationStream(
 async function* processToolCallQueueStream(
   conversation: Conversation,
   mode: PermissionMode,
-  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; signal?: AbortSignal },
+  options: { providerId?: string; model?: string; thinkingMode?: ThinkingMode; projectPath?: string; signal?: AbortSignal },
   contentBuffer: string
 ): AsyncGenerator<StreamEvent, boolean> {
   while (conversation.toolCallQueue.length > 0) {
@@ -413,6 +428,7 @@ async function* processToolCallQueueStream(
     conversation.toolCallQueue.shift();
     const result = await executeTool(toolCall, options.projectPath, {
       conversationId: conversation.id,
+      providerId: options.providerId,
       permissionEffect: approvalDecision.effect,
       permissionReason: approvalDecision.reason
     });
@@ -439,6 +455,7 @@ export async function* runAgentStream(input: {
   attachments?: AgentAttachment[];
   conversationId?: string;
   mode: PermissionMode;
+  providerId?: string;
   model?: string;
   thinkingMode?: ThinkingMode;
   projectPath?: string;
@@ -471,6 +488,7 @@ export async function* runAgentStream(input: {
     yield { type: "run_started", conversationId: conversation.id };
     yield workflowEvent(input.mode === "plan" ? "planning" : "preparing", input.mode === "plan" ? "正在准备计划" : "正在准备上下文");
     yield* continueConversationStream(conversation, input.mode, {
+      providerId: input.providerId,
       model: input.model,
       thinkingMode: input.thinkingMode,
       projectPath: input.projectPath,
@@ -496,6 +514,7 @@ export async function* approveToolCallStream(input: {
   approvalId: string;
   allow: boolean;
   mode: PermissionMode;
+  providerId?: string;
   model?: string;
   thinkingMode?: ThinkingMode;
   projectPath?: string;
@@ -521,6 +540,7 @@ export async function* approveToolCallStream(input: {
     const result: ToolResult = input.allow
       ? await executeTool(approval.toolCall, approval.projectPath ?? input.projectPath, {
           conversationId: conversation.id,
+          providerId: input.providerId,
           permissionEffect: "allow",
           permissionReason: "User approved this tool call."
         })
@@ -540,6 +560,7 @@ export async function* approveToolCallStream(input: {
 
     try {
       yield* continueConversationStream(conversation, input.mode, {
+        providerId: input.providerId,
         model: input.model,
         thinkingMode: input.thinkingMode,
         projectPath: approval.projectPath ?? input.projectPath,
@@ -588,6 +609,7 @@ export async function* approveToolCallStream(input: {
   const result: ToolResult = input.allow
     ? await executeTool(storedApproval.toolCall, projectPath, {
         conversationId: conversation.id,
+        providerId: input.providerId,
         permissionEffect: "allow",
         permissionReason: "User approved this recovered tool call."
       })
@@ -605,6 +627,7 @@ export async function* approveToolCallStream(input: {
   }
 
   yield* continueConversationStream(conversation, input.mode, {
+    providerId: input.providerId,
     model: input.model,
     thinkingMode: input.thinkingMode,
     projectPath,

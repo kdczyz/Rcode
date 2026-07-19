@@ -1,10 +1,12 @@
 import { Preferences } from "@capacitor/preferences";
 
-export const API_BASE = (import.meta.env.VITE_AUTH_API_URL || "https://rcode-remote-server.kdczyz0728-994.workers.dev").replace(/\/$/, "");
+export const API_BASE = (import.meta.env.VITE_AUTH_API_URL || "https://lxqandlzy.me").replace(/\/$/, "");
 const TOKEN_KEY = "rcode.auth.token.v1";
 const USER_KEY = "rcode.auth.user.v1";
 const LOCAL_PREFIX = "rcode.mobile.";
 const REQUEST_TIMEOUT_MS = 15_000;
+const WORK_REQUEST_TIMEOUT_MS = 65_000;
+const WORK_STREAM_TIMEOUT_MS = 125_000;
 
 export class ApiError extends Error {
   constructor(message: string, public readonly status: number, public readonly code?: string) {
@@ -32,9 +34,30 @@ export interface RemoteDevice {
   platform: string;
   appVersion?: string;
   projectName?: string;
+  workspace?: RemoteWorkspace;
   ready: boolean;
   online: boolean;
   lastSeenAt: number;
+}
+
+export interface RemoteWorkspaceSession {
+  id: string;
+  title: string;
+  updatedAt: string;
+  conversationId?: string;
+}
+
+export interface RemoteWorkspaceProject {
+  id: string;
+  name: string;
+  sessions: RemoteWorkspaceSession[];
+}
+
+export interface RemoteWorkspace {
+  projects: RemoteWorkspaceProject[];
+  models: string[];
+  defaultModel?: string;
+  activeProjectId?: string;
 }
 
 export type CommandStatus = "queued" | "running" | "awaiting_approval" | "completed" | "failed";
@@ -46,13 +69,26 @@ export interface RemoteCommand {
   action: "agent.run" | "agent.approve";
   status: CommandStatus;
   summary?: string;
+  projectId?: string;
+  sessionId?: string;
+  model?: string;
+  conversationId?: string;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface RemoteHistoryEvent {
+  id: string;
+  commandId: string;
+  type: string;
+  event: Record<string, unknown>;
+  createdAt: number;
 }
 
 export interface RemoteSnapshot {
   devices: RemoteDevice[];
   commands: RemoteCommand[];
+  events?: RemoteHistoryEvent[];
 }
 
 export async function readToken() {
@@ -93,7 +129,7 @@ export async function request<T>(path: string, init: RequestInit = {}, authentic
     if (token) headers.set("authorization", `Bearer ${token}`);
   }
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeout = window.setTimeout(() => controller.abort(), path === "/v1/work/images" ? 190_000 : path === "/v1/work/chat" ? WORK_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS);
   const abort = () => controller.abort();
   init.signal?.addEventListener("abort", abort, { once: true });
   try {
@@ -119,6 +155,103 @@ export async function request<T>(path: string, init: RequestInit = {}, authentic
   } finally {
     window.clearTimeout(timeout);
     init.signal?.removeEventListener("abort", abort);
+  }
+}
+
+export type WorkStreamEvent =
+  | { type: "delta"; delta: string }
+  | { type: "done"; model: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }
+  | { type: "error"; error: string };
+
+export interface GeneratedImage {
+  id: string;
+  name: string;
+  mimeType: string;
+  dataUrl?: string;
+  url?: string;
+  revisedPrompt?: string;
+}
+
+export async function generateWorkImage(payload: {
+  prompt: string;
+  providerId?: string;
+  model?: string;
+  size?: string;
+  quality?: string;
+  count?: number;
+}) {
+  return request<{ providerId: string; model: string; images: GeneratedImage[] }>("/v1/work/images", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function streamWorkChat(
+  payload: { messages: Array<{ role: "user" | "assistant"; content: string }>; providerId?: string; model?: string; thinkingMode?: "fast" | "balanced" | "deep" },
+  onEvent: (event: WorkStreamEvent) => void
+): Promise<void> {
+  const headers = new Headers({ "content-type": "application/json", accept: "text/event-stream" });
+  const token = await readToken();
+  if (token) headers.set("authorization", `Bearer ${token}`);
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), WORK_STREAM_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${API_BASE}/v1/work/chat`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...payload, stream: true }),
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({ error: `请求失败 (${response.status})` })) as { error?: string; code?: string };
+      if (response.status === 401) {
+        await writeToken();
+        await writeCachedUser();
+      }
+      throw new ApiError(body.error || `请求失败 (${response.status})`, response.status, body.code);
+    }
+    if (!response.body) throw new Error("服务器未返回实时响应");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let completed = false;
+
+    const processBlock = (block: string) => {
+      const data = block.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+      if (!data) return;
+      let event: WorkStreamEvent;
+      try { event = JSON.parse(data) as WorkStreamEvent; } catch { return; }
+      if (event.type === "error") throw new Error(event.error || "实时回复中断");
+      if (event.type === "done") completed = true;
+      onEvent(event);
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split(/\r?\n\r?\n/);
+      buffer = blocks.pop() ?? "";
+      for (const block of blocks) processBlock(block);
+      // `done` is the protocol-level end marker. Close locally right away even
+      // when an intermediary leaves the HTTP connection alive for a moment.
+      if (completed) {
+        await reader.cancel().catch(() => undefined);
+        break;
+      }
+    }
+    if (!completed) {
+      buffer += decoder.decode();
+      if (buffer.trim()) processBlock(buffer);
+    }
+    if (!completed) throw new Error("实时回复提前结束，请重试");
+  } catch (reason) {
+    if (reason instanceof ApiError) throw reason;
+    if (controller.signal.aborted) throw new Error("实时回复超时，请稍后重试");
+    if (reason instanceof TypeError) throw new Error("无法连接到 Rcode 服务，请检查网络后重试");
+    throw reason instanceof Error ? reason : new Error("实时回复失败，请稍后重试");
+  } finally {
+    window.clearTimeout(timeout);
   }
 }
 

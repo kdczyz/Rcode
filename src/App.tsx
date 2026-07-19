@@ -8,14 +8,9 @@ import {
   Copy,
   CornerDownRight,
   FileText,
-  Folder,
-  FolderOpen,
   History,
-  ListFilter,
   MessageSquarePlus,
   MoreHorizontal,
-  PanelLeft,
-  PanelRight,
   Pencil,
   Plus,
   Puzzle,
@@ -23,11 +18,7 @@ import {
   Save,
   Search,
   Settings,
-  SquareChevronLeft,
-  SquareChevronRight,
-  Send,
   SlidersHorizontal,
-  Square,
   Terminal,
   Trash2,
   UserRound,
@@ -45,6 +36,7 @@ import { ProjectNavigator } from "./components/sidebar/ProjectNavigator";
 type PermissionMode = "default" | "plan" | "workspace_write" | "full_access" | "custom";
 type ThemePreference = "system" | "dark" | "light";
 type ThinkingMode = "fast" | "balanced" | "deep";
+type ReasoningDialect = "auto" | "sub2api" | "openai-compatible";
 type ProjectKind = "empty" | "folder" | "temporary";
 type MessageStatus = "completed" | "approval_required" | "error" | "running";
 type WorkflowPhase = "preparing" | "planning" | "thinking" | "inspecting" | "executing" | "awaiting_approval" | "plan_ready" | "completed" | "stopped" | "failed";
@@ -89,6 +81,14 @@ interface ChatMessage {
   showResponseMeta?: boolean;
   responseStartedAt?: number;
   responseCompletedAt?: number;
+  reasoning?: {
+    mode: ThinkingMode;
+    native: boolean;
+    method: "thinking_toggle" | "reasoning_effort" | "reasoning_budget" | "always_on" | "prompt_fallback";
+    value: string;
+    label: string;
+    transport?: "direct" | "gateway" | "fallback";
+  };
   usage?: {
     rawInputTokens?: number;
     promptTokens: number;
@@ -204,25 +204,6 @@ interface UsageSummary {
   }>;
 }
 
-interface ToolCatalogItem {
-  name: string;
-  description: string;
-  risk: "low" | "medium" | "high";
-  source: "builtin" | "mcp";
-  defaultApproval: "allow" | "ask" | "deny";
-}
-
-interface AuditEvent {
-  id: string;
-  createdAt: string;
-  toolName?: string;
-  permissionEffect?: string;
-  permissionReason?: string;
-  ok?: boolean;
-  durationMs?: number;
-  outputSummary?: string;
-}
-
 interface McpServerConfig {
   id: string;
   name: string;
@@ -246,10 +227,14 @@ interface AiProviderConfig {
   apiKeyEnv?: string;
   apiKeyPreview?: string;
   chatCompletionsPath?: string;
+  imageGenerationPath?: string;
   modelsPath?: string;
   balancePath?: string;
   defaultModel: string;
   fallbackModels?: string[];
+  defaultImageModel?: string;
+  imageModels?: string[];
+  reasoningDialect?: ReasoningDialect;
   enabled: boolean;
   source?: "builtin" | "user";
   active: boolean;
@@ -298,13 +283,6 @@ interface AgentSkill {
   defaultPrompt?: string;
 }
 
-interface MemoryItem {
-  id: string;
-  kind: string;
-  content: string;
-  importance: number;
-}
-
 type LearningCategory = "preference" | "project" | "pattern" | "bugfix" | "workflow";
 
 interface LearningRecordItem {
@@ -346,12 +324,6 @@ const skillScopeLabels: Record<AgentSkill["scope"], string> = {
   project: "当前项目"
 };
 
-interface SubagentDefinition {
-  name: string;
-  description: string;
-  scope: "project" | "user";
-}
-
 interface QueuedPrompt {
   id: string;
   content: string;
@@ -366,10 +338,10 @@ interface TaskTimerState {
 
 /** SSE 流事件 */
 interface StreamEvent {
-  type: "run_started" | "workflow_state" | "context_snapshot" | "task_plan" | "text_delta" | "billing_usage" | "tool_call" | "permission_decision" | "tool_result" | "diff_created" | "learning_result" | "approval_required" | "completed" | "error";
+  type: "run_started" | "workflow_state" | "context_snapshot" | "reasoning_config" | "task_plan" | "text_delta" | "billing_usage" | "tool_call" | "permission_decision" | "tool_result" | "diff_created" | "learning_result" | "approval_required" | "completed" | "error";
   content?: string;
   toolCall?: { id: string; name: string; arguments: Record<string, unknown> };
-  result?: { toolCallId: string; name: string; ok: boolean; content: string; diff?: DiffResult; diffs?: DiffResult[]; auditEventId?: string; exitCode?: number; process?: ManagedProcessView };
+  result?: { toolCallId: string; name: string; ok: boolean; content: string; attachments?: ComposerAttachment[]; diff?: DiffResult; diffs?: DiffResult[]; auditEventId?: string; exitCode?: number; process?: ManagedProcessView };
   conversationId?: string;
   answer?: string;
   message?: string;
@@ -379,6 +351,7 @@ interface StreamEvent {
   label?: string;
   plan?: TaskPlanView;
   snapshot?: ProjectSession["contextSnapshot"];
+  config?: ChatMessage["reasoning"];
   usage?: {
     rawInputTokens: number;
     promptTokens: number;
@@ -415,24 +388,12 @@ type SplitDiffReviewRow =
   | { kind: "fold"; hiddenCount: number; key: string };
 type DiffViewMode = "split" | "unified";
 
-interface EditPreviewLine {
-  type: "same" | "add" | "remove" | "meta";
-  content: string;
-  oldLine?: number;
-  newLine?: number;
-}
-
-interface EditPreview {
-  label: string;
-  lines: EditPreviewLine[];
-  totalLines: number;
-}
-
 const workspaceStorageKey = "agent.workspace.projects.v1";
 const sidebarCollapsedStorageKey = "agent.workspace.sidebarCollapsed.v1";
 const sidebarWidthStorageKey = "agent.workspace.sidebarWidth.v1";
 const projectSessionCollapsedStorageKey = "agent.workspace.projectSessionCollapsed.v1";
 const aiDisabledProviderMonitoringStorageKey = "agent.ai.disabledProviderMonitoring.v1";
+const thinkingModeStorageKey = "agent.chat.thinkingMode.v1";
 const aiRealtimeMonitorIntervalMs = 15_000;
 
 function loadDisabledAiProviderMonitoringIds() {
@@ -444,6 +405,11 @@ function loadDisabledAiProviderMonitoringIds() {
   }
 }
 
+function loadThinkingMode(): ThinkingMode {
+  const saved = localStorage.getItem(thinkingModeStorageKey);
+  return saved === "fast" || saved === "balanced" || saved === "deep" ? saved : "balanced";
+}
+
 const temporaryProjectId = "project_unassigned";
 const temporaryProjectName = "不使用项目";
 const defaultSidebarWidth = 318;
@@ -451,8 +417,6 @@ const minSidebarWidth = 220;
 const maxSidebarWidth = 520;
 const sessionArchiveSwipeThreshold = 82;
 const sessionArchiveSwipeMax = 96;
-const editPreviewContextLines = 2;
-const editPreviewLineLimit = 90;
 const API_BASE = import.meta.env.VITE_API_BASE || (window.location.protocol === "file:" || window.agentDesktop?.isDesktopClient ? "http://localhost:8787" : "");
 const AI_PROVIDER_QUICK_CONNECTS: Record<string, AiProviderQuickConnect> = {
   deepseek: {
@@ -481,12 +445,10 @@ const AI_PROVIDER_QUICK_CONNECTS: Record<string, AiProviderQuickConnect> = {
     modelsPath: "/models", chatCompletionsPath: "/chat/completions"
   }
 };
-const thinkingOptions: Array<{ id: ThinkingMode; label: string }> = [
-  { id: "fast", label: "快速" },
-  { id: "balanced", label: "标准" },
-  { id: "deep", label: "深度" }
-];
 
+function inferredImageModels(models: string[]) {
+  return models.filter((model) => /(?:^|[-_.\/])(gpt-image|dall-e|image|imagen|flux|sdxl|stable-diffusion|recraft|seedream)(?:$|[-_.\/\d])/i.test(model));
+}
 const defaultPermissionOptions: PermissionOption[] = [
   { id: "default", label: "默认", description: "使用配置文件中的默认工作区沙箱策略" },
   { id: "plan", label: "计划", description: "只读规划模式，不允许写文件、联网或执行命令" },
@@ -499,6 +461,11 @@ const toolActionLabels: Record<string, { running: string; completed: string; nou
   read_file: { running: "正在读取", completed: "已读取", noun: "个文件" },
   write_file: { running: "正在编辑", completed: "已编辑", noun: "个文件" },
   run_shell: { running: "正在运行", completed: "已运行", noun: "条命令" },
+  project_diagnostics: { running: "正在诊断", completed: "已诊断", noun: "个项目" },
+  generate_image: { running: "正在生成", completed: "已生成", noun: "张图片" },
+  docker_compose: { running: "正在执行", completed: "已执行", noun: "个容器操作" },
+  sqlite_query: { running: "正在查询", completed: "已查询", noun: "个数据库" },
+  git_push: { running: "正在推送", completed: "已推送", noun: "个分支" },
   start_process: { running: "正在启动", completed: "已启动", noun: "个进程" },
   read_process: { running: "正在读取", completed: "已读取", noun: "个进程" },
   write_process: { running: "正在发送", completed: "已发送", noun: "次输入" },
@@ -735,10 +702,6 @@ function formatBalanceAmount(currency: string, amount: number) {
   } catch {
     return `${currency} ${amount.toFixed(2)}`;
   }
-}
-
-function formatPercent(value: number) {
-  return `${Math.round(Math.max(0, Math.min(1, value)) * 100)}%`;
 }
 
 function getDateKey(date: Date) {
@@ -1032,15 +995,6 @@ function renderMessageContent(content: string, projectPath?: string) {
   return parts;
 }
 
-function getToolShortTarget(message: ChatMessage) {
-  const pathArg = message.toolArgs?.path as string | undefined;
-  const commandArg = message.toolArgs?.command as string | undefined;
-  const urlArg = message.toolArgs?.url as string | undefined;
-  const target = pathArg ?? commandArg ?? urlArg ?? "";
-  if (!target) return "";
-  return target.length > 34 ? `...${target.slice(-31)}` : target;
-}
-
 function getFileName(filePath: string) {
   return filePath.split(/[\\/]/).filter(Boolean).at(-1) ?? filePath;
 }
@@ -1065,17 +1019,6 @@ function getDiffEditKind(diff?: DiffResult) {
   if (diff.addedLines > 0) return "新增内容";
   if (diff.removedLines > 0) return "删减";
   return "更新";
-}
-
-function getEditSummaryText(diffs: DiffResult[]) {
-  if (diffs.length === 0) return "等待文件变更结果";
-  const created = diffs.filter((diff) => diff.oldContent === null).length;
-  const changed = diffs.length - created;
-  const parts = [
-    created > 0 ? `新增 ${created} 个文件` : "",
-    changed > 0 ? `修改 ${changed} 个文件` : ""
-  ].filter(Boolean);
-  return parts.length > 0 ? parts.join("，") : "已更新文件内容";
 }
 
 function lineCount(text: string) {
@@ -1149,42 +1092,6 @@ function getToolLineChangeStats(message: ChatMessage): LineChangeStats {
   }
 
   return { addedLines: 0, removedLines: 0, isEstimate: false };
-}
-
-function trimEditPreviewLines(lines: EditPreviewLine[], limit = editPreviewLineLimit) {
-  if (lines.length <= limit) return lines;
-  const hiddenCount = lines.length - limit;
-  return [
-    ...lines.slice(0, limit),
-    { type: "meta" as const, content: `... 已隐藏 ${hiddenCount} 行` }
-  ];
-}
-
-function getCompactDiffPreviewLines(diff: DiffResult) {
-  const includedIndexes = new Set<number>();
-  diff.lines.forEach((line, index) => {
-    if (line.type === "same") return;
-    const start = Math.max(0, index - editPreviewContextLines);
-    const end = Math.min(diff.lines.length - 1, index + editPreviewContextLines);
-    for (let cursor = start; cursor <= end; cursor++) {
-      includedIndexes.add(cursor);
-    }
-  });
-
-  if (includedIndexes.size === 0) {
-    return trimEditPreviewLines(diff.lines.slice(0, 18));
-  }
-
-  const previewLines: EditPreviewLine[] = [];
-  let previousIndex = -1;
-  [...includedIndexes].sort((a, b) => a - b).forEach((index) => {
-    if (previousIndex !== -1 && index > previousIndex + 1) {
-      previewLines.push({ type: "meta", content: `... 跳过 ${index - previousIndex - 1} 行未变更内容` });
-    }
-    previewLines.push(diff.lines[index]);
-    previousIndex = index;
-  });
-  return trimEditPreviewLines(previewLines);
 }
 
 function getDiffReviewRows(diff: DiffResult, contextLines = 3): DiffReviewRow[] {
@@ -1269,81 +1176,6 @@ function getSplitDiffReviewRows(rows: DiffReviewRow[]): SplitDiffReviewRow[] {
   return splitRows;
 }
 
-function getPatchPreviewLines(patchText: string) {
-  const lines = patchText.split("\n").map<EditPreviewLine>((line) => {
-    if (line.startsWith("@@") || line.startsWith("diff --git") || line.startsWith("index ")) {
-      return { type: "meta", content: line };
-    }
-    if (line.startsWith("+") && !line.startsWith("+++")) {
-      return { type: "add", content: line.slice(1) };
-    }
-    if (line.startsWith("-") && !line.startsWith("---")) {
-      return { type: "remove", content: line.slice(1) };
-    }
-    if (line.startsWith(" ")) {
-      return { type: "same", content: line.slice(1) };
-    }
-    return { type: "meta", content: line };
-  });
-  return trimEditPreviewLines(lines);
-}
-
-function getTextBlockPreviewLines(text: string, type: EditPreviewLine["type"]) {
-  return trimEditPreviewLines(text.split("\n").map((content, index) => (
-    type === "add"
-      ? { type, content, newLine: index + 1 }
-      : type === "remove"
-        ? { type, content, oldLine: index + 1 }
-        : { type, content, oldLine: index + 1, newLine: index + 1 }
-  )));
-}
-
-function getEditPreview(message: ChatMessage): EditPreview | undefined {
-  if (message.diff) {
-    return {
-      label: "实时 diff",
-      lines: getCompactDiffPreviewLines(message.diff),
-      totalLines: message.diff.lines.length
-    };
-  }
-
-  if (!message.toolArgs || !isEditToolName(message.toolName)) return undefined;
-
-  const contentArg = typeof message.toolArgs.content === "string" ? message.toolArgs.content : "";
-  if (message.toolName === "write_file" && contentArg) {
-    return {
-      label: `即将写入完整内容 · ${lineCount(contentArg)} 行`,
-      lines: getTextBlockPreviewLines(contentArg, "add"),
-      totalLines: lineCount(contentArg)
-    };
-  }
-
-  const patchArg = typeof message.toolArgs.patch === "string" ? message.toolArgs.patch : "";
-  if (patchArg) {
-    return {
-      label: `补丁预览 · ${lineCount(patchArg)} 行`,
-      lines: getPatchPreviewLines(patchArg),
-      totalLines: lineCount(patchArg)
-    };
-  }
-
-  const oldTextArg = typeof message.toolArgs.oldText === "string" ? message.toolArgs.oldText : "";
-  const newTextArg = typeof message.toolArgs.newText === "string" ? message.toolArgs.newText : "";
-  if (oldTextArg || newTextArg) {
-    const lines = [
-      ...(oldTextArg ? getTextBlockPreviewLines(oldTextArg, "remove") : []),
-      ...(newTextArg ? getTextBlockPreviewLines(newTextArg, "add") : [])
-    ];
-    return {
-      label: "替换文本预览",
-      lines: trimEditPreviewLines(lines),
-      totalLines: lineCount(oldTextArg) + lineCount(newTextArg)
-    };
-  }
-
-  return undefined;
-}
-
 function isEditToolName(toolName?: string) {
   return toolName === "write_file" || toolName === "apply_patch";
 }
@@ -1360,7 +1192,7 @@ function getToolDisplayTarget(message: ChatMessage) {
 }
 
 function getToolActivityCategory(toolName?: string): ToolActivityCategory {
-  if (toolName === "run_shell" || toolName === "start_process" || toolName === "read_process" || toolName === "write_process" || toolName === "stop_process" || toolName === "list_processes") return "command";
+  if (toolName === "run_shell" || toolName === "start_process" || toolName === "read_process" || toolName === "write_process" || toolName === "stop_process" || toolName === "list_processes" || toolName === "project_diagnostics" || toolName === "docker_compose" || toolName === "sqlite_query" || toolName === "git_push") return "command";
   if (toolName === "write_file" || toolName === "apply_patch") return "edit";
   if (toolName === "read_file") return "read";
   if (toolName === "list_files" || toolName === "search_text" || toolName === "inspect_tree" || toolName === "web_fetch") return "lookup";
@@ -1644,19 +1476,6 @@ function getSessionTitle(prompt: string) {
   return prompt.length > 24 ? `${prompt.slice(0, 24)}...` : prompt;
 }
 
-function getRelativeTime(date: string) {
-  const elapsed = Date.now() - new Date(date).getTime();
-  const minute = 60 * 1000;
-  const hour = 60 * minute;
-  const day = 24 * hour;
-  const week = 7 * day;
-  if (elapsed < minute) return "刚刚";
-  if (elapsed < hour) return `${Math.max(1, Math.floor(elapsed / minute))} 分`;
-  if (elapsed < day) return `${Math.floor(elapsed / hour)} 时`;
-  if (elapsed < week) return `${Math.floor(elapsed / day)} 天`;
-  return `${Math.floor(elapsed / week)} 周`;
-}
-
 /** 解析 SSE 流 */
 async function* parseSseStream(response: Response): AsyncGenerator<StreamEvent> {
   const reader = response.body!.getReader();
@@ -1714,26 +1533,24 @@ export default function App() {
   const [health, setHealth] = useState<{ providerConfigured: boolean; model: string; provider?: string }>();
   const [modelOptions, setModelOptions] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState("");
+  const [imageMode, setImageMode] = useState(false);
+  const [selectedImageModel, setSelectedImageModel] = useState("");
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
-  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>("balanced");
+  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>(() => loadThinkingMode());
   const [permissionMenuOpen, setPermissionMenuOpen] = useState(false);
   const [managedProcessPanelOpen, setManagedProcessPanelOpen] = useState(false);
   const [managedProcesses, setManagedProcesses] = useState<ManagedProcessView[]>([]);
   const [managedProcessLoadError, setManagedProcessLoadError] = useState("");
   const [permissionOptions, setPermissionOptions] = useState<PermissionOption[]>(defaultPermissionOptions);
   const [usageSummary, setUsageSummary] = useState<UsageSummary | undefined>();
-  const [toolCatalog, setToolCatalog] = useState<ToolCatalogItem[]>([]);
-  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [aiProviders, setAiProviders] = useState<AiProviderConfig[]>([]);
   const [aiActiveProviderId, setAiActiveProviderId] = useState("");
   const [aiProviderBalance, setAiProviderBalance] = useState<AiProviderBalance | undefined>();
   const [aiProviderBalanceLoading, setAiProviderBalanceLoading] = useState(false);
   const [mcpServers, setMcpServers] = useState<McpServerConfig[]>([]);
   const [skills, setSkills] = useState<AgentSkill[]>([]);
-  const [memories, setMemories] = useState<MemoryItem[]>([]);
   const [learningRecords, setLearningRecords] = useState<LearningRecordItem[]>([]);
   const [latestLearningRun, setLatestLearningRun] = useState<LearningRunItem | undefined>();
-  const [subagents, setSubagents] = useState<SubagentDefinition[]>([]);
   const [aiDraft, setAiDraft] = useState({
     id: "",
     displayName: "",
@@ -1743,8 +1560,12 @@ export default function App() {
     modelsPath: "/models",
     balancePath: "",
     chatCompletionsPath: "/chat/completions",
+    imageGenerationPath: "/images/generations",
+    defaultImageModel: "",
+    imageModelsText: "",
     apiKeyEnv: "AI_API_KEY",
-    protocol: "openai-compatible" as string
+    protocol: "openai-compatible" as string,
+    reasoningDialect: "auto" as ReasoningDialect
   });
   const [aiDraftModels, setAiDraftModels] = useState<string[]>([]);
   const [aiDraftModelStatus, setAiDraftModelStatus] = useState("");
@@ -1828,6 +1649,13 @@ export default function App() {
 
   const resolvedTheme = themePreference === "system" ? systemTheme : themePreference;
   const modelName = selectedModel || health?.model || "Agent";
+  const activeAiProvider = aiProviders.find((provider) => provider.id === aiActiveProviderId || provider.active);
+  const imageModelOptions = [...new Set([activeAiProvider?.defaultImageModel, ...(activeAiProvider?.imageModels ?? [])].filter((model): model is string => Boolean(model)))];
+  const imageModelName = imageModelOptions.includes(selectedImageModel) ? selectedImageModel : imageModelOptions[0] || "图片模型";
+
+  useEffect(() => {
+    if (imageMode && imageModelOptions.length === 0) setImageMode(false);
+  }, [imageMode, imageModelOptions.length]);
 
   const activeProject = useMemo(
     () => workspaceState.projects.find((project) => project.id === workspaceState.activeProjectId),
@@ -1860,7 +1688,6 @@ export default function App() {
 
   const messages = activeSession?.messages ?? [];
   const pendingApprovals = activeSession?.pendingApprovals ?? [];
-  const conversationId = activeSession?.conversationId;
   const isActiveSessionRunning = activeSession ? runningSessionIds.has(activeSession.id) : false;
   const activeResponseMetaId = useMemo(() => {
     if (!isActiveSessionRunning) return undefined;
@@ -2026,11 +1853,31 @@ export default function App() {
   }, [themePreference]);
 
   useEffect(() => {
+    localStorage.setItem(thinkingModeStorageKey, thinkingMode);
+  }, [thinkingMode]);
+
+  useEffect(() => {
     void window.agentDesktop?.remoteUpdateDevice?.({
-      projectPath: activeProject?.path,
-      projectName: activeProject?.name
+      projects: workspaceState.projects
+        .filter((project) => Boolean(project.path) && !project.sessions.every((session) => Boolean(session.archivedAt)))
+        .map((project) => ({
+          id: project.id,
+          name: project.name,
+          path: project.path,
+          sessions: project.sessions
+            .filter((session) => !session.archivedAt)
+            .map((session) => ({
+              id: session.id,
+              title: session.title,
+              updatedAt: session.updatedAt,
+              conversationId: session.conversationId
+            }))
+        })),
+      models: modelOptions,
+      defaultModel: modelName,
+      activeProjectId: activeProject?.id
     });
-  }, [activeProject?.name, activeProject?.path]);
+  }, [activeProject?.id, modelName, modelOptions, workspaceState.projects]);
 
   useEffect(() => {
     void window.agentDesktop?.getThemePreference?.().then((saved) => {
@@ -2138,39 +1985,27 @@ export default function App() {
     if (isDesktopClient && !localApiToken) return;
     const headers = getLocalApiHeaders();
     void Promise.all([
-      fetch(`${API_BASE}/api/tools`, { headers }).then((r) => r.ok ? r.json() : { tools: [] }),
-      fetch(`${API_BASE}/api/audit`, { headers }).then((r) => r.ok ? r.json() : { events: [] }),
       fetch(`${API_BASE}/api/usage`, { headers }).then((r) => r.ok ? r.json() : undefined),
       fetch(`${API_BASE}/api/ai/providers`, { headers }).then((r) => r.ok ? r.json() : { providers: [], activeProviderId: "" }),
       fetch(`${API_BASE}/api/mcp/servers`, { headers }).then((r) => r.ok ? r.json() : { servers: [] }),
       fetch(`${API_BASE}/api/skills${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { skills: [] }),
-      fetch(`${API_BASE}/api/memory${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { memories: [] }),
-      fetch(`${API_BASE}/api/learning${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { records: [] }),
-      fetch(`${API_BASE}/api/agents${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { agents: [] })
-    ]).then(([toolsData, auditData, usageData, aiData, mcpData, skillsData, memoryData, learningData, agentsData]) => {
-      setToolCatalog(toolsData.tools ?? []);
-      setAuditEvents(auditData.events ?? []);
+      fetch(`${API_BASE}/api/learning${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { records: [] })
+    ]).then(([usageData, aiData, mcpData, skillsData, learningData]) => {
       setUsageSummary(usageData);
       setAiProviders(aiData.providers ?? []);
       setAiActiveProviderId(aiData.activeProviderId ?? "");
       setMcpServers(mcpData.servers ?? []);
       setSkills(skillsData.skills ?? []);
-      setMemories(memoryData.memories ?? []);
       setLearningRecords(learningData.records ?? []);
       setLatestLearningRun(learningData.lastRun);
-      setSubagents(agentsData.agents ?? []);
     }).catch(() => {
-      setToolCatalog([]);
-      setAuditEvents([]);
       setUsageSummary(undefined);
       setAiProviders([]);
       setAiActiveProviderId("");
       setMcpServers([]);
       setSkills([]);
-      setMemories([]);
       setLearningRecords([]);
       setLatestLearningRun(undefined);
-      setSubagents([]);
     });
   }, [localApiToken, isDesktopClient, activeProject?.path]);
 
@@ -2564,6 +2399,7 @@ export default function App() {
         showResponseMeta: false,
         responseStartedAt: undefined,
         responseCompletedAt: undefined,
+        reasoning: undefined,
         usage: undefined
       }
     ];
@@ -2589,6 +2425,7 @@ export default function App() {
                 showResponseMeta: false,
                 responseStartedAt: undefined,
                 responseCompletedAt: undefined,
+                reasoning: undefined,
                 usage: undefined
               }
             : message
@@ -2598,6 +2435,7 @@ export default function App() {
           showResponseMeta: true,
           responseStartedAt: source?.responseStartedAt ?? responseStartedAt,
           responseCompletedAt: target.responseCompletedAt ?? source?.responseCompletedAt,
+          reasoning: source?.reasoning,
           usage
         }
       ];
@@ -2624,6 +2462,7 @@ export default function App() {
             showResponseMeta: false,
             responseStartedAt: undefined,
             responseCompletedAt: undefined,
+            reasoning: undefined,
             usage: undefined
           };
         }
@@ -2633,6 +2472,7 @@ export default function App() {
             showResponseMeta: true,
             responseStartedAt: source.responseStartedAt ?? responseStartedAt,
             responseCompletedAt,
+            reasoning: source.reasoning,
             usage: source.usage
           };
         }
@@ -2769,6 +2609,17 @@ export default function App() {
           }
           break;
 
+        case "reasoning_config":
+          if (event.config) {
+            updateSession(projectId, sessionId, (s) => ({
+              ...s,
+              messages: s.messages.map((message) =>
+                message.id === currentAssistantId ? { ...message, reasoning: event.config } : message
+              )
+            }));
+          }
+          break;
+
         case "task_plan":
           if (event.plan) {
             updateSession(projectId, sessionId, (s) => ({
@@ -2891,6 +2742,7 @@ export default function App() {
                   return {
                     ...m,
                     content: event.result!.content,
+                    attachments: event.result!.attachments,
                     toolResult: { ok: event.result!.ok, content: event.result!.content, process: event.result!.process },
                     diff: resultDiff,
                     status: "completed" as const
@@ -3114,6 +2966,87 @@ export default function App() {
     await runAgentForSession(activeProject.id, activeSession.id, content, true, content, undefined, attachments);
   }
 
+  async function runImageGeneration() {
+    const content = prompt.trim();
+    if (!content || !activeProject || !activeSession || imageModelOptions.length === 0 || isActiveSessionRunning) return;
+    const projectId = activeProject.id;
+    const sessionId = activeSession.id;
+    const assistantMessageId = createId("message");
+    const startedAt = Date.now();
+    appendUserMessage(projectId, sessionId, content);
+    setPrompt("");
+    updateSession(projectId, sessionId, (session) => ({
+      ...session,
+      updatedAt: new Date().toISOString(),
+      workflowPhase: "executing",
+      workflowLabel: "正在生成图片",
+      messages: [...session.messages, {
+        id: assistantMessageId,
+        role: "assistant",
+        content: "",
+        isStreaming: true,
+        startedAt,
+        showResponseMeta: true,
+        responseStartedAt: startedAt,
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, model: imageModelName, provider: aiActiveProviderId }
+      }]
+    }));
+    const abortController = new AbortController();
+    abortControllersRef.current.set(sessionId, abortController);
+    markSessionRunning(sessionId);
+    try {
+      const response = await fetch(`${API_BASE}/api/images/generate`, {
+        method: "POST",
+        signal: abortController.signal,
+        headers: getJsonHeaders(),
+        body: JSON.stringify({ prompt: content, providerId: aiActiveProviderId, model: imageModelName, count: 1, size: "auto", quality: "auto" })
+      });
+      const data = await response.json().catch(() => ({})) as { error?: string; attachments?: ComposerAttachment[]; model?: string; provider?: string };
+      if (!response.ok || !data.attachments?.length) throw new Error(data.error || "图片服务没有返回图片");
+      const completedAt = Date.now();
+      updateSession(projectId, sessionId, (session) => ({
+        ...session,
+        workflowPhase: "completed",
+        workflowLabel: "图片生成完成",
+        messages: session.messages.map((message) => message.id === assistantMessageId ? {
+          ...message,
+          content: `已生成 ${data.attachments!.length} 张图片。`,
+          attachments: data.attachments,
+          isStreaming: false,
+          status: "completed" as const,
+          completedAt,
+          durationMs: completedAt - startedAt,
+          responseCompletedAt: completedAt,
+          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, model: data.model || imageModelName, provider: data.provider || aiActiveProviderId }
+        } : message)
+      }));
+    } catch (error) {
+      const completedAt = Date.now();
+      updateSession(projectId, sessionId, (session) => ({
+        ...session,
+        workflowPhase: "failed",
+        workflowLabel: "图片生成失败",
+        messages: session.messages.map((message) => message.id === assistantMessageId ? {
+          ...message,
+          content: error instanceof DOMException && error.name === "AbortError" ? "已停止图片生成。" : error instanceof Error ? error.message : "图片生成失败",
+          isStreaming: false,
+          status: "error" as const,
+          completedAt,
+          durationMs: completedAt - startedAt,
+          responseCompletedAt: completedAt
+        } : message)
+      }));
+    } finally {
+      if (abortControllersRef.current.get(sessionId) === abortController) abortControllersRef.current.delete(sessionId);
+      markSessionIdle(sessionId);
+    }
+  }
+
+  function submitCurrentComposer() {
+    if (imageMode) void runImageGeneration();
+    else void runAgent();
+  }
+
   async function decideApproval(approvalId: string, allow: boolean) {
     if (!activeProject || !activeSession || isActiveSessionRunning) return;
 
@@ -3205,7 +3138,7 @@ export default function App() {
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
     event.preventDefault();
-    void runAgent();
+    submitCurrentComposer();
   }
 
   function handleSendButtonClick() {
@@ -3213,7 +3146,7 @@ export default function App() {
       stopActiveResponse();
       return;
     }
-    void runAgent();
+    submitCurrentComposer();
   }
 
   function changeSessionMode(nextMode: PermissionMode) {
@@ -3398,28 +3331,20 @@ export default function App() {
 
   async function reloadPlatformData() {
     const headers = getLocalApiHeaders();
-    const [mcpData, auditData, usageData, toolsData, aiData, skillsData, memoryData, learningData, agentsData] = await Promise.all([
+    const [mcpData, usageData, aiData, skillsData, learningData] = await Promise.all([
       fetch(`${API_BASE}/api/mcp/servers`, { headers }).then((r) => r.ok ? r.json() : { servers: [] }),
-      fetch(`${API_BASE}/api/audit`, { headers }).then((r) => r.ok ? r.json() : { events: [] }),
       fetch(`${API_BASE}/api/usage`, { headers }).then((r) => r.ok ? r.json() : undefined),
-      fetch(`${API_BASE}/api/tools`, { headers }).then((r) => r.ok ? r.json() : { tools: [] }),
       fetch(`${API_BASE}/api/ai/providers`, { headers }).then((r) => r.ok ? r.json() : { providers: [], activeProviderId: "" }),
       fetch(`${API_BASE}/api/skills${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { skills: [] }),
-      fetch(`${API_BASE}/api/memory${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { memories: [] }),
-      fetch(`${API_BASE}/api/learning${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { records: [] }),
-      fetch(`${API_BASE}/api/agents${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { agents: [] })
+      fetch(`${API_BASE}/api/learning${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { records: [] })
     ]);
     setMcpServers(mcpData.servers ?? []);
-    setAuditEvents(auditData.events ?? []);
     setUsageSummary(usageData);
-    setToolCatalog(toolsData.tools ?? []);
     setAiProviders(aiData.providers ?? []);
     setAiActiveProviderId(aiData.activeProviderId ?? "");
     setSkills(skillsData.skills ?? []);
-    setMemories(memoryData.memories ?? []);
     setLearningRecords(learningData.records ?? []);
     setLatestLearningRun(learningData.lastRun);
-    setSubagents(agentsData.agents ?? []);
   }
 
   async function reloadRuntimeData() {
@@ -3488,8 +3413,12 @@ export default function App() {
       modelsPath: quickConnect.modelsPath,
       balancePath: quickConnect.balancePath ?? "",
       chatCompletionsPath: quickConnect.chatCompletionsPath,
+      imageGenerationPath: "/images/generations",
+      defaultImageModel: "",
+      imageModelsText: "",
       apiKeyEnv: quickConnect.apiKeyEnv,
-      protocol: "openai-compatible"
+      protocol: "openai-compatible",
+      reasoningDialect: "auto"
     });
     setAiDraftModels([]);
     setAiDraftError("");
@@ -3527,6 +3456,14 @@ export default function App() {
       if (data.error) throw new Error(data.error);
       const models = (data.models ?? []).map((model: { id: string }) => model.id).filter(Boolean);
       setAiDraftModels(models);
+      const imageModels = inferredImageModels(models);
+      if (imageModels.length) {
+        setAiDraft((cur) => ({
+          ...cur,
+          defaultImageModel: cur.defaultImageModel || imageModels[0],
+          imageModelsText: cur.imageModelsText || imageModels.join(", ")
+        }));
+      }
       setAiDraftModelStatus(models.length ? `已获取 ${models.length} 个模型` : "未发现模型，请检查 URL 或密钥权限");
       if (models.length && !models.includes(aiDraft.defaultModel)) {
         setAiDraft((cur) => ({ ...cur, defaultModel: models[0] }));
@@ -3537,6 +3474,22 @@ export default function App() {
     } finally {
       setAiDraftFetchingModels(false);
     }
+  }
+
+  async function syncWorkAiProviderToCloud(providerId: string) {
+    if (!window.agentDesktop?.syncWorkAiProvider) return undefined;
+    const result = await window.agentDesktop.syncWorkAiProvider({ providerId });
+    if (!result?.ok) throw new Error("Cloudflare 未确认接口同步");
+    return result;
+  }
+
+  async function syncAllWorkAiProvidersToCloud() {
+    if (window.agentDesktop?.syncAllWorkAiProviders) {
+      const result = await window.agentDesktop.syncAllWorkAiProviders();
+      if (!result?.ok) throw new Error("Cloudflare 未确认接口同步");
+      return result;
+    }
+    return syncWorkAiProviderToCloud(aiActiveProviderId);
   }
 
   async function saveAiProviderFromDraft() {
@@ -3560,13 +3513,19 @@ export default function App() {
           modelsPath: aiDraft.modelsPath.trim() || "/models",
           balancePath: aiDraft.balancePath.trim() || undefined,
           chatCompletionsPath: aiDraft.chatCompletionsPath.trim() || "/chat/completions",
+          imageGenerationPath: aiDraft.imageGenerationPath.trim() || "/images/generations",
+          defaultImageModel: aiDraft.defaultImageModel.trim() || undefined,
+          imageModels: [...new Set(aiDraft.imageModelsText.split(/[,\n]/).map((model) => model.trim()).filter(Boolean))],
           protocol: aiDraft.protocol || "openai-compatible",
+          reasoningDialect: aiDraft.reasoningDialect,
+          fallbackModels: aiDraftModels.filter((model) => model !== aiDraft.defaultModel.trim()),
           enabled: true
         })
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "保存接口失败");
-      if (editingAiProviderId === aiActiveProviderId || AI_PROVIDER_QUICK_CONNECTS[aiDraftId]) {
+      const shouldActivate = editingAiProviderId === aiActiveProviderId || Boolean(AI_PROVIDER_QUICK_CONNECTS[aiDraftId]);
+      if (shouldActivate) {
         const activateResponse = await fetch(`${API_BASE}/api/ai/providers/${encodeURIComponent(aiDraftId)}/activate`, {
           method: "POST",
           headers: getLocalApiHeaders()
@@ -3576,7 +3535,12 @@ export default function App() {
           throw new Error(typeof activateData.error === "string" ? activateData.error : "接口已保存，但启用失败");
         }
       }
-      setAiDraft({ id: "", displayName: "", baseUrl: "", apiKey: "", defaultModel: "gpt-4o", modelsPath: "/models", balancePath: "", chatCompletionsPath: "/chat/completions", apiKeyEnv: "AI_API_KEY", protocol: "openai-compatible" });
+      try {
+        await syncAllWorkAiProvidersToCloud();
+      } catch (error) {
+        throw new Error(`接口已保存，但同步到手机聊天失败：${error instanceof Error ? error.message : "未知错误"}`);
+      }
+      setAiDraft({ id: "", displayName: "", baseUrl: "", apiKey: "", defaultModel: "gpt-4o", modelsPath: "/models", balancePath: "", chatCompletionsPath: "/chat/completions", imageGenerationPath: "/images/generations", defaultImageModel: "", imageModelsText: "", apiKeyEnv: "AI_API_KEY", protocol: "openai-compatible", reasoningDialect: "auto" });
       setAiDraftModels([]);
       setAiDraftModelStatus("");
       setShowAddProviderModal(false);
@@ -3591,7 +3555,7 @@ export default function App() {
 
   function openNewAiProvider() {
     setEditingAiProviderId(undefined);
-    setAiDraft({ id: "", displayName: "", baseUrl: "", apiKey: "", defaultModel: "gpt-4o", modelsPath: "/models", balancePath: "", chatCompletionsPath: "/chat/completions", apiKeyEnv: "AI_API_KEY", protocol: "openai-compatible" });
+    setAiDraft({ id: "", displayName: "", baseUrl: "", apiKey: "", defaultModel: "gpt-4o", modelsPath: "/models", balancePath: "", chatCompletionsPath: "/chat/completions", imageGenerationPath: "/images/generations", defaultImageModel: "", imageModelsText: "", apiKeyEnv: "AI_API_KEY", protocol: "openai-compatible", reasoningDialect: "auto" });
     setAiDraftModels([]);
     setAiDraftModelStatus("");
     setAiDraftError("");
@@ -3609,8 +3573,12 @@ export default function App() {
       modelsPath: provider.modelsPath || "/models",
       balancePath: provider.balancePath || "",
       chatCompletionsPath: provider.chatCompletionsPath || "/chat/completions",
+      imageGenerationPath: provider.imageGenerationPath || "/images/generations",
+      defaultImageModel: provider.defaultImageModel || "",
+      imageModelsText: (provider.imageModels ?? []).join(", "),
       apiKeyEnv: provider.apiKeyEnv || "AI_API_KEY",
-      protocol: "openai-compatible"
+      protocol: "openai-compatible",
+      reasoningDialect: provider.reasoningDialect ?? "auto"
     });
     setAiDraftModels([]);
     setAiDraftModelStatus(provider.configured ? "输入新密钥以替换当前密钥" : "请输入 API Key");
@@ -3627,7 +3595,12 @@ export default function App() {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "切换接口失败");
-      setAiProviderStatus((cur) => ({ ...cur, [id]: "已设为当前接口" }));
+      try {
+        await syncAllWorkAiProvidersToCloud();
+      } catch (error) {
+        throw new Error(`已设为当前接口，但同步到手机 Work 失败：${error instanceof Error ? error.message : "未知错误"}`);
+      }
+      setAiProviderStatus((cur) => ({ ...cur, [id]: "已设为当前接口，并同步到手机 Work" }));
       await Promise.all([reloadPlatformData(), reloadRuntimeData()]);
     } catch (error) {
       setAiProviderStatus((cur) => ({ ...cur, [id]: error instanceof Error ? `失败：${error.message}` : "切换接口失败" }));
@@ -3694,6 +3667,7 @@ export default function App() {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "删除接口失败");
+      await syncAllWorkAiProvidersToCloud();
       setDisabledAiProviderMonitoringIds((cur) => {
         const next = new Set(cur);
         next.delete(id);
@@ -4215,7 +4189,7 @@ export default function App() {
         <div className="settingsContentStack">
           <section className="settingsPaneSection aiProviderSection">
             <div className="aiProviderPageIntro">
-              <p>配置 OpenAI-compatible 模型服务，并切换当前 Agent 使用的接口。</p>
+              <p>电脑端与手机端共用同一套 AI 接口；保存、切换和删除后会自动同步。</p>
               <button className="settingsBtnPrimary" type="button" onClick={openNewAiProvider}>
                 <Plus size={15} />
                 添加接口
@@ -4346,7 +4320,10 @@ export default function App() {
                           {provider.configured ? "密钥已配置" : "缺少密钥"}
                         </span>
                       </strong>
-                      <small className="aiProviderMeta">{provider.id} · {provider.defaultModel}</small>
+                      <small className="aiProviderMeta">
+                        {provider.id} · {provider.defaultModel}
+                        {provider.reasoningDialect === "sub2api" ? " · Sub2API 思考转换" : ""}
+                      </small>
                       <small className="aiProviderEndpoint">{provider.baseUrl}</small>
                       {statusText ? (
                         <small className={`aiProviderStatusLine ${statusText.includes("失败") || statusText.includes("required") ? "error" : statusText.includes("测试中") ? "testing" : "ok"}`}>
@@ -4454,6 +4431,24 @@ export default function App() {
                       <input value={aiDraft.baseUrl} onChange={(e) => setAiDraft((cur) => ({ ...cur, baseUrl: e.target.value }))} />
                     </div>
                   )}
+                  <div className="aiFormField">
+                    <label>思考协议</label>
+                    <select
+                      value={aiDraft.reasoningDialect}
+                      onChange={(e) => setAiDraft((cur) => ({ ...cur, reasoningDialect: e.target.value as ReasoningDialect }))}
+                    >
+                      <option value="auto">自动识别（推荐）</option>
+                      <option value="sub2api">Sub2API 多模型中转</option>
+                      <option value="openai-compatible">标准 OpenAI 兼容</option>
+                    </select>
+                    <small>
+                      {aiDraft.reasoningDialect === "sub2api"
+                        ? "按模型名称转换 reasoning、thinking 和预算参数，适合 Sub2API 自建域名。"
+                        : aiDraft.reasoningDialect === "openai-compatible"
+                          ? "始终发送 reasoning_effort，由接口自行兼容或返回降级信号。"
+                          : "优先识别官方接口；中转域名会结合模型名称选择参数。"}
+                    </small>
+                  </div>
                   <div className="aiFormRow">
                     <div className="aiFormField">
                       <label>默认模型</label>
@@ -4481,6 +4476,34 @@ export default function App() {
                       <label>模型列表路径</label>
                       <input value={aiDraft.modelsPath} onChange={(e) => setAiDraft((cur) => ({ ...cur, modelsPath: e.target.value }))} placeholder="/models" />
                     </div>
+                  </div>
+                  <div className="aiFormRow">
+                    <div className="aiFormField">
+                      <label>默认图片模型（可选）</label>
+                      <input
+                        value={aiDraft.defaultImageModel}
+                        onChange={(e) => setAiDraft((cur) => ({ ...cur, defaultImageModel: e.target.value }))}
+                        placeholder="如 gpt-image-2 / flux-1.1-pro"
+                      />
+                    </div>
+                    <div className="aiFormField">
+                      <label>图片生成路径</label>
+                      <input
+                        value={aiDraft.imageGenerationPath}
+                        onChange={(e) => setAiDraft((cur) => ({ ...cur, imageGenerationPath: e.target.value }))}
+                        placeholder="/images/generations"
+                      />
+                    </div>
+                  </div>
+                  <div className="aiFormField">
+                    <label>图片模型列表（可选）</label>
+                    <textarea
+                      value={aiDraft.imageModelsText}
+                      onChange={(e) => setAiDraft((cur) => ({ ...cur, imageModelsText: e.target.value }))}
+                      placeholder="多个模型使用逗号或换行分隔"
+                      rows={2}
+                    />
+                    <small>图片模型单独显示在生图入口；获取模型后会自动识别常见 Image、DALL·E、Flux、Imagen 等模型名称。</small>
                   </div>
                   <div className="aiFormField">
                     <label>余额接口（可选）</label>
@@ -5097,6 +5120,19 @@ export default function App() {
                             {showResponseMeta && (
                               <div className="messageMeta" aria-label="本次回复统计">
                                 <span className="responseModel">{message.usage?.model ?? modelName}</span>
+                                {message.reasoning && (
+                                  <span
+                                    className={`responseReasoning ${message.reasoning.transport ?? (message.reasoning.native ? "direct" : "fallback")}`}
+                                    title={message.reasoning.transport === "gateway"
+                                      ? `本次请求已由中转协议转换：${message.reasoning.method} = ${message.reasoning.value}`
+                                      : message.reasoning.native
+                                        ? `本次请求已使用模型原生推理控制：${message.reasoning.method} = ${message.reasoning.value}`
+                                        : "当前接口不支持原生推理参数，本次已降级为系统提示控制"}
+                                  >
+                                    <Brain size={11} />
+                                    {message.reasoning.label}
+                                  </span>
+                                )}
                                 {responseDurationMs !== undefined && (
                                   <span className="responseMetric">耗时 {formatResponseDuration(responseDurationMs)}</span>
                                 )}
@@ -5141,12 +5177,12 @@ export default function App() {
                                   : <p className="responseReplayEmpty">本轮直接生成回复，未调用任何工具。</p>}
                               </section>
                             )}
-                            {message.role === "user" && Boolean(message.attachments?.length) && (
+                            {Boolean(message.attachments?.length) && (
                               <div className="messageAttachmentGrid" aria-label="消息附件">
                                 {message.attachments!.map((attachment) => (
                                   <div className={`messageAttachment ${attachment.kind}`} key={attachment.id} title={attachment.name}>
-                                    {attachment.kind === "image" && attachment.dataUrl ? (
-                                      <img src={attachment.dataUrl} alt={attachment.name} />
+                                    {attachment.kind === "image" && (attachment.dataUrl || attachment.url) ? (
+                                      <img src={attachment.dataUrl || (attachment.url?.startsWith("/") ? `${API_BASE}${attachment.url}` : attachment.url)} alt={attachment.name} />
                                     ) : (
                                       <span className="messageAttachmentFileIcon"><FileText size={18} /></span>
                                     )}
@@ -5239,9 +5275,11 @@ export default function App() {
                   <ChatComposer
                     prompt={prompt}
                     attachments={composerAttachments}
-                    modelName={modelName}
-                    modelOptions={modelOptions}
+                    modelName={imageMode ? imageModelName : modelName}
+                    modelOptions={imageMode ? imageModelOptions : modelOptions}
                     modelMenuOpen={modelMenuOpen}
+                    imageMode={imageMode}
+                    imageGenerationAvailable={imageModelOptions.length > 0}
                     thinkingMode={thinkingMode}
                     permissionMode={currentMode}
                     permissionOptions={permissionOptions}
@@ -5262,7 +5300,12 @@ export default function App() {
                     onKeyDown={handleComposerKeyDown}
                     onToggleModelMenu={() => setModelMenuOpen((open) => !open)}
                     onSelectModel={(model) => {
-                      setSelectedModel(model);
+                      if (imageMode) setSelectedImageModel(model);
+                      else setSelectedModel(model);
+                      setModelMenuOpen(false);
+                    }}
+                    onToggleImageMode={() => {
+                      setImageMode((enabled) => !enabled);
                       setModelMenuOpen(false);
                     }}
                     onThinkingModeChange={setThinkingMode}

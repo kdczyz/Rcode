@@ -1,11 +1,13 @@
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { getRuntimeConfig } from "./config";
 import { recordAuditEvent, saveArtifact, saveLearningRecord, type LearningRecordCategory } from "../storage/database";
 import { portableExecutor } from "./executor";
 import { managedProcessManager } from "./processManager";
 import { executeMcpTool, listMcpToolDefinitions } from "../integrations/mcpClient";
+import { generateImage, type ImageQuality, type ImageSize } from "../providers/imageProvider";
 import { analyzeShellCommand, assertNotSymlinkEscape, assertPathInsideWorkspace, getWorkspaceRoot, sandboxPolicyName } from "../security/sandbox";
 import type { AgentToolName, BuiltinToolName, DiffResult, ExecutorResult, ManagedProcessSnapshot, ToolCall, ToolDefinition, ToolResult } from "../shared/types";
 
@@ -61,6 +63,24 @@ const inputSchemas: Record<BuiltinToolName, Record<string, unknown>> = {
       depth: { type: "number", description: "Maximum depth. Defaults to 2." }
     }
   },
+  project_diagnostics: {
+    type: "object",
+    properties: {
+      cwd: { type: "string", description: "Project directory inside the workspace. Defaults to project root." },
+      kind: { type: "string", enum: ["typecheck", "lint", "test", "build", "all"], description: "Diagnostic task to run. Defaults to typecheck." }
+    }
+  },
+  generate_image: {
+    type: "object",
+    properties: {
+      prompt: { type: "string", description: "Detailed visual description for the image model." },
+      model: { type: "string", description: "Optional configured image model. Uses the provider default when omitted." },
+      size: { type: "string", enum: ["auto", "1024x1024", "1536x1024", "1024x1536", "2048x2048", "2048x1152", "2160x3840", "3840x2160"] },
+      quality: { type: "string", enum: ["auto", "low", "medium", "high"] },
+      count: { type: "number", minimum: 1, maximum: 4 }
+    },
+    required: ["prompt"]
+  },
   record_learning: {
     type: "object",
     properties: {
@@ -91,7 +111,8 @@ const inputSchemas: Record<BuiltinToolName, Record<string, unknown>> = {
     type: "object",
     properties: {
       command: { type: "string", description: "Command to run through zsh. Use non-interactive flags." },
-      cwd: { type: "string", description: "Optional working directory. Defaults to project root." }
+      cwd: { type: "string", description: "Optional working directory. Defaults to project root." },
+      secretRefs: { type: "array", items: { type: "string" }, description: "Allowlisted environment-variable names to inject without exposing their values to the model." }
     },
     required: ["command"]
   },
@@ -101,7 +122,8 @@ const inputSchemas: Record<BuiltinToolName, Record<string, unknown>> = {
       command: { type: "string", description: "Long-running command to start. Do not add &, nohup, or output redirection." },
       cwd: { type: "string", description: "Optional working directory. Defaults to project root." },
       label: { type: "string", description: "Short user-facing label, such as Vue dev server." },
-      startupWaitMs: { type: "number", description: "Milliseconds to collect startup output before returning (0-3000)." }
+      startupWaitMs: { type: "number", description: "Milliseconds to collect startup output before returning (0-3000)." },
+      secretRefs: { type: "array", items: { type: "string" }, description: "Allowlisted environment-variable names to inject without exposing their values to the model." }
     },
     required: ["command"]
   },
@@ -129,6 +151,24 @@ const inputSchemas: Record<BuiltinToolName, Record<string, unknown>> = {
   list_processes: {
     type: "object",
     properties: {}
+  },
+  docker_compose: {
+    type: "object",
+    properties: {
+      action: { type: "string", enum: ["config", "ps", "logs", "build", "pull", "up", "down", "restart"], description: "Compose action. Read-only actions run automatically; mutations require approval." },
+      cwd: { type: "string", description: "Directory containing the Compose file." },
+      services: { type: "array", items: { type: "string" }, description: "Optional service names." },
+      tail: { type: "number", description: "Log lines for the logs action (1-2000)." }
+    },
+    required: ["action"]
+  },
+  sqlite_query: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "SQLite database file inside the workspace." },
+      query: { type: "string", description: "SQL statement. Read-only queries run automatically; mutations require approval." }
+    },
+    required: ["path", "query"]
   },
   git_status: {
     type: "object",
@@ -165,6 +205,15 @@ const inputSchemas: Record<BuiltinToolName, Record<string, unknown>> = {
       message: { type: "string", description: "Commit message." }
     },
     required: ["message"]
+  },
+  git_push: {
+    type: "object",
+    properties: {
+      cwd: { type: "string", description: "Optional git worktree path. Defaults to project root." },
+      remote: { type: "string", description: "Remote name. Defaults to origin." },
+      branch: { type: "string", description: "Optional branch name. Defaults to the current branch." },
+      setUpstream: { type: "boolean", description: "Set upstream tracking for the branch." }
+    }
   }
 };
 
@@ -174,6 +223,8 @@ export const registeredTools: ToolDefinition[] = [
   { id: "list_files", name: "list_files", description: "List files under a workspace directory while ignoring build artifacts.", inputSchema: inputSchemas.list_files, source: "builtin", risk: "low", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "search_text", name: "search_text", description: "Search text in workspace files while ignoring build artifacts.", inputSchema: inputSchemas.search_text, source: "builtin", risk: "low", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "inspect_tree", name: "inspect_tree", description: "Inspect the workspace directory tree.", inputSchema: inputSchemas.inspect_tree, source: "builtin", risk: "low", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
+  { id: "project_diagnostics", name: "project_diagnostics", description: "Run configured project typecheck, lint, test, or build diagnostics inside the workspace.", inputSchema: inputSchemas.project_diagnostics, source: "builtin", risk: "low", requiresSandbox: true, requiresExecutor: true, defaultApproval: "allow", approvalMode: "allow" },
+  { id: "generate_image", name: "generate_image", description: "Generate images with the selected provider's configured image model. This uses a paid network API and always requires approval.", inputSchema: inputSchemas.generate_image, source: "builtin", risk: "high", requiresSandbox: false, defaultApproval: "ask", approvalMode: "ask" },
   { id: "record_learning", name: "record_learning", description: "Save a verified reusable lesson to this project's learning records. Never store credentials, personal data, raw logs, or unverified guesses.", inputSchema: inputSchemas.record_learning, source: "builtin", risk: "low", requiresSandbox: false, defaultApproval: "allow", approvalMode: "allow" },
   { id: "apply_patch", name: "apply_patch", description: "Patch an existing file using unified diff or exact oldText/newText replacement.", inputSchema: inputSchemas.apply_patch, source: "builtin", risk: "high", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "web_fetch", name: "web_fetch", description: "Fetch documentation or API references from a URL.", inputSchema: inputSchemas.web_fetch, source: "builtin", risk: "medium", requiresSandbox: false, defaultApproval: "ask", approvalMode: "ask" },
@@ -183,11 +234,14 @@ export const registeredTools: ToolDefinition[] = [
   { id: "write_process", name: "write_process", description: "Write input to a running managed process session.", inputSchema: inputSchemas.write_process, source: "builtin", risk: "medium", requiresSandbox: true, defaultApproval: "ask", approvalMode: "ask" },
   { id: "stop_process", name: "stop_process", description: "Stop a managed process session and its child process tree.", inputSchema: inputSchemas.stop_process, source: "builtin", risk: "medium", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "list_processes", name: "list_processes", description: "List managed process sessions for the current project.", inputSchema: inputSchemas.list_processes, source: "builtin", risk: "low", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
+  { id: "docker_compose", name: "docker_compose", description: "Inspect or control Docker Compose with structured arguments and approval for mutations.", inputSchema: inputSchemas.docker_compose, source: "builtin", risk: "high", requiresSandbox: true, requiresExecutor: true, defaultApproval: "ask", approvalMode: "ask" },
+  { id: "sqlite_query", name: "sqlite_query", description: "Query a workspace SQLite database; reads are automatic and mutations require approval.", inputSchema: inputSchemas.sqlite_query, source: "builtin", risk: "high", requiresSandbox: true, defaultApproval: "ask", approvalMode: "ask" },
   { id: "git_status", name: "git_status", description: "Show git status for the workspace.", inputSchema: inputSchemas.git_status, source: "builtin", risk: "low", requiresSandbox: true, requiresExecutor: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "git_diff", name: "git_diff", description: "Show git diff for the workspace.", inputSchema: inputSchemas.git_diff, source: "builtin", risk: "low", requiresSandbox: true, requiresExecutor: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "git_branch", name: "git_branch", description: "Create or switch a git branch in the workspace.", inputSchema: inputSchemas.git_branch, source: "builtin", risk: "medium", requiresSandbox: true, requiresExecutor: true, defaultApproval: "ask", approvalMode: "ask" },
   { id: "git_stage", name: "git_stage", description: "Stage selected workspace paths for commit.", inputSchema: inputSchemas.git_stage, source: "builtin", risk: "medium", requiresSandbox: true, requiresExecutor: true, defaultApproval: "ask", approvalMode: "ask" },
-  { id: "git_commit", name: "git_commit", description: "Create a git commit with the staged changes.", inputSchema: inputSchemas.git_commit, source: "builtin", risk: "high", requiresSandbox: true, requiresExecutor: true, defaultApproval: "ask", approvalMode: "ask" }
+  { id: "git_commit", name: "git_commit", description: "Create a git commit with the staged changes.", inputSchema: inputSchemas.git_commit, source: "builtin", risk: "high", requiresSandbox: true, requiresExecutor: true, defaultApproval: "ask", approvalMode: "ask" },
+  { id: "git_push", name: "git_push", description: "Push a branch to a Git remote after explicit approval.", inputSchema: inputSchemas.git_push, source: "builtin", risk: "high", requiresSandbox: true, requiresExecutor: true, defaultApproval: "ask", approvalMode: "ask" }
 ];
 
 export async function getRegisteredTools(projectPath?: string): Promise<ToolDefinition[]> {
@@ -318,6 +372,29 @@ function executorOutput(result: ExecutorResult) {
   return [result.stdout, result.stderr].filter(Boolean).join("\n");
 }
 
+function isReadOnlySql(query: string) {
+  return /^(select|pragma\b(?![\s\S]*=)|explain|with\b[\s\S]*\bselect\b)/i.test(query.trim());
+}
+
+async function diagnosticCommand(cwd: string, kind: string) {
+  const packageJsonPath = path.join(cwd, "package.json");
+  if (!existsSync(packageJsonPath)) throw new Error("project_diagnostics currently requires a package.json in the selected directory");
+  const packageJson = JSON.parse(await readFile(packageJsonPath, "utf8")) as { scripts?: Record<string, string> };
+  const scripts = packageJson.scripts ?? {};
+  const requested = kind === "all" ? ["typecheck", "lint", "test", "build"] : [kind];
+  const available = requested.filter((name) => typeof scripts[name] === "string");
+  if (available.length === 0) {
+    throw new Error(`No matching package script found for diagnostics: ${requested.join(", ")}`);
+  }
+  return available.map((name) => `npm run ${name}`).join(" && ");
+}
+
+function getStringArray(value: unknown, field: string) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw new Error(`${field} must be an array of strings`);
+  return value as string[];
+}
+
 function buildExecutorToolResult(
   call: ToolCall,
   executorResult: ExecutorResult,
@@ -338,7 +415,7 @@ function buildExecutorToolResult(
   };
 }
 
-export async function executeTool(call: ToolCall, projectPath?: string, context?: { conversationId?: string; permissionEffect?: string; permissionReason?: string }): Promise<ToolResult> {
+export async function executeTool(call: ToolCall, projectPath?: string, context?: { conversationId?: string; permissionEffect?: string; permissionReason?: string; providerId?: string }): Promise<ToolResult> {
   const startedAt = Date.now();
   let auditEventId: string | undefined;
   let exitCode: number | undefined;
@@ -433,6 +510,29 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
       const dir = await assertPathInsideWorkspace(call.arguments.path ?? ".", projectPath);
       const tree = await inspectTree(dir.canonicalPath, Math.min(getNumber(call.arguments.depth, 2), 5));
       result = { toolCallId: call.id, name: call.name, ok: true, content: tree.slice(0, 12000) };
+    } else if (call.name === "project_diagnostics") {
+      const cwd = call.arguments.cwd ? (await assertPathInsideWorkspace(call.arguments.cwd, projectPath)).canonicalPath : getWorkspaceRoot(projectPath);
+      const kind = typeof call.arguments.kind === "string" ? call.arguments.kind : "typecheck";
+      const command = await diagnosticCommand(cwd, kind);
+      executorResult = await portableExecutor.run({ command, cwd, projectPath });
+      exitCode = executorResult.exitCode;
+      result = buildExecutorToolResult(call, executorResult, context);
+    } else if (call.name === "generate_image") {
+      const generated = await generateImage({
+        prompt: getString(call.arguments.prompt, "prompt"),
+        providerId: context?.providerId,
+        model: typeof call.arguments.model === "string" ? call.arguments.model : undefined,
+        size: typeof call.arguments.size === "string" ? call.arguments.size as ImageSize : undefined,
+        quality: typeof call.arguments.quality === "string" ? call.arguments.quality as ImageQuality : undefined,
+        count: getNumber(call.arguments.count, 1)
+      });
+      result = {
+        toolCallId: call.id,
+        name: call.name,
+        ok: true,
+        content: `Generated ${generated.attachments.length} image(s) with ${generated.model}.`,
+        attachments: generated.attachments
+      };
     } else if (call.name === "record_learning") {
       const record = saveLearningRecord({
         projectPath: getWorkspaceRoot(projectPath),
@@ -463,7 +563,7 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
       const command = getString(call.arguments.command, "command");
       const analysis = await analyzeShellCommand(command, call.arguments.cwd, projectPath);
       if (analysis.blockedReason) throw new Error(analysis.blockedReason);
-      executorResult = await portableExecutor.run({ command, cwd: analysis.cwd, projectPath });
+      executorResult = await portableExecutor.run({ command, cwd: analysis.cwd, projectPath, secretRefs: call.arguments.secretRefs });
       exitCode = executorResult.exitCode;
       result = buildExecutorToolResult(call, executorResult, context);
     } else if (call.name === "start_process") {
@@ -476,7 +576,8 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         cwd: call.arguments.cwd,
         projectPath,
         label: typeof call.arguments.label === "string" ? call.arguments.label : undefined,
-        startupWaitMs: getNumber(call.arguments.startupWaitMs, 700)
+        startupWaitMs: getNumber(call.arguments.startupWaitMs, 700),
+        secretRefs: call.arguments.secretRefs
       });
       result = {
         toolCallId: call.id,
@@ -513,13 +614,44 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         ok: true,
         content: processes.length ? processes.map((process) => formatProcess({ ...process, output: process.output.slice(-2_000) })).join("\n\n---\n\n") : "No managed processes for this project."
       };
+    } else if (call.name === "docker_compose") {
+      const cwd = call.arguments.cwd ? (await assertPathInsideWorkspace(call.arguments.cwd, projectPath)).canonicalPath : getWorkspaceRoot(projectPath);
+      const action = getString(call.arguments.action, "action");
+      const allowedActions = new Set(["config", "ps", "logs", "build", "pull", "up", "down", "restart"]);
+      if (!allowedActions.has(action)) throw new Error(`Unsupported Docker Compose action: ${action}`);
+      const services = getStringArray(call.arguments.services, "services");
+      const serviceArgs = services.map(shellQuote).join(" ");
+      const tail = Math.max(1, Math.min(getNumber(call.arguments.tail, 200), 2_000));
+      const actionArgs = action === "logs" ? `logs --no-color --tail ${tail}` : action === "up" ? "up --detach" : action;
+      const command = `docker compose ${actionArgs}${serviceArgs ? ` ${serviceArgs}` : ""}`;
+      executorResult = await portableExecutor.run({ command, cwd, projectPath });
+      exitCode = executorResult.exitCode;
+      result = buildExecutorToolResult(call, executorResult, context);
+    } else if (call.name === "sqlite_query") {
+      const databasePath = await assertNotSymlinkEscape(call.arguments.path, projectPath);
+      const query = getString(call.arguments.query, "query").trim();
+      if (!query) throw new Error("query is required");
+      const readOnly = isReadOnlySql(query);
+      const database = new DatabaseSync(databasePath.canonicalPath, { readOnly });
+      try {
+        if (readOnly) {
+          const rows = database.prepare(query).all();
+          const content = JSON.stringify(rows, (_key, value) => typeof value === "bigint" ? value.toString() : value, 2);
+          result = { toolCallId: call.id, name: call.name, ok: true, content: content.slice(0, 12000) };
+        } else {
+          database.exec(query);
+          result = { toolCallId: call.id, name: call.name, ok: true, content: "SQLite statement executed successfully." };
+        }
+      } finally {
+        database.close();
+      }
     } else if (call.name === "git_status" || call.name === "git_diff") {
       const cwd = call.arguments.cwd ? (await assertPathInsideWorkspace(call.arguments.cwd, projectPath)).canonicalPath : getWorkspaceRoot(projectPath);
       const command = call.name === "git_status" ? "git status --short --branch" : `git diff ${call.arguments.staged ? "--staged" : ""}`;
       executorResult = await portableExecutor.run({ command, cwd, projectPath });
       exitCode = executorResult.exitCode;
       result = buildExecutorToolResult(call, executorResult, context);
-    } else if (call.name === "git_branch" || call.name === "git_stage" || call.name === "git_commit") {
+    } else if (call.name === "git_branch" || call.name === "git_stage" || call.name === "git_commit" || call.name === "git_push") {
       const cwd = call.arguments.cwd ? (await assertPathInsideWorkspace(call.arguments.cwd, projectPath)).canonicalPath : getWorkspaceRoot(projectPath);
       let command: string;
       if (call.name === "git_branch") {
@@ -530,8 +662,12 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         if (paths.length === 0) throw new Error("paths is required");
         for (const item of paths) await assertPathInsideWorkspace(item, projectPath);
         command = `git add -- ${paths.map(shellQuote).join(" ")}`;
-      } else {
+      } else if (call.name === "git_commit") {
         command = `git commit -m ${shellQuote(getString(call.arguments.message, "message"))}`;
+      } else {
+        const remote = shellQuote(typeof call.arguments.remote === "string" ? call.arguments.remote : "origin");
+        const branch = typeof call.arguments.branch === "string" ? ` ${shellQuote(call.arguments.branch)}` : "";
+        command = `git push${call.arguments.setUpstream ? " --set-upstream" : ""} ${remote}${branch}`;
       }
       executorResult = await portableExecutor.run({ command, cwd, projectPath });
       exitCode = executorResult.exitCode;

@@ -28,11 +28,19 @@ dangerous_commands_require_approval = true
 workspace_only = true
 blocked = [
   "rm -rf /",
-  "sudo rm",
   "diskutil erase",
   "mkfs",
   "shutdown",
   "reboot"
+]
+
+# 密钥值只保存在本机 .env.local / 启动环境中。Agent 只能请求这里列出的变量名，
+# 每次注入都需审批，工具输出还会按实际值自动脱敏。
+[secrets]
+allowed_env = [
+  "GITHUB_PERSONAL_ACCESS_TOKEN",
+  "CLOUDFLARE_API_TOKEN",
+  "DATABASE_URL"
 ]
 
 [[tools]]
@@ -48,6 +56,26 @@ enabled = true
 [[tools]]
 name = "web_fetch"
 risk = "medium"
+enabled = true
+
+[[tools]]
+name = "project_diagnostics"
+risk = "low"
+enabled = true
+
+[[tools]]
+name = "docker_compose"
+risk = "high"
+enabled = true
+
+[[tools]]
+name = "sqlite_query"
+risk = "high"
+enabled = true
+
+[[tools]]
+name = "git_push"
+risk = "high"
 enabled = true
 
 [[tools]]

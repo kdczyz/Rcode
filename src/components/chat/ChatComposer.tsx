@@ -9,6 +9,7 @@ export interface ComposerAttachment {
   size: number;
   kind: "image" | "file";
   dataUrl?: string;
+  url?: string;
   text?: string;
 }
 
@@ -26,6 +27,8 @@ interface ChatComposerProps {
   modelName: string;
   modelOptions: string[];
   modelMenuOpen: boolean;
+  imageMode: boolean;
+  imageGenerationAvailable: boolean;
   thinkingMode: ThinkingMode;
   permissionMode: PermissionMode;
   permissionOptions: PermissionOption[];
@@ -44,6 +47,7 @@ interface ChatComposerProps {
   onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onToggleModelMenu: () => void;
   onSelectModel: (model: string) => void;
+  onToggleImageMode: () => void;
   onThinkingModeChange: (mode: ThinkingMode) => void;
   onTogglePermissionMenu: () => void;
   onSelectPermission: (mode: PermissionMode) => void;
@@ -53,10 +57,10 @@ interface ChatComposerProps {
   onStopManagedProcess: (processId: string) => Promise<void>;
 }
 
-const thinkingOptions: Array<{ id: ThinkingMode; label: string }> = [
-  { id: "fast", label: "快速" },
-  { id: "balanced", label: "标准" },
-  { id: "deep", label: "深度" }
+const thinkingOptions: Array<{ id: ThinkingMode; label: string; description: string }> = [
+  { id: "fast", label: "快速", description: "关闭或降低模型原生推理，优先响应速度" },
+  { id: "balanced", label: "标准", description: "使用中等或模型默认推理，平衡质量与速度" },
+  { id: "deep", label: "深度", description: "请求最高可用推理强度，可能增加耗时与 token" }
 ];
 
 const maxAttachmentCount = 8;
@@ -123,13 +127,32 @@ export function ChatComposer(props: ChatComposerProps) {
   const models = props.modelOptions.length > 0 ? props.modelOptions : [props.modelName];
   const isPlanMode = props.permissionMode === "plan";
   const processPickerRef = useRef<HTMLDivElement>(null);
+  const thinkingPickerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [stoppingProcessIds, setStoppingProcessIds] = useState<Set<string>>(() => new Set());
   const [processActionError, setProcessActionError] = useState("");
   const [isRefreshingProcesses, setIsRefreshingProcesses] = useState(false);
   const [attachmentError, setAttachmentError] = useState("");
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  const [thinkingMenuOpen, setThinkingMenuOpen] = useState(false);
   const runningProcessCount = props.managedProcesses.filter((process) => process.status === "running").length;
+  const selectedThinkingOption = thinkingOptions.find((option) => option.id === props.thinkingMode) ?? thinkingOptions[1];
+
+  useEffect(() => {
+    if (!thinkingMenuOpen) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!thinkingPickerRef.current?.contains(event.target as Node)) setThinkingMenuOpen(false);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setThinkingMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [thinkingMenuOpen]);
 
   useEffect(() => {
     if (!props.managedProcessPanelOpen) return;
@@ -279,7 +302,7 @@ export function ChatComposer(props: ChatComposerProps) {
           onChange={(event: ChangeEvent<HTMLTextAreaElement>) => props.onPromptChange(event.target.value)}
           onKeyDown={props.onKeyDown}
           onPaste={handlePaste}
-          placeholder={isPlanMode ? "描述目标，我会先检查上下文并给出可执行计划" : "描述任务，或输入 / 查看可用命令"}
+          placeholder={props.imageMode ? "描述你想生成的画面、风格、构图和文字" : isPlanMode ? "描述目标，我会先检查上下文并给出可执行计划" : "描述任务，或输入 / 查看可用命令"}
           rows={1}
         />
         <button className={`sendButton ${props.isRunning ? "stopping" : ""}`} type="button" onClick={props.onSend} disabled={!props.isRunning && !props.prompt.trim() && props.attachments.length === 0} aria-label={props.isRunning ? "停止回复" : "发送"}>
@@ -303,6 +326,16 @@ export function ChatComposer(props: ChatComposerProps) {
             <Paperclip size={14} />
             <span>附件</span>
           </button>
+          <button
+            className={`attachmentPickerButton ${props.imageMode ? "active" : ""}`}
+            type="button"
+            onClick={props.onToggleImageMode}
+            disabled={!props.imageGenerationAvailable || props.isRunning}
+            title={props.imageGenerationAvailable ? "切换文本对话与图片生成" : "请先在当前 AI 接口中配置图片模型"}
+          >
+            <Image size={14} />
+            <span>{props.imageMode ? "生图中" : "生图"}</span>
+          </button>
           <div className="modelPicker">
             <button className="modelPickerButton" type="button" onClick={props.onToggleModelMenu}><span>{props.modelName}</span><ChevronDown size={14} /></button>
             {props.modelMenuOpen && (
@@ -311,12 +344,45 @@ export function ChatComposer(props: ChatComposerProps) {
               </div>
             )}
           </div>
-          <label className="thinkingMode">
-            <Brain size={14} />
-            <select value={props.thinkingMode} onChange={(event) => props.onThinkingModeChange(event.target.value as ThinkingMode)}>
-              {thinkingOptions.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
-            </select>
-          </label>
+          <div className="thinkingPicker" ref={thinkingPickerRef}>
+            <button
+              className={`thinkingMode ${thinkingMenuOpen ? "active" : ""}`}
+              type="button"
+              aria-expanded={thinkingMenuOpen}
+              aria-haspopup="listbox"
+              title={selectedThinkingOption.description}
+              onClick={() => setThinkingMenuOpen((open) => !open)}
+            >
+              <Brain size={14} />
+              <span>{selectedThinkingOption.label}</span>
+              <ChevronDown size={12} />
+            </button>
+            {thinkingMenuOpen && (
+              <div className="thinkingMenu" role="listbox" aria-label="思考模式">
+                <header>
+                  <strong>思考模式</strong>
+                  <span>按当前模型与接口转换为真实推理参数</span>
+                </header>
+                {thinkingOptions.map((item) => (
+                  <button
+                    className={item.id === props.thinkingMode ? "active" : ""}
+                    key={item.id}
+                    type="button"
+                    role="option"
+                    aria-selected={item.id === props.thinkingMode}
+                    onClick={() => {
+                      props.onThinkingModeChange(item.id);
+                      setThinkingMenuOpen(false);
+                    }}
+                  >
+                    <span><strong>{item.label}</strong><small>{item.description}</small></span>
+                    {item.id === props.thinkingMode && <Check size={15} />}
+                  </button>
+                ))}
+                <footer>回复统计会标明原生直连、中转转换或提示兼容。</footer>
+              </div>
+            )}
+          </div>
           <div className="managedProcessPicker" ref={processPickerRef}>
             <button
               className={`managedProcessButton ${props.managedProcessPanelOpen ? "active" : ""}`}
@@ -404,7 +470,7 @@ export function ChatComposer(props: ChatComposerProps) {
           {props.queueLength > 0 && <span className="queueBadge">队列 {props.queueLength}</span>}
         </div>
         <div className="composerActions">
-          <span className={`composerHint ${attachmentError ? "error" : ""}`}>{attachmentError || "Enter 发送 · 可粘贴图片或文件"}</span>
+          <span className={`composerHint ${attachmentError ? "error" : ""}`}>{attachmentError || (props.imageMode ? "Enter 生成 · 图片会保存到本机" : "Enter 发送 · 可粘贴图片或文件")}</span>
           <div className="permissionPicker">
             <button className="permissionModeButton" type="button" title={props.selectedPermission.description} onClick={props.onTogglePermissionMenu}>
               <span>{props.selectedPermission.label}</span><ChevronDown size={14} />

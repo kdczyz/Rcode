@@ -4,7 +4,10 @@ import test from "node:test";
 test("learning records are deduplicated, updated, and reject credentials", async () => {
   process.env.LOCAL_DATABASE_PATH = `/tmp/rcode-learning-db-${process.pid}-${Date.now()}.sqlite`;
   const {
+    appendConversationMessage,
     deleteLearningRecord,
+    getConversationById,
+    getOrCreateConversation,
     getAgentUsageSummary,
     listLearningRecords,
     recordAgentUsageEvent,
@@ -35,6 +38,20 @@ test("learning records are deduplicated, updated, and reject credentials", async
   });
 
   try {
+    const conversation = getOrCreateConversation({ projectPath });
+    appendConversationMessage(conversation.id, {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: "tool-1", name: "read_file", arguments: { path: "README.md" } }],
+      reasoningContent: "provider-private-reasoning-context",
+      reasoningDetails: [{ type: "reasoning.text", text: "structured-reasoning-context", id: "reasoning-1" }]
+    });
+    const storedMessage = getConversationById(conversation.id)?.messages[0];
+    assert.equal(storedMessage?.reasoningContent, "provider-private-reasoning-context");
+    assert.deepEqual(storedMessage?.reasoningDetails, [
+      { type: "reasoning.text", text: "structured-reasoning-context", id: "reasoning-1" }
+    ]);
+
     assert.equal(duplicate.id, first.id);
     const records = listLearningRecords(projectPath);
     assert.equal(records.length, 1);

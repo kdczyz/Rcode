@@ -79,9 +79,13 @@ const toolNames: Record<string, string> = {
   stop_process: "停止进程",
   list_processes: "查看进程",
   search_text: "搜索代码",
+  project_diagnostics: "项目诊断",
   list_files: "浏览目录",
   inspect_tree: "检查目录",
   web_fetch: "获取网页",
+  docker_compose: "Docker Compose",
+  sqlite_query: "SQLite 查询",
+  git_push: "推送代码",
   git_status: "检查状态",
   git_diff: "查看差异"
 };

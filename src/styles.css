@@ -2627,6 +2627,31 @@ h2 {
   font-weight: var(--weight-semibold);
 }
 
+.responseReasoning {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 999px;
+  padding: 2px 6px;
+  color: var(--muted);
+  background: var(--surface-2);
+  white-space: nowrap;
+}
+
+.responseReasoning.native,
+.responseReasoning.direct {
+  color: color-mix(in srgb, var(--text) 76%, var(--muted));
+}
+
+.responseReasoning.gateway {
+  color: color-mix(in srgb, var(--accent) 72%, var(--text));
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface-2));
+}
+
+.responseReasoning.fallback {
+  color: var(--warning, #b7791f);
+}
+
 .responseMetric {
   position: relative;
   white-space: nowrap;
@@ -2952,14 +2977,96 @@ h2 {
   padding: 0 7px;
 }
 
-.thinkingMode select {
-  appearance: none;
-  border: 0;
-  color: inherit;
-  background: transparent;
+.thinkingMode {
   font: inherit;
   font-weight: var(--weight-semibold);
-  outline: none;
+}
+
+.thinkingMode.active {
+  border-color: var(--border);
+  color: var(--text);
+  background: var(--surface-3);
+}
+
+.thinkingPicker {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.thinkingMenu {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  z-index: 12;
+  display: grid;
+  width: min(340px, calc(100vw - 32px));
+  overflow: hidden;
+  border: var(--glass-border);
+  border-radius: 12px;
+  padding: 6px;
+  color: var(--text);
+  background: var(--surface-2);
+  box-shadow: var(--glass-shadow-lg);
+  animation: menuReveal 0.2s var(--ease-out-expo) both;
+}
+
+.thinkingMenu header {
+  display: grid;
+  gap: 2px;
+  padding: 8px 9px 9px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.thinkingMenu header strong {
+  font-size: 12px;
+}
+
+.thinkingMenu header span,
+.thinkingMenu footer {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.thinkingMenu > button {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+  border: 0;
+  border-radius: 8px;
+  padding: 7px 9px;
+  color: var(--muted);
+  text-align: left;
+  background: transparent;
+}
+
+.thinkingMenu > button > span {
+  display: grid;
+  gap: 3px;
+}
+
+.thinkingMenu > button strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.thinkingMenu > button small {
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.thinkingMenu > button:hover,
+.thinkingMenu > button.active {
+  color: var(--selected-text);
+  background: var(--selected);
+}
+
+.thinkingMenu footer {
+  margin-top: 3px;
+  padding: 7px 9px 5px;
+  border-top: 1px solid var(--border-soft);
 }
 
 .permissionPicker {
@@ -9519,6 +9626,12 @@ strong.streaming {
   border-color: var(--border);
   color: var(--text);
   background: var(--surface-3);
+}
+
+.attachmentPickerButton.active {
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--border));
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface-2));
 }
 
 .composerHint.error { color: color-mix(in srgb, var(--danger) 82%, var(--text)); }

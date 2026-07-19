@@ -1,5 +1,6 @@
 import { authenticate, createPasswordRecord, createSession, publicUser, randomToken, sha256, validateRegistration, verifyPassword } from "./auth";
 import { corsHeaders, HttpError, json, logError, readJsonObject, requiredString } from "./http";
+import { deleteWorkAiConfig, discoverWorkAiModels, getWorkAiConfig, saveWorkAiConfig, workChat, workGenerateImage } from "./work-ai";
 export { RemoteRoom } from "./remote-room";
 
 interface LoginUserRow {
@@ -139,12 +140,18 @@ async function route(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
   if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
-    return json({ service: "rcode-remote-server", status: "ok", version: "0.1.0" });
+    return json({ service: "rcode-remote-server", status: "ok", version: "0.5.0" });
   }
   if (request.method === "POST" && url.pathname === "/v1/auth/register") return register(request, env);
   if (request.method === "POST" && url.pathname === "/v1/auth/login") return login(request, env);
   if (request.method === "GET" && url.pathname === "/v1/auth/me") return me(request, env);
   if (request.method === "POST" && url.pathname === "/v1/auth/logout") return logout(request, env);
+  if (request.method === "GET" && url.pathname === "/v1/work/ai-config") return getWorkAiConfig(request, env);
+  if (request.method === "PUT" && url.pathname === "/v1/work/ai-config") return saveWorkAiConfig(request, env);
+  if (request.method === "DELETE" && url.pathname === "/v1/work/ai-config") return deleteWorkAiConfig(request, env);
+  if (request.method === "POST" && url.pathname === "/v1/work/ai-discover") return discoverWorkAiModels(request, env);
+  if (request.method === "POST" && url.pathname === "/v1/work/chat") return workChat(request, env);
+  if (request.method === "POST" && url.pathname === "/v1/work/images") return workGenerateImage(request, env);
   if (request.method === "POST" && url.pathname === "/v1/remote/ticket") return createTicket(request, env);
   if (request.method === "GET" && url.pathname === "/v1/remote/connect") return connect(request, env);
   throw new HttpError(404, "接口不存在", "not_found");

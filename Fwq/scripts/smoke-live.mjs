@@ -1,4 +1,4 @@
-const baseUrl = process.env.BASE_URL || "https://rcode-remote-server.kdczyz0728-994.workers.dev";
+const baseUrl = process.env.BASE_URL || "https://lxqandlzy.me";
 const smokeId = process.env.SMOKE_ID;
 
 if (!smokeId || !/^smoke_[0-9]+$/.test(smokeId)) {

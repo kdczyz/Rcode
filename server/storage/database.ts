@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { AgentAttachment, AgentMessage, LearningRunStatus, PendingApproval, PermissionRule, ToolCall, ToolResult } from "../shared/types";
+import type { AgentAttachment, AgentMessage, LearningRunStatus, PendingApproval, PermissionRule, ReasoningDialect, ToolCall } from "../shared/types";
 
 interface ConversationRow {
   id: string;
@@ -18,6 +18,8 @@ interface MessageRow {
   tool_call_id: string | null;
   tool_calls_json: string | null;
   attachments_json: string | null;
+  reasoning_content: string | null;
+  reasoning_details_json: string | null;
 }
 
 type UsageEventType = "prompt" | "ai_call";
@@ -188,10 +190,14 @@ export interface AiProviderConfig {
   apiKey?: string;
   apiKeyEnv?: string;
   chatCompletionsPath?: string;
+  imageGenerationPath?: string;
   modelsPath?: string;
   balancePath?: string;
   defaultModel: string;
   fallbackModels?: string[];
+  defaultImageModel?: string;
+  imageModels?: string[];
+  reasoningDialect?: ReasoningDialect;
   enabled: boolean;
   source?: "builtin" | "user";
 }
@@ -222,6 +228,8 @@ function getDatabase() {
       tool_call_id TEXT,
       tool_calls_json TEXT,
       attachments_json TEXT,
+      reasoning_content TEXT,
+      reasoning_details_json TEXT,
       created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS approvals (
@@ -388,6 +396,8 @@ function migrateDatabase(db: DatabaseSync) {
   tryExec(db, "DROP TABLE IF EXISTS users");
   tryExec(db, "ALTER TABLE approvals ADD COLUMN remaining_tool_queue_json TEXT");
   tryExec(db, "ALTER TABLE messages ADD COLUMN attachments_json TEXT");
+  tryExec(db, "ALTER TABLE messages ADD COLUMN reasoning_content TEXT");
+  tryExec(db, "ALTER TABLE messages ADD COLUMN reasoning_details_json TEXT");
   tryExec(db, "ALTER TABLE approvals ADD COLUMN resume_input_json TEXT");
   tryExec(db, "ALTER TABLE approvals ADD COLUMN conversation_snapshot_id TEXT");
   tryExec(db, "ALTER TABLE audit_events ADD COLUMN executor_kind TEXT");
@@ -464,7 +474,7 @@ export function getOrCreateConversation(input: {
   }
 
   const messageRows = db.prepare(`
-    SELECT role, content, tool_call_id, tool_calls_json, attachments_json
+    SELECT role, content, tool_call_id, tool_calls_json, attachments_json, reasoning_content, reasoning_details_json
     FROM messages
     WHERE conversation_id = ?
     ORDER BY id ASC
@@ -494,7 +504,9 @@ export function getOrCreateConversation(input: {
       content: message.content,
       toolCallId: message.tool_call_id ?? undefined,
       toolCalls: jsonParse<ToolCall[] | undefined>(message.tool_calls_json, undefined),
-      attachments: jsonParse<AgentAttachment[] | undefined>(message.attachments_json, undefined)
+      attachments: jsonParse<AgentAttachment[] | undefined>(message.attachments_json, undefined),
+      reasoningContent: message.reasoning_content ?? undefined,
+      reasoningDetails: jsonParse<Array<Record<string, unknown>> | undefined>(message.reasoning_details_json, undefined)
     })),
     pendingApprovals: approvals.map((approval) => ({
       id: approval.id,
@@ -536,8 +548,8 @@ export function appendConversationMessage(conversationId: string, message: Agent
   const db = getDatabase();
   const now = new Date().toISOString();
   db.prepare(`
-    INSERT INTO messages (conversation_id, role, content, tool_call_id, tool_calls_json, attachments_json, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO messages (conversation_id, role, content, tool_call_id, tool_calls_json, attachments_json, reasoning_content, reasoning_details_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     conversationId,
     message.role,
@@ -545,6 +557,8 @@ export function appendConversationMessage(conversationId: string, message: Agent
     message.toolCallId ?? null,
     message.toolCalls ? JSON.stringify(message.toolCalls) : null,
     message.attachments ? JSON.stringify(message.attachments) : null,
+    message.reasoningContent ?? null,
+    message.reasoningDetails ? JSON.stringify(message.reasoningDetails) : null,
     now
   );
   db.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?").run(now, conversationId);
@@ -937,7 +951,8 @@ export function saveUserAiProvider(config: AiProviderConfig) {
     type: "openai-compatible",
     displayName: config.displayName.trim() || config.id,
     baseUrl: config.baseUrl.trim().replace(/\/+$/, ""),
-    defaultModel: config.defaultModel.trim()
+    defaultModel: config.defaultModel.trim(),
+    reasoningDialect: config.reasoningDialect ?? "auto"
   };
   getDatabase().prepare(`
     INSERT OR REPLACE INTO ai_providers (id, display_name, config_json, enabled, updated_at)

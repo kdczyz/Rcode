@@ -8,6 +8,8 @@ const toolRisks: Record<BuiltinToolName, ToolRisk> = {
   list_files: "low",
   search_text: "low",
   inspect_tree: "low",
+  project_diagnostics: "low",
+  generate_image: "high",
   record_learning: "low",
   apply_patch: "high",
   web_fetch: "medium",
@@ -17,11 +19,14 @@ const toolRisks: Record<BuiltinToolName, ToolRisk> = {
   write_process: "medium",
   stop_process: "medium",
   list_processes: "low",
+  docker_compose: "high",
+  sqlite_query: "high",
   git_status: "low",
   git_diff: "low",
   git_branch: "medium",
   git_stage: "medium",
-  git_commit: "high"
+  git_commit: "high",
+  git_push: "high"
 };
 
 export function getToolRisk(toolName: AgentToolName): ToolRisk {

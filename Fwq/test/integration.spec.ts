@@ -1,5 +1,6 @@
 import { exports } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { env } from "cloudflare:test";
+import { describe, expect, it, vi } from "vitest";
 
 interface JsonMessage {
   type?: string;
@@ -42,6 +43,142 @@ function nextMessage(socket: WebSocket, type: string): Promise<JsonMessage> {
 }
 
 describe("Rcode remote server", () => {
+  it("encrypts per-user Work AI configuration and never returns the API key", async () => {
+    const register = await call("/v1/auth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        email: "work@example.com",
+        username: "work_user",
+        displayName: "Work User",
+        password: "StrongPass123"
+      })
+    });
+    expect(register.status).toBe(201);
+    const session = await responseJson(register);
+    const authorization = { authorization: `Bearer ${String(session.token)}`, "content-type": "application/json" };
+
+    const empty = await call("/v1/work/ai-config", { headers: authorization });
+    expect(await responseJson(empty)).toEqual({ configured: false, providers: [] });
+
+    const discoveryUpstream = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({
+      data: [{ id: "work-model" }, { id: "work-model-mini" }, { id: "work-model" }]
+    }), { headers: { "content-type": "application/json" } }));
+    const discovered = await call("/v1/work/ai-discover", {
+      method: "POST",
+      headers: authorization,
+      body: JSON.stringify({ baseUrl: "https://api.example.com/v1", apiKey: "sk-sensitive-test-key" })
+    });
+    expect(discovered.status).toBe(200);
+    const discoveredBody = await responseJson(discovered);
+    expect(discoveredBody).toMatchObject({
+      displayName: "example.com",
+      baseUrl: "https://api.example.com/v1",
+      chatCompletionsPath: "/chat/completions",
+      model: "work-model",
+      models: ["work-model", "work-model-mini"]
+    });
+    expect(String(discoveryUpstream.mock.calls[0]?.[0])).toBe("https://api.example.com/v1/models");
+    expect(JSON.stringify(discoveredBody)).not.toContain("sk-sensitive-test-key");
+    discoveryUpstream.mockRestore();
+
+    const saved = await call("/v1/work/ai-config", {
+      method: "PUT",
+      headers: authorization,
+      body: JSON.stringify({
+        providerId: "desktop-main",
+        displayName: "电脑接口",
+        baseUrl: "https://api.example.com/v1",
+        chatCompletionsPath: "/chat/completions",
+        imageGenerationPath: "/images/generations",
+        model: "work-model",
+        models: ["work-model", "work-model-mini"],
+        defaultImageModel: "gpt-image-test",
+        imageModels: ["gpt-image-test"],
+        apiKey: "sk-sensitive-test-key"
+      })
+    });
+    expect(saved.status).toBe(200);
+    const savedBody = await responseJson(saved);
+    expect(savedBody).toMatchObject({
+      configured: true,
+      selectedProviderId: "desktop-main",
+      displayName: "电脑接口",
+      model: "work-model",
+      models: ["work-model", "work-model-mini"],
+      defaultImageModel: "gpt-image-test",
+      imageModels: ["gpt-image-test"],
+      apiKeyPreview: "••••-key"
+    });
+    expect(savedBody.providers).toHaveLength(1);
+    expect(JSON.stringify(savedBody)).not.toContain("sk-sensitive-test-key");
+
+    const db = (env as unknown as { DB: D1Database }).DB;
+    const stored = await db.prepare("SELECT api_key_ciphertext FROM work_ai_providers LIMIT 1").first<{ api_key_ciphertext: string }>();
+    expect(stored?.api_key_ciphertext).toBeTruthy();
+    expect(stored?.api_key_ciphertext).not.toContain("sk-sensitive-test-key");
+
+    const upstream = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response([
+        'data: {"model":"work-model-mini","choices":[{"delta":{"content":"实时"}}]}',
+        '',
+        'data: {"choices":[{"delta":{"content":"回复"}}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}',
+        '',
+        'data: [DONE]',
+        ''
+      ].join("\n"), { headers: { "content-type": "text/event-stream" } }));
+    const streamed = await call("/v1/work/chat", {
+      method: "POST",
+      headers: authorization,
+      body: JSON.stringify({
+        providerId: "desktop-main",
+        model: "work-model-mini",
+        thinkingMode: "deep",
+        stream: true,
+        messages: [{ role: "user", content: "hello" }]
+      })
+    });
+    expect(streamed.status).toBe(200);
+    expect(streamed.headers.get("content-type")).toContain("text/event-stream");
+    const streamText = await streamed.text();
+    expect(streamText).toContain('"type":"delta","delta":"实时"');
+    expect(streamText).toContain('"type":"delta","delta":"回复"');
+    expect(streamText).toContain('"type":"done","model":"work-model-mini"');
+    const upstreamRequest = upstream.mock.calls[0]?.[1];
+    expect(String(upstreamRequest?.body)).toContain('"model":"work-model-mini"');
+    expect(String(upstreamRequest?.body)).toContain('"stream":true');
+    expect(String(upstreamRequest?.body)).toContain('"reasoning_effort":"high"');
+    upstream.mockRestore();
+
+    const encodedImage = btoa("generated-image-bytes");
+    const imageUpstream = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({
+      data: [{ b64_json: encodedImage, revised_prompt: "A test image" }]
+    }), { headers: { "content-type": "application/json" } }));
+    const generated = await call("/v1/work/images", {
+      method: "POST",
+      headers: authorization,
+      body: JSON.stringify({ providerId: "desktop-main", model: "gpt-image-test", prompt: "Draw a test image" })
+    });
+    expect(generated.status).toBe(200);
+    expect(await responseJson(generated)).toMatchObject({
+      providerId: "desktop-main",
+      model: "gpt-image-test",
+      images: [{ mimeType: "image/jpeg", dataUrl: `data:image/jpeg;base64,${encodedImage}`, revisedPrompt: "A test image" }]
+    });
+    expect(String(imageUpstream.mock.calls[0]?.[0])).toBe("https://api.example.com/v1/images/generations");
+    expect(String(imageUpstream.mock.calls[0]?.[1]?.body)).toContain('"output_format":"jpeg"');
+    imageUpstream.mockRestore();
+
+    const removed = await call("/v1/work/ai-config", { method: "DELETE", headers: authorization });
+    expect(await responseJson(removed)).toEqual({ configured: false, providers: [] });
+    const chat = await call("/v1/work/chat", {
+      method: "POST",
+      headers: authorization,
+      body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] })
+    });
+    expect(chat.status).toBe(409);
+    expect(await responseJson(chat)).toMatchObject({ code: "work_ai_not_configured" });
+  });
+
   it("handles auth and relays a complete controller-agent task", async () => {
     const health = await call("/health");
     expect(health.status).toBe(200);

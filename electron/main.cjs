@@ -18,7 +18,7 @@ let remoteSocket;
 let remoteReconnectTimer;
 let remoteHeartbeatTimer;
 let remoteConnectionWanted = false;
-let remoteProject = { path: undefined, name: undefined };
+let remoteWorkspace = { projects: [], models: [], defaultModel: undefined, activeProjectId: undefined };
 let remoteCommandRunning = false;
 const remoteCommandQueue = [];
 const receivedRemoteCommandIds = new Set();
@@ -26,7 +26,7 @@ const preferencesPath = () => path.join(app.getPath("userData"), "preferences.js
 const authSessionPath = () => path.join(app.getPath("userData"), "auth-session.bin");
 const githubMcpSessionPath = () => path.join(app.getPath("userData"), "github-mcp-oauth.bin");
 const remoteDevicePath = () => path.join(app.getPath("userData"), "remote-device.json");
-const authApiUrl = () => (process.env.RCODE_AUTH_API_URL || "https://rcode-remote-server.kdczyz0728-994.workers.dev").replace(/\/$/, "");
+const authApiUrl = () => (process.env.RCODE_AUTH_API_URL || "https://lxqandlzy.me").replace(/\/$/, "");
 const localAgentApiUrl = () => process.env.RCODE_LOCAL_API_URL || (isDev ? "http://127.0.0.1:8789" : "http://127.0.0.1:8787");
 const githubOauthCallbackPath = "/oauth/github/callback";
 
@@ -273,13 +273,126 @@ async function authRequest(pathname, options = {}) {
     if (!token) return undefined;
     headers.set("authorization", `Bearer ${token}`);
   }
-  const response = await fetch(`${authApiUrl()}${pathname}`, { method: options.method || "GET", headers, body: options.body ? JSON.stringify(options.body) : undefined });
+  const method = options.method || "GET";
+  const request = { method, headers, body: options.body ? JSON.stringify(options.body) : undefined };
+  const retryDelays = [0, 1_500, 4_000];
+  const attempts = ["GET", "PUT", "DELETE"].includes(method) ? retryDelays.length : 1;
+  let response;
+  let networkError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (retryDelays[attempt]) await new Promise((resolve) => setTimeout(resolve, retryDelays[attempt]));
+    try {
+      response = await fetch(`${authApiUrl()}${pathname}`, request);
+      break;
+    } catch (error) {
+      networkError = error;
+    }
+  }
+  if (!response) throw networkError ?? new Error("无法连接 Rcode 账号服务");
   const data = await response.json().catch(() => ({ error: "认证服务返回了无效响应" }));
   if (!response.ok) {
     if (response.status === 401) await clearAuthToken();
     throw new Error(typeof data.error === "string" ? data.error : "认证请求失败");
   }
   return data;
+}
+
+async function readLocalWorkAiSyncCandidate(providerId) {
+  const url = new URL(`${localAgentApiUrl()}/api/ai/providers/work-sync-candidate`);
+  if (providerId) url.searchParams.set("id", providerId);
+  const response = await fetch(url, { headers: { "x-agent-token": localApiToken } });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data?.provider) {
+    throw new Error(typeof data.error === "string" ? data.error : "无法读取电脑端 AI 接口");
+  }
+  return data.provider;
+}
+
+async function readLocalWorkAiSyncCandidates() {
+  const response = await fetch(`${localAgentApiUrl()}/api/ai/providers/work-sync-candidates`, {
+    headers: { "x-agent-token": localApiToken }
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !Array.isArray(data?.providers)) {
+    throw new Error(typeof data.error === "string" ? data.error : "无法读取电脑端 AI 接口列表");
+  }
+  return data.providers;
+}
+
+async function uploadWorkAiProvider(provider) {
+  return authRequest("/v1/work/ai-config", {
+    method: "PUT",
+    authenticated: true,
+    body: {
+      providerId: provider.providerId,
+      displayName: provider.displayName,
+      baseUrl: provider.baseUrl,
+      chatCompletionsPath: provider.chatCompletionsPath,
+      imageGenerationPath: provider.imageGenerationPath,
+      model: provider.model,
+      models: provider.models,
+      defaultImageModel: provider.defaultImageModel,
+      imageModels: provider.imageModels,
+      apiKey: provider.apiKey
+    }
+  });
+}
+
+async function syncWorkAiProvider(providerId) {
+  const token = await readAuthToken();
+  if (!token) throw new Error("请先登录 Rcode 账号再同步 Work 接口");
+  const provider = await readLocalWorkAiSyncCandidate(providerId);
+  const config = await uploadWorkAiProvider(provider);
+  return {
+    ok: true,
+    provider: { id: provider.providerId, displayName: provider.displayName, model: provider.model },
+    config
+  };
+}
+
+async function syncAllWorkAiProviders() {
+  const token = await readAuthToken();
+  if (!token) throw new Error("请先登录 Rcode 账号再同步聊天接口");
+  const providers = await readLocalWorkAiSyncCandidates();
+  if (!providers.length) {
+    const config = await authRequest("/v1/work/ai-config", { method: "DELETE", authenticated: true });
+    return { ok: true, providerCount: 0, modelCount: 0, providers: [], config };
+  }
+  let config;
+  for (const provider of providers) config = await uploadWorkAiProvider(provider);
+  const localIds = new Set(providers.map((provider) => provider.providerId));
+  const staleProviders = (Array.isArray(config?.providers) ? config.providers : [])
+    .filter((provider) => provider?.id && !localIds.has(provider.id));
+  for (const provider of staleProviders) {
+    config = await authRequest(`/v1/work/ai-config?providerId=${encodeURIComponent(provider.id)}`, {
+      method: "DELETE",
+      authenticated: true
+    });
+  }
+  return {
+    ok: true,
+    providerCount: providers.length,
+    modelCount: providers.reduce((total, provider) => total + (Array.isArray(provider.models) ? provider.models.length : 0), 0),
+    providers: providers.map((provider) => ({ id: provider.providerId, displayName: provider.displayName, model: provider.model })),
+    config
+  };
+}
+
+function syncAllWorkAiProvidersInBackground() {
+  void (async () => {
+    const retryDelays = [0, 3_000, 12_000];
+    let lastError;
+    for (const delay of retryDelays) {
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      try {
+        await syncAllWorkAiProviders();
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    console.warn("Shared AI provider sync unavailable after retries:", lastError instanceof Error ? lastError.message : lastError);
+  })();
 }
 
 async function remoteDeviceId() {
@@ -305,6 +418,19 @@ function sendRemote(value) {
   }
 }
 
+function publicRemoteWorkspace() {
+  return {
+    projects: remoteWorkspace.projects.map((project) => ({
+      id: project.id,
+      name: project.name,
+      sessions: project.sessions
+    })),
+    models: remoteWorkspace.models,
+    defaultModel: remoteWorkspace.defaultModel,
+    activeProjectId: remoteWorkspace.activeProjectId
+  };
+}
+
 function stopRemoteAgentConnection(clearWanted = true) {
   if (clearWanted) remoteConnectionWanted = false;
   clearTimeout(remoteReconnectTimer);
@@ -324,6 +450,9 @@ function scheduleRemoteReconnect(delayMs = 3_000) {
 
 function publicRemoteEvent(event) {
   if (!event || typeof event !== "object" || typeof event.type !== "string") return undefined;
+  if (event.type === "run_started") {
+    return { type: event.type, conversationId: typeof event.conversationId === "string" ? event.conversationId.slice(0, 256) : undefined };
+  }
   if (event.type === "workflow_state") {
     return { type: event.type, phase: event.phase, label: String(event.label || "电脑正在处理").slice(0, 240) };
   }
@@ -332,6 +461,59 @@ function publicRemoteEvent(event) {
   }
   if (event.type === "tool_call") {
     return { type: event.type, toolName: String(event.toolCall?.name || "未知工具").slice(0, 160) };
+  }
+  if (event.type === "tool_result") {
+    return {
+      type: event.type,
+      toolName: String(event.result?.name || "工具").slice(0, 160),
+      ok: event.result?.ok === true,
+      summary: typeof event.result?.summary === "string" ? event.result.summary.slice(0, 500) : undefined,
+      exitCode: typeof event.result?.exitCode === "number" ? event.result.exitCode : undefined
+    };
+  }
+  if (event.type === "task_plan") {
+    const steps = (Array.isArray(event.plan?.steps) ? event.plan.steps : []).slice(0, 30).map((step) => ({
+      id: String(step?.id || "").slice(0, 100),
+      title: String(step?.title || "任务步骤").slice(0, 240),
+      status: step?.status === "completed" || step?.status === "in_progress" ? step.status : "pending"
+    }));
+    return { type: event.type, summary: String(event.plan?.summary || "任务计划").slice(0, 500), stepCount: steps.length, steps };
+  }
+  if (event.type === "diff_created") {
+    const diffs = Array.isArray(event.diffs) ? event.diffs : [];
+    return {
+      type: event.type,
+      fileCount: diffs.length,
+      addedLines: diffs.reduce((total, diff) => total + (Number(diff?.addedLines) || 0), 0),
+      removedLines: diffs.reduce((total, diff) => total + (Number(diff?.removedLines) || 0), 0)
+    };
+  }
+  if (event.type === "billing_usage") {
+    return {
+      type: event.type,
+      totalTokens: Number(event.usage?.totalTokens) || 0,
+      promptTokens: Number(event.usage?.promptTokens) || 0,
+      completionTokens: Number(event.usage?.completionTokens) || 0,
+      model: String(event.model || "").slice(0, 160),
+      provider: String(event.provider || "").slice(0, 160)
+    };
+  }
+  if (event.type === "context_snapshot") {
+    return {
+      type: event.type,
+      budgetTokens: Number(event.snapshot?.budgetTokens) || 0,
+      estimatedTokens: Number(event.snapshot?.estimatedTokens) || 0,
+      messageCount: Number(event.snapshot?.messageCount) || 0,
+      activeSkillCount: Array.isArray(event.snapshot?.activeSkills) ? event.snapshot.activeSkills.length : 0
+    };
+  }
+  if (event.type === "learning_result") {
+    return {
+      type: event.type,
+      status: String(event.status || "skipped").slice(0, 40),
+      recordsSaved: Number(event.recordsSaved) || 0,
+      reason: String(event.reason || "").slice(0, 500)
+    };
   }
   if (event.type === "permission_decision") {
     return { type: event.type, effect: event.effect, reason: String(event.reason || "权限检查完成").slice(0, 1_000) };
@@ -344,11 +526,16 @@ function publicRemoteEvent(event) {
       approvalId: String(approval.id).slice(0, 160),
       reason: String(approval.reason || event.answer || "电脑请求执行受保护操作").slice(0, 2_000),
       risk: approval.risk === "high" || approval.risk === "medium" ? approval.risk : "low",
+      conversationId: typeof event.conversationId === "string" ? event.conversationId.slice(0, 256) : undefined,
       toolCall: approval.toolCall ? { name: String(approval.toolCall.name || "").slice(0, 160) } : undefined
     };
   }
   if (event.type === "completed") {
-    return { type: event.type, answer: String(event.answer || "任务已完成").slice(0, 12_000) };
+    return {
+      type: event.type,
+      answer: String(event.answer || "任务已完成").slice(0, 12_000),
+      conversationId: typeof event.conversationId === "string" ? event.conversationId.slice(0, 256) : undefined
+    };
   }
   if (event.type === "error") {
     return { type: event.type, message: String(event.message || "任务执行失败").slice(0, 2_000) };
@@ -360,18 +547,44 @@ async function consumeLocalAgentStream(command) {
   const payload = command?.payload && typeof command.payload === "object" ? command.payload : {};
   const action = command?.action;
   if (action !== "agent.run" && action !== "agent.approve") throw new Error("不支持的远程指令");
+  const requestedProjectId = typeof payload.projectId === "string" ? payload.projectId : "";
+  const project = remoteWorkspace.projects.find((item) => item.id === requestedProjectId)
+    || remoteWorkspace.projects.find((item) => item.id === remoteWorkspace.activeProjectId)
+    || remoteWorkspace.projects[0];
+  if (!project?.path) throw new Error("所选项目当前不可用，请在电脑端重新打开项目");
+  const requestedModel = typeof payload.model === "string" ? payload.model.trim() : "";
+  const providerId = typeof payload.providerId === "string" && /^[a-zA-Z0-9._:-]{1,100}$/.test(payload.providerId.trim())
+    ? payload.providerId.trim()
+    : undefined;
+  const model = requestedModel.slice(0, 160) || remoteWorkspace.defaultModel;
+  const mode = ["default", "plan", "workspace_write", "custom", "full_access"].includes(payload.mode)
+    ? payload.mode
+    : "workspace_write";
+  const thinkingMode = payload.thinkingMode === "fast" || payload.thinkingMode === "deep"
+    ? payload.thinkingMode
+    : "balanced";
+  const conversationId = typeof payload.conversationId === "string" && payload.conversationId.length <= 256
+    ? payload.conversationId
+    : undefined;
   const endpoint = action === "agent.run" ? "/api/agent/run" : "/api/agent/approve";
   const body = action === "agent.run"
     ? {
         prompt: String(payload.prompt || "").slice(0, 8_000),
-        mode: payload.mode === "plan" ? "plan" : "workspace_write",
-        projectPath: remoteProject.path
+        mode,
+        projectPath: project.path,
+        conversationId,
+        providerId,
+        model,
+        thinkingMode
       }
     : {
         approvalId: String(payload.approvalId || "").slice(0, 160),
         allow: payload.allow === true,
-        mode: "workspace_write",
-        projectPath: remoteProject.path
+        mode,
+        projectPath: project.path,
+        providerId,
+        model,
+        thinkingMode
       };
   if (action === "agent.run" && !body.prompt.trim()) throw new Error("远程任务内容为空");
   if (action === "agent.approve" && !body.approvalId) throw new Error("远程审批编号为空");
@@ -459,6 +672,8 @@ function queueRemoteCommand(command) {
 
 async function sendRemoteDeviceUpdate() {
   const serverReady = await waitForServer(1_500);
+  const activeProject = remoteWorkspace.projects.find((item) => item.id === remoteWorkspace.activeProjectId)
+    || remoteWorkspace.projects[0];
   sendRemote({
     type: "device.announce",
     device: {
@@ -466,8 +681,9 @@ async function sendRemoteDeviceUpdate() {
       name: os.hostname(),
       platform: process.platform,
       appVersion: app.getVersion(),
-      projectName: remoteProject.name,
-      ready: serverReady && Boolean(remoteProject.path)
+      projectName: activeProject?.name,
+      workspace: publicRemoteWorkspace(),
+      ready: serverReady && remoteWorkspace.projects.some((project) => Boolean(project.path))
     }
   });
 }
@@ -482,6 +698,8 @@ async function startRemoteAgentConnection() {
   }
   try {
     const serverReady = await waitForServer(4_000);
+    const activeProject = remoteWorkspace.projects.find((item) => item.id === remoteWorkspace.activeProjectId)
+      || remoteWorkspace.projects[0];
     const ticket = await authRequest("/v1/remote/ticket", {
       method: "POST",
       authenticated: true,
@@ -492,8 +710,9 @@ async function startRemoteAgentConnection() {
           name: os.hostname(),
           platform: process.platform,
           appVersion: app.getVersion(),
-          projectName: remoteProject.name,
-          ready: serverReady && Boolean(remoteProject.path)
+          projectName: activeProject?.name,
+          workspace: publicRemoteWorkspace(),
+          ready: serverReady && remoteWorkspace.projects.some((project) => Boolean(project.path))
         }
       }
     });
@@ -738,7 +957,10 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle("agent:auth-session", async () => {
     const session = await authRequest("/v1/auth/me", { authenticated: true });
-    if (session) void startRemoteAgentConnection();
+    if (session) {
+      void startRemoteAgentConnection();
+      syncAllWorkAiProvidersInBackground();
+    }
     return session;
   });
   ipcMain.handle("agent:auth-login", async (_event, details) => {
@@ -746,6 +968,7 @@ app.whenReady().then(async () => {
     if (!result?.token) throw new Error("认证服务未返回会话 Token");
     await writeAuthToken(result.token);
     void startRemoteAgentConnection();
+    syncAllWorkAiProvidersInBackground();
     return { user: result.user, expiresAt: result.expiresAt };
   });
   ipcMain.handle("agent:auth-register", async (_event, details) => {
@@ -753,6 +976,7 @@ app.whenReady().then(async () => {
     if (!result?.token) throw new Error("认证服务未返回会话 Token");
     await writeAuthToken(result.token);
     void startRemoteAgentConnection();
+    syncAllWorkAiProvidersInBackground();
     return { user: result.user, expiresAt: result.expiresAt };
   });
   ipcMain.handle("agent:auth-logout", async () => {
@@ -764,16 +988,59 @@ app.whenReady().then(async () => {
     }
     return { ok: true };
   });
+  ipcMain.handle("agent:sync-work-ai", async (_event, details) => {
+    const providerId = typeof details?.providerId === "string" ? details.providerId.trim().slice(0, 160) : undefined;
+    return syncWorkAiProvider(providerId);
+  });
+  ipcMain.handle("agent:sync-all-work-ai", async () => syncAllWorkAiProviders());
   ipcMain.handle("agent:remote-update-device", async (_event, details) => {
-    const projectPath = typeof details?.projectPath === "string" && path.isAbsolute(details.projectPath)
-      ? details.projectPath
-      : undefined;
-    remoteProject = {
-      path: projectPath,
-      name: typeof details?.projectName === "string" && details.projectName.trim()
-        ? details.projectName.trim().slice(0, 160)
-        : projectPath ? path.basename(projectPath) : undefined
+    const rawProjects = Array.isArray(details?.projects) ? details.projects : [];
+    const projects = rawProjects.slice(0, 50).flatMap((rawProject) => {
+      const projectPath = typeof rawProject?.path === "string" && path.isAbsolute(rawProject.path)
+        ? rawProject.path
+        : undefined;
+      const id = typeof rawProject?.id === "string" ? rawProject.id.slice(0, 128) : "";
+      if (!id || !projectPath) return [];
+      const sessions = (Array.isArray(rawProject.sessions) ? rawProject.sessions : []).slice(0, 30).flatMap((rawSession) => {
+        const sessionId = typeof rawSession?.id === "string" ? rawSession.id.slice(0, 128) : "";
+        if (!sessionId) return [];
+        return [{
+          id: sessionId,
+          title: typeof rawSession.title === "string" && rawSession.title.trim()
+            ? rawSession.title.trim().slice(0, 160)
+            : "新会话",
+          updatedAt: typeof rawSession.updatedAt === "string" ? rawSession.updatedAt.slice(0, 64) : new Date().toISOString(),
+          conversationId: typeof rawSession.conversationId === "string" ? rawSession.conversationId.slice(0, 256) : undefined
+        }];
+      });
+      return [{
+        id,
+        path: projectPath,
+        name: typeof rawProject.name === "string" && rawProject.name.trim()
+          ? rawProject.name.trim().slice(0, 160)
+          : path.basename(projectPath),
+        sessions
+      }];
+    });
+    const models = (Array.isArray(details?.models) ? details.models : [])
+      .filter((model) => typeof model === "string" && model.trim())
+      .map((model) => model.trim().slice(0, 160))
+      .slice(0, 60);
+    const requestedDefaultModel = typeof details?.defaultModel === "string" ? details.defaultModel.trim().slice(0, 160) : undefined;
+    remoteWorkspace = {
+      projects,
+      models: [...new Set(models)],
+      defaultModel: models.includes(requestedDefaultModel) ? requestedDefaultModel : models[0],
+      activeProjectId: typeof details?.activeProjectId === "string" ? details.activeProjectId.slice(0, 128) : undefined
     };
+    while (JSON.stringify(publicRemoteWorkspace()).length > 40 * 1024) {
+      const projectWithSessions = remoteWorkspace.projects
+        .filter((project) => project.sessions.length > 0)
+        .sort((left, right) => right.sessions.length - left.sessions.length)[0];
+      if (projectWithSessions) projectWithSessions.sessions.pop();
+      else if (remoteWorkspace.projects.length > 1) remoteWorkspace.projects.pop();
+      else break;
+    }
     await sendRemoteDeviceUpdate();
     return { ok: true };
   });

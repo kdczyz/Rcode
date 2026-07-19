@@ -7,7 +7,8 @@ export default defineConfig({
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
         bindings: {
-          TEST_MIGRATIONS: await readD1Migrations("./migrations")
+          TEST_MIGRATIONS: await readD1Migrations("./migrations"),
+          AI_CONFIG_SECRET: "test-only-ai-config-secret-with-32-bytes"
         }
       }
     }))

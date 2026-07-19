@@ -11,6 +11,8 @@ contextBridge.exposeInMainWorld("agentDesktop", {
   authLogin: (details) => ipcRenderer.invoke("agent:auth-login", details),
   authRegister: (details) => ipcRenderer.invoke("agent:auth-register", details),
   authLogout: () => ipcRenderer.invoke("agent:auth-logout"),
+  syncWorkAiProvider: (details) => ipcRenderer.invoke("agent:sync-work-ai", details),
+  syncAllWorkAiProviders: () => ipcRenderer.invoke("agent:sync-all-work-ai"),
   remoteUpdateDevice: (details) => ipcRenderer.invoke("agent:remote-update-device", details),
   getThemePreference: () => ipcRenderer.invoke("agent:get-theme-preference"),
   setThemePreference: (themePreference) => ipcRenderer.invoke("agent:set-theme-preference", themePreference),

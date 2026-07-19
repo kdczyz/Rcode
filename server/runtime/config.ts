@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { parse as parseToml } from "smol-toml";
-import type { AgentToolName, LegacyPermissionMode, PermissionMode, ToolRisk } from "../shared/types";
+import type { AgentToolName, LegacyPermissionMode, PermissionMode, ReasoningDialect, ToolRisk } from "../shared/types";
 import { getActiveAiProviderId, listUserAiProviders } from "../storage/database";
 
 export interface ProviderEntry {
@@ -11,10 +11,14 @@ export interface ProviderEntry {
   apiKey?: string;
   apiKeyEnv: string;
   chatCompletionsPath?: string;
+  imageGenerationPath?: string;
   modelsPath?: string;
   balancePath?: string;
   defaultModel: string;
   fallbackModels?: string[];
+  defaultImageModel?: string;
+  imageModels?: string[];
+  reasoningDialect?: ReasoningDialect;
   enabled?: boolean;
   source?: "builtin" | "user";
 }
@@ -56,6 +60,9 @@ interface AgentTomlConfig {
       blocked?: string[];
     };
   };
+  secrets?: {
+    allowed_env?: string[];
+  };
   tools?: ToolConfig[];
 }
 
@@ -81,6 +88,9 @@ export interface RuntimeConfig {
     accessibility: boolean;
     dangerousCommandsRequireApproval: boolean;
     blockedCommands: string[];
+  };
+  secrets: {
+    allowedEnv: string[];
   };
 }
 
@@ -118,10 +128,14 @@ function buildRuntimeConfig(): RuntimeConfig {
           apiKey: provider.apiKey,
           apiKeyEnv: provider.apiKeyEnv || "AI_API_KEY",
           chatCompletionsPath: provider.chatCompletionsPath,
+          imageGenerationPath: provider.imageGenerationPath,
           modelsPath: provider.modelsPath,
           balancePath: provider.balancePath,
           defaultModel: provider.defaultModel,
           fallbackModels: provider.fallbackModels,
+          defaultImageModel: provider.defaultImageModel,
+          imageModels: provider.imageModels,
+          reasoningDialect: provider.reasoningDialect,
           enabled: provider.enabled,
           source: "user" as const
         }
@@ -170,7 +184,8 @@ function buildRuntimeConfig(): RuntimeConfig {
         dangerousCommandsRequireApproval:
           agentConfig.computer_control?.dangerous_commands_require_approval ?? true,
         blockedCommands: agentConfig.computer_control?.command_policy?.blocked ?? []
-      }
+      },
+      secrets: { allowedEnv: agentConfig.secrets?.allowed_env ?? [] }
     };
   }
 
@@ -197,7 +212,8 @@ function buildRuntimeConfig(): RuntimeConfig {
       dangerousCommandsRequireApproval:
         agentConfig.computer_control?.dangerous_commands_require_approval ?? true,
       blockedCommands: agentConfig.computer_control?.command_policy?.blocked ?? []
-    }
+    },
+    secrets: { allowedEnv: agentConfig.secrets?.allowed_env ?? [] }
   };
 }
 

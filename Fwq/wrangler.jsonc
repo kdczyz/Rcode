@@ -2,8 +2,12 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "rcode-remote-server",
   "main": "src/index.ts",
-  "compatibility_date": "2026-07-10",
+  "compatibility_date": "2026-07-17",
   "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "routes": [
+    { "pattern": "lxqandlzy.me/*", "zone_name": "lxqandlzy.me" }
+  ],
   "observability": {
     "enabled": true,
     "logs": { "enabled": true, "head_sampling_rate": 1 },

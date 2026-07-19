@@ -15,11 +15,15 @@ export interface PermissionDecision {
 const managedRules: PermissionRule[] = [
   { id: "managed-deny-sensitive-env", effect: "deny", targetType: "path", pattern: "**/.env*", scope: "managed", enabled: true },
   { id: "managed-deny-ssh", effect: "deny", targetType: "path", pattern: "**/.ssh/**", scope: "managed", enabled: true },
+  { id: "managed-deny-keychains", effect: "deny", targetType: "path", pattern: "**/Library/Keychains/**", scope: "managed", enabled: true },
+  { id: "managed-deny-browser-passwords", effect: "deny", targetType: "path", pattern: "**/Library/Application Support/**/Login Data", scope: "managed", enabled: true },
   { id: "managed-ask-web", effect: "ask", targetType: "tool", pattern: "web_fetch", scope: "managed", enabled: true },
+  { id: "managed-ask-image-generation", effect: "ask", targetType: "tool", pattern: "generate_image", scope: "managed", enabled: true },
   { id: "managed-ask-shell-network", effect: "ask", targetType: "command", pattern: "curl", scope: "managed", enabled: true },
   { id: "managed-ask-git-branch", effect: "ask", targetType: "tool", pattern: "git_branch", scope: "managed", enabled: true },
   { id: "managed-ask-git-stage", effect: "ask", targetType: "tool", pattern: "git_stage", scope: "managed", enabled: true },
-  { id: "managed-ask-git-commit", effect: "ask", targetType: "tool", pattern: "git_commit", scope: "managed", enabled: true }
+  { id: "managed-ask-git-commit", effect: "ask", targetType: "tool", pattern: "git_commit", scope: "managed", enabled: true },
+  { id: "managed-ask-git-push", effect: "ask", targetType: "tool", pattern: "git_push", scope: "managed", enabled: true }
 ];
 
 const readOnlyComputerTools = new Set([
@@ -65,7 +69,7 @@ async function targetValuesForToolCall(toolCall: ToolCall, projectPath?: string)
     values.push({ targetType: "path", value: resolved.input });
   }
 
-  if (toolCall.name === "list_files" || toolCall.name === "search_text" || toolCall.name === "inspect_tree") {
+  if (toolCall.name === "list_files" || toolCall.name === "search_text" || toolCall.name === "inspect_tree" || toolCall.name === "sqlite_query") {
     const rawPath = toolCall.arguments.path ?? ".";
     const resolved = await resolveWorkspacePath(rawPath, projectPath);
     values.push({ targetType: "path", value: resolved.canonicalPath });
@@ -75,6 +79,12 @@ async function targetValuesForToolCall(toolCall: ToolCall, projectPath?: string)
   if (toolCall.name === "run_shell" || toolCall.name === "start_process") {
     const command = typeof toolCall.arguments.command === "string" ? toolCall.arguments.command : "";
     values.push({ targetType: "command", value: command });
+  }
+
+  if (toolCall.name === "project_diagnostics" || toolCall.name === "docker_compose" || toolCall.name.startsWith("git_")) {
+    const rawPath = toolCall.arguments.cwd ?? ".";
+    const resolved = await resolveWorkspacePath(rawPath, projectPath);
+    values.push({ targetType: "path", value: resolved.canonicalPath });
   }
 
   if (toolCall.name === "web_fetch") {
@@ -120,12 +130,25 @@ export async function evaluatePermission(
     requiresApproval: overrides.requiresApproval ?? effect === "ask"
   });
 
-  if (mode === "full_access") {
-    return decision("allow", "Full access mode allows this tool call.", { enforcement: "guarded", requiresApproval: false });
+  const values = await targetValuesForToolCall(toolCall, projectPath);
+  const matchedManagedDeny = resolveRule(managedRules.filter((rule) => rule.effect === "deny"), values);
+  if (matchedManagedDeny) {
+    return decision("deny", `${matchedManagedDeny.scope} rule ${matchedManagedDeny.id} matched ${matchedManagedDeny.targetType}:${matchedManagedDeny.pattern}`, {
+      matchedRule: matchedManagedDeny,
+      enforcement: "denied",
+      requiresApproval: false
+    });
+  }
+
+  for (const value of values.filter((item) => item.targetType === "path")) {
+    const resolved = await resolveWorkspacePath(value.value, projectPath);
+    if (!resolved.insideWorkspace) {
+      return decision("deny", "Personal files outside the workspace are denied by default.", { enforcement: "denied", requiresApproval: false });
+    }
   }
 
   if (mode === "plan") {
-    const effect: PermissionEffect = toolCall.name === "read_file" || toolCall.name === "list_files" || toolCall.name === "search_text" || toolCall.name === "inspect_tree" || toolCall.name === "git_status" || toolCall.name === "git_diff" || toolCall.name === "read_process" || toolCall.name === "list_processes"
+    const effect: PermissionEffect = toolCall.name === "read_file" || toolCall.name === "list_files" || toolCall.name === "search_text" || toolCall.name === "inspect_tree" || toolCall.name === "project_diagnostics" || toolCall.name === "git_status" || toolCall.name === "git_diff" || toolCall.name === "read_process" || toolCall.name === "list_processes"
       ? "allow"
       : "deny";
     return decision(effect, effect === "allow" ? "Plan mode allows read-only inspection." : "Plan mode blocks writes, shell commands, and network access.", {
@@ -134,15 +157,16 @@ export async function evaluatePermission(
     });
   }
 
-  const values = await targetValuesForToolCall(toolCall, projectPath);
-  const matchedRule = resolveRule([...managedRules, ...listPermissionRules()], values);
-  if (matchedRule) {
-    return decision(matchedRule.effect, `${matchedRule.scope} rule ${matchedRule.id} matched ${matchedRule.targetType}:${matchedRule.pattern}`, {
-      matchedRule,
-      enforcement: matchedRule.effect === "allow" ? "guarded" : matchedRule.effect === "ask" ? "requires_approval" : "denied",
-      requiresApproval: matchedRule.effect === "ask"
+  const matchedManagedRule = resolveRule(managedRules, values);
+  if (matchedManagedRule) {
+    return decision(matchedManagedRule.effect, `${matchedManagedRule.scope} rule ${matchedManagedRule.id} matched ${matchedManagedRule.targetType}:${matchedManagedRule.pattern}`, {
+      matchedRule: matchedManagedRule,
+      enforcement: matchedManagedRule.effect === "allow" ? "guarded" : matchedManagedRule.effect === "ask" ? "requires_approval" : "denied",
+      requiresApproval: matchedManagedRule.effect === "ask"
     });
   }
+
+  const matchedRule = resolveRule(listPermissionRules(), values);
 
   if (toolCall.name === "web_fetch") {
     return decision("ask", "Network access requires approval by default.");
@@ -164,14 +188,24 @@ export async function evaluatePermission(
   if (toolCall.name === "run_shell" || toolCall.name === "start_process") {
     const command = typeof toolCall.arguments.command === "string" ? toolCall.arguments.command : "";
     const analysis = await analyzeShellCommand(command, toolCall.arguments.cwd, projectPath);
-    if (analysis.blockedReason || analysis.destructive || analysis.redirectsOutsideWorkspace || analysis.leaksEnvironment || analysis.backgroundProcess || analysis.interactive) {
+    if (analysis.blockedReason || analysis.redirectsOutsideWorkspace || analysis.leaksEnvironment || analysis.backgroundProcess || analysis.interactive || analysis.credentialAccess) {
       return decision("deny", analysis.blockedReason ?? `Shell command blocked by portable guard: ${analysis.riskFlags.join(", ")}`, {
         enforcement: "denied",
         requiresApproval: false
       });
     }
-    if (analysis.mentionsOutsideWorkspace || analysis.mayUseNetwork) {
-      return decision("ask", "Shell command crosses the workspace or network boundary.");
+    if (analysis.mentionsOutsideWorkspace) {
+      return decision("deny", "Shell commands may not access personal files outside the workspace.", { enforcement: "denied", requiresApproval: false });
+    }
+    const secretRefs = Array.isArray(toolCall.arguments.secretRefs) ? toolCall.arguments.secretRefs : [];
+    if (secretRefs.length > 0) {
+      return decision("ask", `Secret injection requires approval for: ${secretRefs.map(String).join(", ")}.`);
+    }
+    if (analysis.destructive || analysis.productionOperation || analysis.privilegeElevation) {
+      return decision("ask", "Destructive, privileged, or production operations require one-time approval.");
+    }
+    if (analysis.mayUseNetwork || analysis.installsDependencies || analysis.databaseMigration || analysis.databaseMutation || analysis.dockerMutation || analysis.gitMutation || analysis.deployment) {
+      return decision("ask", "Dependency, network, database, container, Git mutation, or deployment operations require approval.");
     }
     return decision("allow", "Routine shell command stays within the workspace boundary.", {
       enforcement: "guarded",
@@ -179,11 +213,30 @@ export async function evaluatePermission(
     });
   }
 
-  for (const value of values.filter((item) => item.targetType === "path")) {
-    const resolved = await resolveWorkspacePath(value.value, projectPath);
-    if (!resolved.insideWorkspace) {
-      return decision("ask", "File operation crosses the workspace boundary.");
-    }
+  if (toolCall.name === "docker_compose") {
+    const action = String(toolCall.arguments.action ?? "ps");
+    return action === "ps" || action === "config" || action === "logs"
+      ? decision("allow", "Read-only Docker Compose inspection is allowed.", { requiresApproval: false })
+      : decision("ask", "Docker Compose mutations require approval.");
+  }
+
+  if (toolCall.name === "sqlite_query") {
+    const query = String(toolCall.arguments.query ?? "").trim();
+    return /^(select|pragma\b(?![\s\S]*=)|explain|with\b[\s\S]*\bselect\b)/i.test(query)
+      ? decision("allow", "Read-only SQLite queries are allowed inside the workspace.", { requiresApproval: false })
+      : decision("ask", "SQLite mutations require one-time approval.");
+  }
+
+  if (matchedRule) {
+    return decision(matchedRule.effect, `${matchedRule.scope} rule ${matchedRule.id} matched ${matchedRule.targetType}:${matchedRule.pattern}`, {
+      matchedRule,
+      enforcement: matchedRule.effect === "allow" ? "guarded" : matchedRule.effect === "ask" ? "requires_approval" : "denied",
+      requiresApproval: matchedRule.effect === "ask"
+    });
+  }
+
+  if (mode === "full_access") {
+    return decision("allow", "Full access mode allows this tool call after mandatory safety rules.", { enforcement: "guarded", requiresApproval: false });
   }
 
   return decision("allow", "Workspace-write default policy allows this tool call.", { requiresApproval: false });

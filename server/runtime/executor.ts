@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { analyzeShellCommand } from "../security/sandbox";
+import { redactSecrets, resolveSecretEnvironment } from "../security/secrets";
 import type { ExecutorResult, ShellAnalysis } from "../shared/types";
 
 const execFileAsync = promisify(execFile);
@@ -11,6 +12,7 @@ export interface ExecutorRunInput {
   projectPath?: string;
   timeoutMs?: number;
   maxBuffer?: number;
+  secretRefs?: unknown;
 }
 
 function safeEnvironment() {
@@ -45,6 +47,7 @@ export class PortableExecutor {
   async run(input: ExecutorRunInput): Promise<ExecutorResult> {
     const startedAt = Date.now();
     const analysis = await this.analyze(input);
+    const secrets = resolveSecretEnvironment(input.secretRefs);
     const argv = ["zsh", "-lc", input.command];
     const blockedReason = blockedByPortableGuard(analysis);
     if (blockedReason) {
@@ -66,13 +69,13 @@ export class PortableExecutor {
         cwd: analysis.cwd,
         timeout: input.timeoutMs ?? 30000,
         maxBuffer: input.maxBuffer ?? 1024 * 1024,
-        env: safeEnvironment()
+        env: { ...safeEnvironment(), ...secrets.env }
       });
       return {
         ok: true,
         exitCode: 0,
-        stdout,
-        stderr,
+        stdout: redactSecrets(stdout, secrets.values),
+        stderr: redactSecrets(stderr, secrets.values),
         durationMs: Date.now() - startedAt,
         riskFlags: analysis.riskFlags,
         cwd: analysis.cwd,
@@ -85,8 +88,8 @@ export class PortableExecutor {
       return {
         ok: false,
         exitCode,
-        stdout: err.stdout ?? "",
-        stderr: err.stderr ?? err.message,
+        stdout: redactSecrets(err.stdout ?? "", secrets.values),
+        stderr: redactSecrets(err.stderr ?? err.message, secrets.values),
         durationMs: Date.now() - startedAt,
         riskFlags: analysis.riskFlags,
         cwd: analysis.cwd,

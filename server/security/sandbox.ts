@@ -93,7 +93,7 @@ function hasBackgroundProcess(command: string) {
 }
 
 function hasEnvLeakPattern(command: string) {
-  return /\b(env|printenv|export\s+-p|set)\b/.test(command) ||
+  return /(?:^|[;&|\n]\s*)(?:env|printenv|export\s+-p|set)(?:\s|$)/.test(command) ||
     /\$([A-Z_]*(KEY|TOKEN|SECRET|PASSWORD|PASS|CREDENTIAL)[A-Z_]*)\b/.test(command);
 }
 
@@ -133,10 +133,14 @@ export async function analyzeShellCommand(command: string, cwdInput: unknown, pr
     /\bnpm\s+(install|add|publish)\b/,
     /\bpnpm\s+(install|add|publish)\b/,
     /\byarn\s+(add|install|publish)\b/,
+    /\b(npx|bunx|pnpm\s+dlx|yarn\s+dlx)\b/,
     /\bgit\s+(clone|fetch|pull|push)\b/,
     /\bssh\b/,
     /\bscp\b/,
-    /\brsync\b.*:/
+    /\brsync\b.*:/,
+    /\b(docker|podman)\s+(pull|push|build)\b/,
+    /\b(wrangler\s+deploy|terraform\s+(plan|apply|destroy)|pulumi\s+(preview|up|destroy))\b/,
+    /\b(kubectl|helm|aws|gcloud|az)\b/
   ];
   const absolutePathMatches = [...command.matchAll(/(?:^|\s)(\/[^\s'"`;&|()]+)/g)];
   let mentionsOutsideWorkspace = false;
@@ -144,6 +148,7 @@ export async function analyzeShellCommand(command: string, cwdInput: unknown, pr
     const resolved = await resolveWorkspacePath(match[1], projectPath);
     if (!resolved.insideWorkspace) mentionsOutsideWorkspace = true;
   }
+  if (/(^|[\s'"`])~(?:\/|\b)/.test(command)) mentionsOutsideWorkspace = true;
   const redirectMatches = [...command.matchAll(/(?:^|\s)(?:>>?|2>|&>)\s*([^\s'"`;&|()]+)/g)];
   let redirectsOutsideWorkspace = false;
   for (const match of redirectMatches) {
@@ -156,6 +161,15 @@ export async function analyzeShellCommand(command: string, cwdInput: unknown, pr
   const mayUseNetwork = networkPatterns.some((pattern) => pattern.test(command));
   const destructive = dangerousPatterns.some((pattern) => pattern.test(command)) ||
     /\b(rm|mv|cp)\b[\s\S]*(?:\.\.|\/)/.test(command) && mentionsOutsideWorkspace;
+  const installsDependencies = /\b(npm|pnpm|yarn|bun)\s+(install|add|remove|uninstall|update|upgrade)\b|\b(npx|bunx|pnpm\s+dlx|yarn\s+dlx)\b|\b(pip|pip3)\s+install\b|\b(bundle|cargo)\s+(install|update)\b|\b(go\s+get|brew\s+(install|upgrade))\b/.test(command);
+  const databaseMigration = /\b(migrate|migration|db:(?:push|migrate|deploy|reset)|prisma\s+(?:migrate|db\s+push)|drizzle-kit\s+(?:push|migrate)|alembic\s+upgrade|knex\s+migrate|sequelize(?:-cli)?\s+db:migrate)\b/i.test(command);
+  const databaseMutation = /\b(psql|mysql|sqlite3|mongosh?)\b[\s\S]*\b(insert|update|delete|drop|truncate|alter|create)\b/i.test(command);
+  const dockerMutation = /\b(docker|podman)(?:\s+compose)?\s+(?:up|down|restart|rm|kill|stop|pull|push|build|run|exec|system\s+prune|volume\s+(?:rm|prune))\b/.test(command);
+  const gitMutation = /\bgit\s+(?:add|commit|push|merge|rebase|reset|clean|switch|checkout|branch\s+-[dD])\b/.test(command);
+  const deployment = /\b(?:wrangler\s+deploy|terraform\s+(?:apply|destroy)|pulumi\s+(?:up|destroy)|vercel(?:\s+deploy)?|netlify\s+deploy|flyctl\s+deploy|firebase\s+deploy|kubectl\s+(?:apply|delete|rollout)|helm\s+(?:install|upgrade|uninstall)|xcodebuild\s+(?:archive|-exportArchive))\b|\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?[\w:-]*(?:deploy|release|publish)(?:\s|$)/.test(command);
+  const productionOperation = /(?:^|[\s_-])(?:prod|production)(?:$|[\s_=:-])|--environment[=\s]+prod(?:uction)?\b|--remote\b/.test(command);
+  const privilegeElevation = /\b(?:sudo|su\s|doas)\b/.test(command);
+  const credentialAccess = /\bsecurity\s+find-(?:generic|internet)-password\b|\b(?:cat|less|more|head|tail|cp|scp)\b[^\n]*?(?:\.ssh\/|id_(?:rsa|ed25519|ecdsa)|Login Data|Cookies|Keychain)|(?:\/|~\/)(?:Library\/Keychains|\.ssh)(?:\/|\b)/i.test(command);
   const leaksEnvironment = hasEnvLeakPattern(command);
   const backgroundProcess = hasBackgroundProcess(command);
   const interactive = hasInteractivePattern(command);
@@ -165,6 +179,15 @@ export async function analyzeShellCommand(command: string, cwdInput: unknown, pr
     redirectsOutsideWorkspace ? "redirects_outside_workspace" : "",
     mayUseNetwork ? "network" : "",
     destructive ? "destructive" : "",
+    installsDependencies ? "dependency_install" : "",
+    databaseMigration ? "database_migration" : "",
+    databaseMutation ? "database_mutation" : "",
+    dockerMutation ? "docker_mutation" : "",
+    gitMutation ? "git_mutation" : "",
+    deployment ? "deployment" : "",
+    productionOperation ? "production" : "",
+    privilegeElevation ? "privilege_elevation" : "",
+    credentialAccess ? "credential_access" : "",
     leaksEnvironment ? "env_leak" : "",
     backgroundProcess ? "background_process" : "",
     interactive ? "interactive" : "",
@@ -179,6 +202,15 @@ export async function analyzeShellCommand(command: string, cwdInput: unknown, pr
     redirectsOutsideWorkspace,
     mayUseNetwork,
     destructive,
+    installsDependencies,
+    databaseMigration,
+    databaseMutation,
+    dockerMutation,
+    gitMutation,
+    deployment,
+    productionOperation,
+    privilegeElevation,
+    credentialAccess,
     leaksEnvironment,
     backgroundProcess,
     interactive,

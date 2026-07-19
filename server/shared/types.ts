@@ -1,5 +1,17 @@
 export type PermissionMode = "default" | "plan" | "workspace_write" | "full_access" | "custom";
 
+export type ThinkingMode = "fast" | "balanced" | "deep";
+export type ReasoningDialect = "auto" | "sub2api" | "openai-compatible";
+
+export interface AppliedReasoningConfig {
+  mode: ThinkingMode;
+  native: boolean;
+  method: "thinking_toggle" | "reasoning_effort" | "reasoning_budget" | "always_on" | "prompt_fallback";
+  value: string;
+  label: string;
+  transport?: "direct" | "gateway" | "fallback";
+}
+
 export type LearningRunStatus = "saved" | "no_candidate" | "skipped" | "failed";
 
 export type WorkflowPhase =
@@ -45,6 +57,8 @@ export type BuiltinToolName =
   | "list_files"
   | "search_text"
   | "inspect_tree"
+  | "project_diagnostics"
+  | "generate_image"
   | "record_learning"
   | "apply_patch"
   | "web_fetch"
@@ -54,11 +68,14 @@ export type BuiltinToolName =
   | "write_process"
   | "stop_process"
   | "list_processes"
+  | "docker_compose"
+  | "sqlite_query"
   | "git_status"
   | "git_diff"
   | "git_branch"
   | "git_stage"
-  | "git_commit";
+  | "git_commit"
+  | "git_push";
 
 export type AgentToolName = BuiltinToolName | `mcp__${string}__${string}` | string;
 
@@ -140,6 +157,15 @@ export interface ShellAnalysis {
   redirectsOutsideWorkspace: boolean;
   mayUseNetwork: boolean;
   destructive: boolean;
+  installsDependencies: boolean;
+  databaseMigration: boolean;
+  databaseMutation: boolean;
+  dockerMutation: boolean;
+  gitMutation: boolean;
+  deployment: boolean;
+  productionOperation: boolean;
+  privilegeElevation: boolean;
+  credentialAccess: boolean;
   leaksEnvironment: boolean;
   backgroundProcess: boolean;
   interactive: boolean;
@@ -195,6 +221,7 @@ export interface AgentAttachment {
   size: number;
   kind: "image" | "file";
   dataUrl?: string;
+  url?: string;
   text?: string;
 }
 
@@ -204,6 +231,10 @@ export interface AgentMessage {
   attachments?: AgentAttachment[];
   toolCallId?: string;
   toolCalls?: ToolCall[];
+  /** Provider reasoning context required to continue thinking-mode tool calls. Never shown in the UI. */
+  reasoningContent?: string;
+  /** Structured reasoning blocks used by MiniMax-compatible interleaved tool calls. */
+  reasoningDetails?: Array<Record<string, unknown>>;
 }
 
 export interface AgentRunResponse {
@@ -219,6 +250,7 @@ export type StreamEvent =
   | { type: "run_started"; conversationId: string }
   | { type: "workflow_state"; phase: WorkflowPhase; label: string }
   | { type: "context_snapshot"; snapshot: ContextSnapshot }
+  | { type: "reasoning_config"; config: AppliedReasoningConfig }
   | { type: "task_plan"; plan: TaskPlan }
   | { type: "text_delta"; content: string }
   | {

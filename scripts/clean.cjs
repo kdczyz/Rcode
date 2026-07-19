@@ -8,7 +8,13 @@ const generatedPaths = [
   "dist",
   "dist-server",
   "dist-server-bundle",
-  "release"
+  "release",
+  "artifacts",
+  "Fwq/dist-worker",
+  "Rcode_apk/dist",
+  "Rcode_apk/android/build",
+  "Rcode_apk/android/app/build",
+  "Rcode_apk/android/capacitor-cordova-android-plugins/build"
 ];
 
 function removePath(relativePath) {

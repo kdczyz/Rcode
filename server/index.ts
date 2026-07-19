@@ -34,6 +34,8 @@ import {
   fetchModelsForDraft,
   fetchProviderBalance,
   fetchProviderModels,
+  getWorkAiSyncCandidate,
+  getWorkAiSyncCandidates,
   listAiProviders,
   removeAiProvider,
   saveAiProvider,
@@ -46,6 +48,7 @@ import { listMcpTools, setMcpRuntimeBearerToken, testMcpServer, trustMcpServer }
 import { getProjectHookTrust } from "./agent/hooks";
 import { listSubagents } from "./agent/subagents";
 import { managedProcessManager } from "./runtime/processManager";
+import { generateImage, generatedImageFilePath, type ImageQuality, type ImageSize } from "./providers/imageProvider";
 
 dotenv.config();
 if (existsSync(".env.local")) {
@@ -86,6 +89,10 @@ function parseThinkingMode(value: unknown): ThinkingMode {
 
 function parseModel(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function parseProviderId(value: unknown): string | undefined {
+  return typeof value === "string" && /^[a-zA-Z0-9._:-]{1,100}$/.test(value.trim()) ? value.trim() : undefined;
 }
 
 function parseProjectPath(value: unknown): string | undefined {
@@ -238,6 +245,23 @@ app.get("/api/agents", requireLocalToken, async (request, response) => {
 
 app.get("/api/ai/providers", requireLocalToken, (_request, response) => {
   response.json(listAiProviders());
+});
+
+app.get("/api/ai/providers/work-sync-candidate", requireLocalToken, async (request, response) => {
+  try {
+    const providerId = typeof request.query.id === "string" ? request.query.id : undefined;
+    response.json({ provider: await getWorkAiSyncCandidate(providerId) });
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : "无法读取当前 AI 接口" });
+  }
+});
+
+app.get("/api/ai/providers/work-sync-candidates", requireLocalToken, async (_request, response) => {
+  try {
+    response.json({ providers: await getWorkAiSyncCandidates() });
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : "无法读取电脑端 AI 接口" });
+  }
 });
 
 app.post("/api/ai/providers", requireLocalToken, (request, response) => {
@@ -484,6 +508,42 @@ app.get("/api/models", async (_request, response) => {
   }
 });
 
+app.get("/api/images/generated/:fileName", (request, response) => {
+  try {
+    response.sendFile(
+      generatedImageFilePath(String(request.params.fileName)),
+      { headers: { "Cache-Control": "private, max-age=31536000, immutable" } },
+      (error) => {
+        if (error && !response.headersSent) response.status(404).end();
+      }
+    );
+  } catch {
+    response.status(404).end();
+  }
+});
+
+app.post("/api/images/generate", requireLocalToken, async (request, response) => {
+  try {
+    const prompt = typeof request.body.prompt === "string" ? request.body.prompt : "";
+    const size = typeof request.body.size === "string" ? request.body.size as ImageSize : undefined;
+    const quality = typeof request.body.quality === "string" ? request.body.quality as ImageQuality : undefined;
+    const result = await generateImage({
+      prompt,
+      providerId: parseProviderId(request.body.providerId),
+      model: parseModel(request.body.model),
+      size,
+      quality,
+      count: typeof request.body.count === "number" ? request.body.count : undefined
+    });
+    response.json({
+      ...result,
+      attachments: result.attachments.map(({ dataUrl: _dataUrl, ...attachment }) => attachment)
+    });
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : "图片生成失败" });
+  }
+});
+
 app.post("/api/agent/run", requireLocalToken, async (request, response) => {
   const prompt = typeof request.body.prompt === "string" ? request.body.prompt : "";
   let attachments: AgentAttachment[];
@@ -514,6 +574,7 @@ app.post("/api/agent/run", requireLocalToken, async (request, response) => {
       attachments,
       conversationId: typeof request.body.conversationId === "string" ? request.body.conversationId : undefined,
       mode: parseMode(request.body.mode),
+      providerId: parseProviderId(request.body.providerId),
       model: parseModel(request.body.model),
       thinkingMode: parseThinkingMode(request.body.thinkingMode),
       projectPath: parseProjectPath(request.body.projectPath),
@@ -551,6 +612,7 @@ app.post("/api/agent/approve", requireLocalToken, async (request, response) => {
       approvalId,
       allow: Boolean(request.body.allow),
       mode: parseMode(request.body.mode),
+      providerId: parseProviderId(request.body.providerId),
       model: parseModel(request.body.model),
       thinkingMode: parseThinkingMode(request.body.thinkingMode),
       projectPath: parseProjectPath(request.body.projectPath),

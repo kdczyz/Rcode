@@ -1,13 +1,16 @@
 import { getToolDefinitions } from "../runtime/tools";
-import type { AgentMessage, ContextSnapshot, PermissionMode, ToolCall, ToolResult, AgentToolName, ToolRisk } from "../shared/types";
+import type { AgentMessage, AppliedReasoningConfig, ContextSnapshot, PermissionMode, ReasoningDialect, ThinkingMode, ToolCall, ToolResult, AgentToolName, ToolRisk } from "../shared/types";
 import { getRuntimeConfig } from "../runtime/config";
 import { nanoid } from "nanoid";
 import { buildProjectContextBundle, compactMessagesWithSnapshot } from "../agent/contextManager";
 import type { ProviderUsagePayload } from "./providerUsage";
+import { resolveAiProviderForExecution } from "./aiProviderRegistry";
 
 interface ChatChoice {
   message?: {
     content?: string | null;
+    reasoning_content?: string | null;
+    reasoning_details?: Array<Record<string, unknown>> | null;
     tool_calls?: Array<{
       id: string;
       function: {
@@ -25,6 +28,8 @@ interface ChatResponse {
 
 interface StreamDelta {
   content?: string;
+  reasoning_content?: string;
+  reasoning_details?: Array<Record<string, unknown>>;
   tool_calls?: Array<{
     index: number;
     id?: string;
@@ -46,6 +51,8 @@ interface StreamChunk {
 export interface AiTurn {
   content: string;
   toolCalls: ToolCall[];
+  reasoningContent?: string;
+  reasoningDetails?: Array<Record<string, unknown>>;
 }
 
 export type AiUsage = ProviderUsagePayload;
@@ -75,7 +82,340 @@ export interface LearningExtractionResult {
   provider: string;
 }
 
-export type ThinkingMode = "fast" | "balanced" | "deep";
+export type { ThinkingMode } from "../shared/types";
+
+interface ReasoningRequestConfig {
+  parameters: Record<string, unknown>;
+  omitParameters?: string[];
+  replay: "none" | "tool_calls" | "all";
+  replayField: "reasoning_content" | "reasoning_details";
+  applied: AppliedReasoningConfig;
+}
+
+const unsupportedReasoningTargets = new Set<string>();
+
+function reasoningTargetKey(baseUrl: string, model: string, dialect: ReasoningDialect = "auto") {
+  return `${baseUrl.replace(/\/+$/, "").toLowerCase()}::${model.toLowerCase()}::${dialect}`;
+}
+
+function providerHostname(baseUrl: string) {
+  try {
+    return new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function modeLabel(mode: ThinkingMode) {
+  return mode === "fast" ? "快速" : mode === "deep" ? "深度" : "标准";
+}
+
+function reasoningConfig(
+  mode: ThinkingMode,
+  parameters: Record<string, unknown>,
+  applied: Omit<AppliedReasoningConfig, "mode">,
+  options: Pick<ReasoningRequestConfig, "replay" | "replayField" | "omitParameters"> = { replay: "none", replayField: "reasoning_content" }
+): ReasoningRequestConfig {
+  return { parameters, applied: { mode, transport: "direct", ...applied }, replay: options.replay, replayField: options.replayField, omitParameters: options.omitParameters };
+}
+
+function throughGateway(config: ReasoningRequestConfig): ReasoningRequestConfig {
+  return {
+    ...config,
+    applied: {
+      ...config.applied,
+      transport: "gateway",
+      label: `${modeLabel(config.applied.mode)} · 中转 ${config.applied.value}`
+    }
+  };
+}
+
+function promptOnlyConfig(mode: ThinkingMode): ReasoningRequestConfig {
+  return reasoningConfig(mode, {}, {
+    native: false,
+    method: "prompt_fallback",
+    value: "system_prompt",
+    label: `${modeLabel(mode)} · 提示兼容`,
+    transport: "fallback"
+  });
+}
+
+function isGlm52OrNewer(model: string) {
+  const match = model.toLowerCase().match(/^glm-(\d+)(?:\.(\d+))?/);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2] ?? 0);
+  return major > 5 || (major === 5 && minor >= 2);
+}
+
+/** Maps native endpoints and multi-model gateways to the reasoning controls their upstream accepts. */
+export function buildReasoningRequestConfig(
+  baseUrl: string,
+  model: string,
+  mode: ThinkingMode = "balanced",
+  dialect: ReasoningDialect = "auto"
+): ReasoningRequestConfig {
+  const targetKey = reasoningTargetKey(baseUrl, model, dialect);
+  if (unsupportedReasoningTargets.has(targetKey)) return promptOnlyConfig(mode);
+
+  const hostname = providerHostname(baseUrl);
+  const normalizedModel = model.toLowerCase();
+  const modelId = normalizedModel.split("/").pop() ?? normalizedModel;
+  const isOfficialMiMo = hostname === "api.xiaomimimo.com" || hostname.endsWith(".xiaomimimo.com");
+  const isOfficialDeepSeek = hostname === "api.deepseek.com" || hostname.endsWith(".deepseek.com");
+  const isOfficialZhipu = hostname === "open.bigmodel.cn" || hostname.endsWith(".bigmodel.cn") || hostname === "api.z.ai" || hostname.endsWith(".z.ai");
+  const isOfficialMiniMax = hostname === "api.minimaxi.com" || hostname.endsWith(".minimaxi.com") || hostname === "api.minimax.io" || hostname.endsWith(".minimax.io");
+  const isOfficialKimi = hostname === "api.moonshot.cn" || hostname.endsWith(".moonshot.cn") || hostname === "api.moonshot.ai" || hostname.endsWith(".moonshot.ai");
+  const isDashScope = hostname.endsWith(".dashscope.aliyuncs.com") || hostname === "dashscope.aliyuncs.com" || hostname.endsWith(".maas.aliyuncs.com");
+  const isOpenRouter = hostname === "openrouter.ai" || hostname.endsWith(".openrouter.ai");
+  const isKnownSub2Api = hostname === "sub2api.org" || hostname.endsWith(".sub2api.org") || hostname === "pincc.ai" || hostname.endsWith(".pincc.ai");
+  const isSub2Api = dialect === "sub2api" || (dialect === "auto" && isKnownSub2Api);
+  const forceGenericOpenAi = dialect === "openai-compatible";
+  const platformOwnsReasoning = isDashScope || isOpenRouter || forceGenericOpenAi;
+
+  const isMiMo = !platformOwnsReasoning && (isOfficialMiMo || /^mimo[-_.]/i.test(modelId));
+  const isDeepSeek = !platformOwnsReasoning && (isOfficialDeepSeek || /^deepseek[-_.]/i.test(modelId));
+  const isZhipu = !platformOwnsReasoning && (isOfficialZhipu || /^glm[-_.]/i.test(modelId));
+  const isMiniMax = !platformOwnsReasoning && (isOfficialMiniMax || /^minimax[-_.]/i.test(modelId));
+  const isKimi = !platformOwnsReasoning && (isOfficialKimi || /^(?:kimi|moonshot)[-_.]/i.test(modelId));
+  const isQwenViaSub2Api = isSub2Api && /^qwen(?:\d+)?[-_.]/i.test(modelId);
+  const translated = (config: ReasoningRequestConfig, officialEndpoint: boolean) =>
+    isSub2Api || !officialEndpoint ? throughGateway(config) : config;
+
+  if (isOpenRouter && !forceGenericOpenAi) {
+    const effort = mode === "fast" ? "low" : mode === "deep" ? "high" : "medium";
+    return throughGateway(reasoningConfig(mode, { reasoning: { effort, exclude: false } }, {
+      native: true, method: "reasoning_effort", value: effort, label: `${modeLabel(mode)} · 原生 ${effort}`
+    }));
+  }
+
+  if (isMiMo) {
+    const value = mode === "fast" ? "disabled" : "enabled";
+    return translated(reasoningConfig(mode, { thinking: { type: value } }, {
+      native: true, method: "thinking_toggle", value, label: `${modeLabel(mode)} · 原生思考${value === "enabled" ? "开启" : "关闭"}`
+    }, { replay: value === "enabled" ? "tool_calls" : "none", replayField: "reasoning_content" }), isOfficialMiMo);
+  }
+
+  if (isDeepSeek) {
+    if (mode === "fast") {
+      return translated(reasoningConfig(mode, { thinking: { type: "disabled" } }, {
+        native: true, method: "thinking_toggle", value: "disabled", label: "快速 · 原生思考关闭"
+      }), isOfficialDeepSeek);
+    }
+    const effort = mode === "deep" ? "max" : "high";
+    return translated(reasoningConfig(mode, { thinking: { type: "enabled" }, reasoning_effort: effort }, {
+      native: true, method: "reasoning_effort", value: effort, label: `${modeLabel(mode)} · 原生 ${effort}`
+    }, { replay: "tool_calls", replayField: "reasoning_content" }), isOfficialDeepSeek);
+  }
+
+  if (isZhipu) {
+    if (mode === "fast") {
+      return translated(reasoningConfig(mode, { thinking: { type: "disabled" } }, {
+        native: true, method: "thinking_toggle", value: "disabled", label: "快速 · 原生思考关闭"
+      }), isOfficialZhipu);
+    }
+    if (isGlm52OrNewer(normalizedModel)) {
+      const effort = mode === "deep" ? "max" : "medium";
+      return translated(reasoningConfig(mode, { thinking: { type: "enabled", ...(mode === "deep" ? { clear_thinking: false } : {}) }, reasoning_effort: effort }, {
+        native: true, method: "reasoning_effort", value: effort, label: `${modeLabel(mode)} · 原生 ${effort}`
+      }, { replay: mode === "deep" ? "all" : "tool_calls", replayField: "reasoning_content" }), isOfficialZhipu);
+    }
+    return translated(reasoningConfig(mode, { thinking: { type: "enabled", ...(mode === "deep" ? { clear_thinking: false } : {}) } }, {
+      native: true, method: "thinking_toggle", value: "enabled", label: `${modeLabel(mode)} · 原生思考开启`
+    }, { replay: mode === "deep" ? "all" : "tool_calls", replayField: "reasoning_content" }), isOfficialZhipu);
+  }
+
+  if (isKimi) {
+    const omitTemperature = ["temperature"];
+    if (/kimi-k3/i.test(normalizedModel)) {
+      return translated(reasoningConfig(mode, { reasoning_effort: "max" }, {
+        native: true, method: "always_on", value: "max", label: `${modeLabel(mode)} · 模型固定 max`
+      }, { replay: "all", replayField: "reasoning_content", omitParameters: omitTemperature }), isOfficialKimi);
+    }
+    if (/kimi-k2\.7-code/i.test(normalizedModel)) {
+      return translated(reasoningConfig(mode, {}, {
+        native: true, method: "always_on", value: "forced", label: `${modeLabel(mode)} · 模型固定思考`
+      }, { replay: "all", replayField: "reasoning_content", omitParameters: omitTemperature }), isOfficialKimi);
+    }
+    if (/kimi-k2\.(?:6|5)/i.test(normalizedModel)) {
+      const value = mode === "fast" ? "disabled" : "enabled";
+      const thinking = { type: value, ...(mode === "deep" && /kimi-k2\.6/i.test(normalizedModel) ? { keep: "all" } : {}) };
+      return translated(reasoningConfig(mode, { thinking }, {
+        native: true, method: "thinking_toggle", value, label: `${modeLabel(mode)} · 原生思考${value === "enabled" ? "开启" : "关闭"}`
+      }, { replay: mode === "deep" && /kimi-k2\.6/i.test(normalizedModel) ? "all" : value === "enabled" ? "tool_calls" : "none", replayField: "reasoning_content", omitParameters: omitTemperature }), isOfficialKimi);
+    }
+    if (/thinking/i.test(normalizedModel)) {
+      return translated(reasoningConfig(mode, {}, {
+        native: true, method: "always_on", value: "forced", label: `${modeLabel(mode)} · 模型固定思考`
+      }, { replay: "tool_calls", replayField: "reasoning_content", omitParameters: omitTemperature }), isOfficialKimi);
+    }
+    return promptOnlyConfig(mode);
+  }
+
+  if (isMiniMax) {
+    if (!isOfficialMiniMax) {
+      const value = mode === "fast" ? "disabled" : "adaptive";
+      return throughGateway(reasoningConfig(mode, { thinking: { type: value } }, {
+        native: true, method: "thinking_toggle", value, label: `${modeLabel(mode)} · 原生 ${value}`
+      }, { replay: value === "adaptive" ? "tool_calls" : "none", replayField: "reasoning_content" }));
+    }
+    return reasoningConfig(mode, { reasoning_split: true }, {
+      native: true, method: "always_on", value: "reasoning_split", label: `${modeLabel(mode)} · 模型固定思考`
+    }, { replay: "tool_calls", replayField: "reasoning_details" });
+  }
+
+  if (isQwenViaSub2Api) {
+    const value = mode === "fast" ? "disabled" : "enabled";
+    return throughGateway(reasoningConfig(mode, { thinking: { type: value } }, {
+      native: true, method: "thinking_toggle", value, label: `${modeLabel(mode)} · 原生思考${value === "enabled" ? "开启" : "关闭"}`
+    }, { replay: value === "enabled" ? "tool_calls" : "none", replayField: "reasoning_content" }));
+  }
+
+  if (isDashScope && !forceGenericOpenAi) {
+    if (/minimax/i.test(normalizedModel)) {
+      const value = mode === "fast" ? "disabled" : "adaptive";
+      return reasoningConfig(mode, { thinking: { type: value } }, {
+        native: true, method: "thinking_toggle", value, label: `${modeLabel(mode)} · 原生 ${value}`
+      }, { replay: value === "adaptive" ? "tool_calls" : "none", replayField: "reasoning_content" });
+    }
+    if (/deepseek|glm/i.test(normalizedModel)) {
+      if (mode === "fast") {
+        return reasoningConfig(mode, { enable_thinking: false }, {
+          native: true, method: "thinking_toggle", value: "disabled", label: "快速 · 原生思考关闭"
+        });
+      }
+      const effort = mode === "deep" ? "max" : "high";
+      return reasoningConfig(mode, { enable_thinking: true, reasoning_effort: effort }, {
+        native: true, method: "reasoning_effort", value: effort, label: `${modeLabel(mode)} · 原生 ${effort}`
+      }, { replay: "tool_calls", replayField: "reasoning_content" });
+    }
+    if (/qwen/i.test(normalizedModel)) {
+      if (mode === "fast") {
+        return reasoningConfig(mode, { enable_thinking: false }, {
+          native: true, method: "thinking_toggle", value: "disabled", label: "快速 · 原生思考关闭"
+        });
+      }
+      const budget = mode === "deep" ? 32_768 : 8_192;
+      return reasoningConfig(mode, { enable_thinking: true, thinking_budget: budget, ...(mode === "deep" ? { preserve_thinking: true } : {}) }, {
+        native: true, method: "reasoning_budget", value: String(budget), label: `${modeLabel(mode)} · 原生预算 ${Math.round(budget / 1024)}k`
+      }, { replay: mode === "deep" ? "all" : "tool_calls", replayField: "reasoning_content" });
+    }
+    const enabled = mode !== "fast";
+    return reasoningConfig(mode, { enable_thinking: enabled }, {
+      native: true, method: "thinking_toggle", value: enabled ? "enabled" : "disabled", label: `${modeLabel(mode)} · 原生思考${enabled ? "开启" : "关闭"}`
+    }, { replay: enabled ? "tool_calls" : "none", replayField: "reasoning_content" });
+  }
+
+  const effort = mode === "fast" ? "low" : mode === "deep" ? "high" : "medium";
+  const generic = reasoningConfig(mode, { reasoning_effort: effort }, {
+    native: true, method: "reasoning_effort", value: effort, label: `${modeLabel(mode)} · 原生 ${effort}`
+  }, { replay: "none", replayField: "reasoning_content" });
+  return isSub2Api ? throughGateway(generic) : generic;
+}
+
+function promptFallbackReasoningConfig(mode: ThinkingMode): AppliedReasoningConfig {
+  return {
+    mode,
+    native: false,
+    method: "prompt_fallback",
+    value: "system_prompt",
+    label: `${modeLabel(mode)} · 提示兼容`,
+    transport: "fallback"
+  };
+}
+
+const reasoningControlKeys = ["reasoning_effort", "thinking", "enable_thinking", "thinking_budget", "preserve_thinking", "reasoning_split", "reasoning"];
+
+function removeUnsupportedReasoningControls(
+  body: Record<string, unknown>,
+  errorBody: string,
+  targetKey: string
+) {
+  if (!/reasoning|thinking|effort/i.test(errorBody)) return false;
+  let changed = false;
+  const normalizedError = errorBody.toLowerCase();
+  const mentionedKeys = reasoningControlKeys.filter((key) => normalizedError.includes(key));
+  const keysToRemove = mentionedKeys.length > 0 ? mentionedKeys : reasoningControlKeys;
+  for (const key of keysToRemove) {
+    if (key in body) {
+      delete body[key];
+      changed = true;
+    }
+  }
+  if (changed && !reasoningControlKeys.some((key) => key in body)) unsupportedReasoningTargets.add(targetKey);
+  return changed;
+}
+
+function effectiveReasoningConfig(selected: ReasoningRequestConfig, body: Record<string, unknown>): AppliedReasoningConfig {
+  const mode = selected.applied.mode;
+  const finalize = (config: AppliedReasoningConfig): AppliedReasoningConfig => {
+    if (!config.native || selected.applied.transport !== "gateway") {
+      return { ...config, transport: config.native ? "direct" : "fallback" };
+    }
+    return {
+      ...config,
+      transport: "gateway",
+      label: `${modeLabel(mode)} · 中转 ${config.value}`
+    };
+  };
+  if (typeof body.reasoning_effort === "string") {
+    return finalize({ mode, native: true, method: "reasoning_effort", value: body.reasoning_effort, label: `${modeLabel(mode)} · 原生 ${body.reasoning_effort}` });
+  }
+  const reasoning = body.reasoning as { effort?: unknown } | undefined;
+  if (reasoning && typeof reasoning.effort === "string") {
+    return finalize({ mode, native: true, method: "reasoning_effort", value: reasoning.effort, label: `${modeLabel(mode)} · 原生 ${reasoning.effort}` });
+  }
+  if (typeof body.thinking_budget === "number") {
+    return finalize({ mode, native: true, method: "reasoning_budget", value: String(body.thinking_budget), label: `${modeLabel(mode)} · 原生预算 ${Math.round(body.thinking_budget / 1024)}k` });
+  }
+  const thinking = body.thinking as { type?: unknown } | undefined;
+  if (thinking && typeof thinking.type === "string") {
+    return finalize({ mode, native: true, method: "thinking_toggle", value: thinking.type, label: `${modeLabel(mode)} · 原生 ${thinking.type}` });
+  }
+  if (typeof body.enable_thinking === "boolean") {
+    return finalize({ mode, native: true, method: "thinking_toggle", value: body.enable_thinking ? "enabled" : "disabled", label: `${modeLabel(mode)} · 原生思考${body.enable_thinking ? "开启" : "关闭"}` });
+  }
+  if (body.reasoning_split === true || selected.applied.method === "always_on") return selected.applied;
+  return promptFallbackReasoningConfig(mode);
+}
+
+function appendReasoningText(current: string, incoming: string) {
+  if (!incoming) return current;
+  return incoming.startsWith(current) ? incoming : current + incoming;
+}
+
+function reasoningDetailsText(details: Array<Record<string, unknown>>) {
+  return details.map((detail) => typeof detail.text === "string" ? detail.text : "").join("");
+}
+
+function mergeReasoningDetails(
+  current: Array<Record<string, unknown>> | undefined,
+  incoming: Array<Record<string, unknown>>
+) {
+  const merged = current?.map((detail) => ({ ...detail })) ?? [];
+  for (const [position, detail] of incoming.entries()) {
+    const detailIndex = typeof detail.index === "number" ? detail.index : undefined;
+    const detailId = typeof detail.id === "string" ? detail.id : undefined;
+    const existingIndex = merged.findIndex((candidate, candidatePosition) =>
+      (detailIndex !== undefined && candidate.index === detailIndex) ||
+      (detailId !== undefined && candidate.id === detailId) ||
+      (detailIndex === undefined && detailId === undefined && candidatePosition === position)
+    );
+    if (existingIndex === -1) {
+      merged.push({ ...detail });
+      continue;
+    }
+    const existing = merged[existingIndex];
+    const existingText = typeof existing.text === "string" ? existing.text : "";
+    const incomingText = typeof detail.text === "string" ? detail.text : "";
+    merged[existingIndex] = {
+      ...existing,
+      ...detail,
+      ...(incomingText ? { text: appendReasoningText(existingText, incomingText) } : {})
+    };
+  }
+  return merged;
+}
 
 const VALID_BUILTIN_TOOL_NAMES = new Set([
   "read_file",
@@ -327,18 +667,21 @@ function getThinkingInstruction(mode: ThinkingMode = "balanced") {
   return "Thinking mode: balanced. Use enough reasoning to be reliable without over-explaining.";
 }
 
-function getConfig(modelOverride?: string) {
+function getConfig(modelOverride?: string, providerId?: string) {
   const runtimeConfig = getRuntimeConfig();
+  const requestedProvider = providerId ? resolveAiProviderForExecution(providerId) : undefined;
+  const provider = requestedProvider ?? runtimeConfig.provider;
   return {
-    apiKey: runtimeConfig.provider.apiKey ?? (
-      runtimeConfig.provider.apiKeyEnv
-        ? process.env[runtimeConfig.provider.apiKeyEnv]
+    apiKey: provider.apiKey ?? (
+      provider.apiKeyEnv
+        ? process.env[provider.apiKeyEnv]
         : process.env.AI_API_KEY
     ),
-    baseUrl: runtimeConfig.provider.baseUrl ?? process.env.AI_BASE_URL ?? "",
-    chatPath: runtimeConfig.provider.chatCompletionsPath ?? "/chat/completions",
-    model: modelOverride || runtimeConfig.provider.defaultModel || process.env.AI_MODEL || "",
-    providerDisplayName: runtimeConfig.provider.displayName,
+    baseUrl: provider.baseUrl ?? process.env.AI_BASE_URL ?? "",
+    chatPath: provider.chatCompletionsPath ?? "/chat/completions",
+    model: modelOverride || provider.defaultModel || process.env.AI_MODEL || "",
+    providerDisplayName: provider.displayName,
+    reasoningDialect: provider.reasoningDialect ?? "auto",
     temperature: runtimeConfig.temperature,
     maxTokens: runtimeConfig.maxTokens
   };
@@ -398,7 +741,8 @@ async function toProviderMessages(
   projectPath?: string,
   modelName?: string,
   providerDisplayName?: string,
-  mode: PermissionMode = "workspace_write"
+  mode: PermissionMode = "workspace_write",
+  reasoningConfig?: ReasoningRequestConfig
 ) {
   const projectInstruction = projectPath
     ? `Current project root: ${projectPath}. Resolve relative file paths and shell commands inside this project unless the user asks otherwise.`
@@ -424,11 +768,22 @@ async function toProviderMessages(
       if (message.role === "tool") {
         return { role: "tool", tool_call_id: message.toolCallId, content: message.content };
       }
-      if (message.role === "assistant" && message.toolCalls && message.toolCalls.length > 0) {
+      if (message.role === "assistant") {
+        const hasToolCalls = Boolean(message.toolCalls?.length);
+        const shouldReplayReasoning = reasoningConfig?.replay === "all" || (reasoningConfig?.replay === "tool_calls" && hasToolCalls);
+        const reasoningFields = shouldReplayReasoning
+          ? reasoningConfig?.replayField === "reasoning_details" && message.reasoningDetails
+            ? { reasoning_details: message.reasoningDetails }
+            : message.reasoningContent
+              ? { reasoning_content: message.reasoningContent }
+              : {}
+          : {};
+        if (!hasToolCalls) return { role: "assistant", content: message.content, ...reasoningFields };
         return {
           role: "assistant",
           content: message.content || null,
-          tool_calls: message.toolCalls.map((toolCall) => ({
+          ...reasoningFields,
+          tool_calls: message.toolCalls!.map((toolCall) => ({
             id: toolCall.id,
             type: "function",
             function: { name: toolCall.name, arguments: JSON.stringify(toolCall.arguments) }
@@ -626,9 +981,9 @@ export async function extractLearningCandidates(
 export async function callAi(
   messages: AgentMessage[],
   toolResults: ToolResult[] = [],
-  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; mode?: PermissionMode; signal?: AbortSignal } = {}
+  options: { providerId?: string; model?: string; thinkingMode?: ThinkingMode; projectPath?: string; mode?: PermissionMode; signal?: AbortSignal } = {}
 ): Promise<AiTurn> {
-  const config = getConfig(options.model);
+  const config = getConfig(options.model, options.providerId);
 
   if (!config.apiKey) {
     return {
@@ -637,19 +992,39 @@ export async function callAi(
     };
   }
 
-  const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}${config.chatPath}`, {
+  const reasoning = buildReasoningRequestConfig(config.baseUrl, config.model, options.thinkingMode, config.reasoningDialect);
+  const endpoint = `${config.baseUrl.replace(/\/$/, "")}${config.chatPath}`;
+  const requestBody: Record<string, unknown> = {
+    model: config.model,
+    messages: (await toProviderMessages(messages, toolResults, options.thinkingMode, options.projectPath, config.model, config.providerDisplayName, options.mode, reasoning)).messages,
+    tools: await getToolsForMode(options.projectPath, options.mode),
+    tool_choice: "auto",
+    temperature: config.temperature,
+    max_tokens: config.maxTokens,
+    ...reasoning.parameters
+  };
+  for (const parameter of reasoning.omitParameters ?? []) delete requestBody[parameter];
+  const sendRequest = (body: Record<string, unknown>) => fetch(endpoint, {
     method: "POST",
     signal: options.signal,
     headers: { "content-type": "application/json", authorization: `Bearer ${config.apiKey}` },
-    body: JSON.stringify({
-      model: config.model,
-      messages: (await toProviderMessages(messages, toolResults, options.thinkingMode, options.projectPath, config.model, config.providerDisplayName, options.mode)).messages,
-      tools: await getToolsForMode(options.projectPath, options.mode),
-      tool_choice: "auto",
-      temperature: config.temperature,
-      max_tokens: config.maxTokens
-    })
+    body: JSON.stringify(body)
   });
+
+  let activeRequestBody = requestBody;
+  let response = await sendRequest(activeRequestBody);
+  if (!response.ok) {
+    const errorBody = await response.text();
+    const fallbackBody = { ...activeRequestBody };
+    const canRetry = (response.status === 400 || response.status === 422) && removeUnsupportedReasoningControls(
+      fallbackBody,
+      errorBody,
+      reasoningTargetKey(config.baseUrl, config.model, config.reasoningDialect)
+    );
+    if (!canRetry) throw new Error(`AI provider error ${response.status}: ${errorBody.slice(0, 500)}`);
+    activeRequestBody = fallbackBody;
+    response = await sendRequest(activeRequestBody);
+  }
 
   if (!response.ok) {
     const body = await response.text();
@@ -674,20 +1049,26 @@ export async function callAi(
     displayContent = parsed.cleanContent;
   }
 
-  return { content: displayContent, toolCalls };
+  return {
+    content: displayContent,
+    toolCalls,
+    reasoningContent: message?.reasoning_content ?? undefined,
+    reasoningDetails: message?.reasoning_details ?? undefined
+  };
 }
 
 /** Streaming AI call: yields text deltas token-by-token, returns tool calls at the end. */
 export async function* callAiStream(
   messages: AgentMessage[],
-  options: { model?: string; thinkingMode?: ThinkingMode; projectPath?: string; mode?: PermissionMode; sessionId?: string; signal?: AbortSignal } = {}
+  options: { providerId?: string; model?: string; thinkingMode?: ThinkingMode; projectPath?: string; mode?: PermissionMode; sessionId?: string; signal?: AbortSignal } = {}
 ): AsyncGenerator<
   | { type: "text_delta"; content: string }
   | { type: "usage"; usage: AiUsage; model: string; provider: string; requestId: string }
   | { type: "context_snapshot"; snapshot: ContextSnapshot }
-  | { type: "tool_calls"; toolCalls: ToolCall[]; cleanContent?: string }
+  | { type: "reasoning_config"; config: AppliedReasoningConfig }
+  | { type: "tool_calls"; toolCalls: ToolCall[]; cleanContent?: string; reasoningContent?: string; reasoningDetails?: Array<Record<string, unknown>> }
 > {
-  const config = getConfig(options.model);
+  const config = getConfig(options.model, options.providerId);
 
   if (!config.apiKey) {
     yield { type: "text_delta", content: "AI_API_KEY 尚未配置。当前框架已就绪：配置 .env 后即可连接兼容 OpenAI Chat Completions 的模型，并按权限模式执行工具调用。" };
@@ -695,7 +1076,9 @@ export async function* callAiStream(
     return;
   }
 
-  const providerContext = await toProviderMessages(messages, [], options.thinkingMode, options.projectPath, config.model, config.providerDisplayName, options.mode);
+  const selectedThinkingMode = options.thinkingMode ?? "balanced";
+  const reasoning = buildReasoningRequestConfig(config.baseUrl, config.model, selectedThinkingMode, config.reasoningDialect);
+  const providerContext = await toProviderMessages(messages, [], options.thinkingMode, options.projectPath, config.model, config.providerDisplayName, options.mode, reasoning);
   yield { type: "context_snapshot", snapshot: providerContext.snapshot };
   const tools = await getToolsForMode(options.projectPath, options.mode);
   const requestBody: Record<string, unknown> = {
@@ -706,8 +1089,10 @@ export async function* callAiStream(
     temperature: config.temperature,
     max_tokens: config.maxTokens,
     stream: true,
-    stream_options: { include_usage: true }
+    stream_options: { include_usage: true },
+    ...reasoning.parameters
   };
+  for (const parameter of reasoning.omitParameters ?? []) delete requestBody[parameter];
 
   // A stable session key improves upstream prefix-cache routing. Like CC
   // Switch, auto mode is conservative: only endpoints known to accept this
@@ -739,6 +1124,13 @@ export async function* callAiStream(
       delete fallbackBody.prompt_cache_key;
       changed = true;
     }
+    if (canRetry && removeUnsupportedReasoningControls(
+      fallbackBody,
+      errorBody,
+      reasoningTargetKey(config.baseUrl, config.model, config.reasoningDialect)
+    )) {
+      changed = true;
+    }
     if (!changed) {
       throw new Error(`AI provider error ${response.status}: ${errorBody.slice(0, 500)}`);
     }
@@ -750,12 +1142,19 @@ export async function* callAiStream(
     }
   }
 
+  yield {
+    type: "reasoning_config",
+    config: effectiveReasoningConfig(reasoning, activeRequestBody)
+  };
+
   if (!response.body) throw new Error("AI provider returned an empty streaming response");
   const providerRequestId = nanoid();
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let contentBuffer = "";
+  let reasoningContentBuffer = "";
+  let reasoningDetailsBuffer: Array<Record<string, unknown>> | undefined;
   const toolCallMap = new Map<number, { id: string; name: string; argsBuffer: string }>();
   let finalUsage: AiUsage | undefined;
 
@@ -784,6 +1183,17 @@ export async function* callAiStream(
         if (delta.content) {
           contentBuffer += delta.content;
           yield { type: "text_delta", content: delta.content };
+        }
+
+        if (delta.reasoning_content) {
+          reasoningContentBuffer = appendReasoningText(reasoningContentBuffer, delta.reasoning_content);
+        }
+
+        if (delta.reasoning_details?.length) {
+          reasoningDetailsBuffer = mergeReasoningDetails(reasoningDetailsBuffer, delta.reasoning_details);
+          if (!delta.reasoning_content) {
+            reasoningContentBuffer = appendReasoningText(reasoningContentBuffer, reasoningDetailsText(delta.reasoning_details));
+          }
         }
 
         if (delta.tool_calls) {
@@ -827,10 +1237,10 @@ export async function* callAiStream(
   if (toolCalls.length === 0 && contentBuffer) {
     const parsed = parseToolCallsFromText(contentBuffer);
     if (parsed.toolCalls.length > 0) {
-      yield { type: "tool_calls", toolCalls: parsed.toolCalls, cleanContent: parsed.cleanContent };
+      yield { type: "tool_calls", toolCalls: parsed.toolCalls, cleanContent: parsed.cleanContent, reasoningContent: reasoningContentBuffer, reasoningDetails: reasoningDetailsBuffer };
       return;
     }
   }
 
-  yield { type: "tool_calls", toolCalls };
+  yield { type: "tool_calls", toolCalls, reasoningContent: reasoningContentBuffer, reasoningDetails: reasoningDetailsBuffer };
 }

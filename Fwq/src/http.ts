@@ -15,7 +15,7 @@ export function corsHeaders(): Headers {
   return new Headers({
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Authorization, Content-Type",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Max-Age": "86400",
     "Cache-Control": "no-store",
     "Content-Type": "application/json; charset=utf-8"

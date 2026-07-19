@@ -81,7 +81,9 @@ export function estimateMessageTokens(message: AgentMessage): number {
     if (attachment.text !== undefined) return total + Math.ceil(attachment.text.length / 4);
     return total + (attachment.kind === "image" ? 850 : 1_200);
   }, 0) ?? 0;
-  return Math.max(1, Math.ceil((message.content.length + toolCallChars) / 4) + attachmentTokens + 8);
+  const reasoningChars = message.reasoningContent?.length ?? 0;
+  const reasoningDetailChars = message.reasoningDetails ? JSON.stringify(message.reasoningDetails).length : 0;
+  return Math.max(1, Math.ceil((message.content.length + toolCallChars + reasoningChars + reasoningDetailChars) / 4) + attachmentTokens + 8);
 }
 
 function truncateToolMessage(message: AgentMessage): AgentMessage {

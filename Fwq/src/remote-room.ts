@@ -17,7 +17,28 @@ interface DeviceMetadata {
   platform: string;
   appVersion?: string;
   projectName?: string;
+  workspace?: RemoteWorkspace;
   ready: boolean;
+}
+
+interface RemoteWorkspaceSession {
+  id: string;
+  title: string;
+  updatedAt: string;
+  conversationId?: string;
+}
+
+interface RemoteWorkspaceProject {
+  id: string;
+  name: string;
+  sessions: RemoteWorkspaceSession[];
+}
+
+interface RemoteWorkspace {
+  projects: RemoteWorkspaceProject[];
+  models: string[];
+  defaultModel?: string;
+  activeProjectId?: string;
 }
 
 interface DeviceRow {
@@ -26,6 +47,7 @@ interface DeviceRow {
   platform: string;
   app_version: string | null;
   project_name: string | null;
+  workspace_json: string | null;
   ready: number;
   last_seen_at: number;
 }
@@ -40,6 +62,14 @@ interface CommandRow {
   payload_json: string;
   created_at: number;
   updated_at: number;
+}
+
+interface CommandEventRow {
+  id: string;
+  command_id: string;
+  type: string;
+  event_json: string;
+  created_at: number;
 }
 
 function isRole(value: unknown): value is Role {
@@ -59,6 +89,11 @@ function attachmentOf(socket: WebSocket): ConnectionAttachment | undefined {
 }
 
 function commandFromRow(row: CommandRow) {
+  let metadata: Record<string, unknown> = {};
+  try {
+    const payload: unknown = JSON.parse(row.payload_json);
+    if (isObject(payload)) metadata = payload;
+  } catch { /* malformed legacy payloads have no public metadata */ }
   return {
     id: row.id,
     requestId: row.request_id,
@@ -66,6 +101,10 @@ function commandFromRow(row: CommandRow) {
     action: row.action,
     status: row.status,
     summary: row.summary ?? undefined,
+    projectId: stringField(metadata.projectId, 128),
+    sessionId: stringField(metadata.sessionId, 128),
+    model: stringField(metadata.model, 160),
+    conversationId: stringField(metadata.conversationId, 256),
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -80,18 +119,51 @@ function stringField(value: unknown, max: number): string | undefined {
   return typeof value === "string" && value.length > 0 && value.length <= max ? value : undefined;
 }
 
+function parseWorkspace(value: unknown): RemoteWorkspace | undefined {
+  if (!isObject(value) || !Array.isArray(value.projects) || !Array.isArray(value.models)) return undefined;
+  const projects = value.projects.slice(0, 50).flatMap((rawProject) => {
+    if (!isObject(rawProject)) return [];
+    const id = stringField(rawProject.id, 128);
+    const name = stringField(rawProject.name, 160);
+    if (!id || !name || !Array.isArray(rawProject.sessions)) return [];
+    const sessions = rawProject.sessions.slice(0, 30).flatMap((rawSession) => {
+      if (!isObject(rawSession)) return [];
+      const sessionId = stringField(rawSession.id, 128);
+      const title = stringField(rawSession.title, 160);
+      const updatedAt = stringField(rawSession.updatedAt, 64);
+      if (!sessionId || !title || !updatedAt) return [];
+      return [{ id: sessionId, title, updatedAt, conversationId: stringField(rawSession.conversationId, 256) }];
+    });
+    return [{ id, name, sessions }];
+  });
+  const models = value.models.flatMap((rawModel) => {
+    const model = stringField(rawModel, 160);
+    return model ? [model] : [];
+  }).slice(0, 60);
+  return {
+    projects,
+    models: [...new Set(models)],
+    defaultModel: stringField(value.defaultModel, 160),
+    activeProjectId: stringField(value.activeProjectId, 128)
+  };
+}
+
 function parseDevice(value: unknown): DeviceMetadata | undefined {
   if (!isObject(value)) return undefined;
   const id = stringField(value.id, 128);
   const name = stringField(value.name, 128);
   const platform = stringField(value.platform, 64);
   if (!id || !name || !platform) return undefined;
+  const workspace = value.workspace === undefined ? undefined : parseWorkspace(value.workspace);
+  if (value.workspace !== undefined && !workspace) return undefined;
+  if (workspace && JSON.stringify(workspace).length > 48 * 1024) return undefined;
   return {
     id,
     name,
     platform,
     appVersion: stringField(value.appVersion, 64),
     projectName: stringField(value.projectName, 256),
+    workspace,
     ready: value.ready === true
   };
 }
@@ -211,13 +283,14 @@ export class RemoteRoom extends DurableObject<Env> {
   private async upsertDevice(userId: string, device: DeviceMetadata, online: boolean): Promise<void> {
     const now = Date.now();
     await this.env.DB.prepare(`
-      INSERT INTO devices (id, user_id, name, platform, app_version, project_name, ready, online, last_seen_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO devices (id, user_id, name, platform, app_version, project_name, workspace_json, ready, online, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(user_id, id) DO UPDATE SET
         name = excluded.name,
         platform = excluded.platform,
         app_version = excluded.app_version,
         project_name = excluded.project_name,
+        workspace_json = excluded.workspace_json,
         ready = excluded.ready,
         online = excluded.online,
         last_seen_at = excluded.last_seen_at
@@ -228,22 +301,27 @@ export class RemoteRoom extends DurableObject<Env> {
       device.platform,
       device.appVersion ?? null,
       device.projectName ?? null,
+      device.workspace ? JSON.stringify(device.workspace) : null,
       device.ready ? 1 : 0,
       online ? 1 : 0,
       now
     ).run();
   }
 
-  private async snapshot(userId: string): Promise<{ devices: unknown[]; commands: unknown[] }> {
-    const [deviceResult, commandResult] = await Promise.all([
+  private async snapshot(userId: string): Promise<{ devices: unknown[]; commands: unknown[]; events: unknown[] }> {
+    const [deviceResult, commandResult, eventResult] = await Promise.all([
       this.env.DB.prepare(`
-        SELECT id, name, platform, app_version, project_name, ready, last_seen_at
+        SELECT id, name, platform, app_version, project_name, workspace_json, ready, last_seen_at
           FROM devices WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 100
       `).bind(userId).all<DeviceRow>(),
       this.env.DB.prepare(`
         SELECT id, request_id, device_id, action, status, summary, payload_json, created_at, updated_at
           FROM commands WHERE user_id = ? ORDER BY created_at DESC LIMIT 100
-      `).bind(userId).all<CommandRow>()
+      `).bind(userId).all<CommandRow>(),
+      this.env.DB.prepare(`
+        SELECT id, command_id, type, event_json, created_at
+          FROM command_events WHERE user_id = ? ORDER BY created_at DESC LIMIT 400
+      `).bind(userId).all<CommandEventRow>()
     ]);
     const onlineDeviceIds = new Set(
       this.ctx.getWebSockets("agent")
@@ -252,17 +330,30 @@ export class RemoteRoom extends DurableObject<Env> {
         .filter((id): id is string => typeof id === "string")
     );
     return {
-      devices: deviceResult.results.map((row) => ({
+      devices: deviceResult.results.map((row) => {
+        let workspace: RemoteWorkspace | undefined;
+        try { workspace = parseWorkspace(JSON.parse(row.workspace_json || "null")); } catch { workspace = undefined; }
+        return {
         id: row.id,
         name: row.name,
         platform: row.platform,
         appVersion: row.app_version ?? undefined,
         projectName: row.project_name ?? undefined,
+        workspace,
         ready: onlineDeviceIds.has(row.id) && row.ready === 1,
         online: onlineDeviceIds.has(row.id),
         lastSeenAt: row.last_seen_at
-      })),
-      commands: commandResult.results.map(commandFromRow)
+        };
+      }),
+      commands: commandResult.results.map(commandFromRow),
+      events: eventResult.results.reverse().flatMap((row) => {
+        try {
+          const event: unknown = JSON.parse(row.event_json);
+          return isObject(event)
+            ? [{ id: row.id, commandId: row.command_id, type: row.type, event, createdAt: row.created_at }]
+            : [];
+        } catch { return []; }
+      })
     };
   }
 

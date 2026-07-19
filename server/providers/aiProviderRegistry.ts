@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import type { AiProviderConfig } from "../storage/database";
 import {
   deleteUserAiProvider,
-  getActiveAiProviderId,
   getUserAiProvider,
   listUserAiProviders,
   saveUserAiProvider,
@@ -60,10 +59,14 @@ function providerEntryToConfig(id: string, provider: ProviderEntry, source: "bui
     apiKey: provider.apiKey,
     apiKeyEnv: provider.apiKeyEnv,
     chatCompletionsPath: provider.chatCompletionsPath,
+    imageGenerationPath: provider.imageGenerationPath,
     modelsPath: provider.modelsPath,
     balancePath: provider.balancePath,
     defaultModel: provider.defaultModel,
     fallbackModels: provider.fallbackModels,
+    defaultImageModel: provider.defaultImageModel,
+    imageModels: provider.imageModels,
+    reasoningDialect: provider.reasoningDialect,
     enabled: provider.enabled !== false,
     source
   };
@@ -95,6 +98,49 @@ export function listAiProviders() {
   };
 }
 
+export interface WorkAiSyncCandidate {
+  providerId: string;
+  displayName: string;
+  baseUrl: string;
+  chatCompletionsPath: string;
+  model: string;
+  models: string[];
+  imageGenerationPath: string;
+  defaultImageModel?: string;
+  imageModels: string[];
+  apiKey: string;
+}
+
+export async function getWorkAiSyncCandidate(providerId?: string): Promise<WorkAiSyncCandidate> {
+  const selectedId = providerId?.trim() || getRuntimeConfig().providerName;
+  if (!selectedId) throw new Error("请先选择一个 AI 接口");
+  const provider = resolveProviderForTest(selectedId);
+  const apiKey = resolveProviderApiKey(provider);
+  if (!apiKey) throw new Error(`AI 接口“${provider.displayName}”尚未配置 API Key`);
+  const discovered = await fetchModelsForConfig(provider);
+  return {
+    providerId: provider.id,
+    displayName: provider.displayName,
+    baseUrl: provider.baseUrl,
+    chatCompletionsPath: provider.chatCompletionsPath || "/chat/completions",
+    model: provider.defaultModel,
+    models: [...new Set([
+      provider.defaultModel,
+      ...(provider.fallbackModels ?? []),
+      ...discovered.models.map((model) => model.id)
+    ].filter(Boolean))].slice(0, 80),
+    imageGenerationPath: provider.imageGenerationPath || "/images/generations",
+    defaultImageModel: provider.defaultImageModel,
+    imageModels: [...new Set([provider.defaultImageModel, ...(provider.imageModels ?? [])].filter((model): model is string => Boolean(model)))].slice(0, 40),
+    apiKey
+  };
+}
+
+export async function getWorkAiSyncCandidates(): Promise<WorkAiSyncCandidate[]> {
+  const configured = listAiProviders().providers.filter((provider) => provider.configured && provider.enabled !== false);
+  return Promise.all(configured.map((provider) => getWorkAiSyncCandidate(provider.id)));
+}
+
 export function normalizeAiProviderInput(input: Partial<AiProviderConfig>) {
   const id = typeof input.id === "string" && input.id.trim()
     ? input.id.trim().replace(/[^a-zA-Z0-9_-]/g, "-")
@@ -113,10 +159,18 @@ export function normalizeAiProviderInput(input: Partial<AiProviderConfig>) {
     chatCompletionsPath: typeof input.chatCompletionsPath === "string" && input.chatCompletionsPath.trim()
       ? input.chatCompletionsPath.trim()
       : "/chat/completions",
+    imageGenerationPath: typeof input.imageGenerationPath === "string" && input.imageGenerationPath.trim()
+      ? input.imageGenerationPath.trim()
+      : "/images/generations",
     modelsPath: typeof input.modelsPath === "string" && input.modelsPath.trim() ? input.modelsPath.trim() : "/models",
     balancePath: typeof input.balancePath === "string" && input.balancePath.trim() ? input.balancePath.trim() : undefined,
     defaultModel,
     fallbackModels: Array.isArray(input.fallbackModels) ? input.fallbackModels.map(String).filter(Boolean) : [],
+    defaultImageModel: typeof input.defaultImageModel === "string" && input.defaultImageModel.trim() ? input.defaultImageModel.trim() : undefined,
+    imageModels: Array.isArray(input.imageModels) ? input.imageModels.map(String).map((model) => model.trim()).filter(Boolean) : [],
+    reasoningDialect: (input.reasoningDialect === "sub2api" || input.reasoningDialect === "openai-compatible"
+      ? input.reasoningDialect
+      : "auto") as AiProviderConfig["reasoningDialect"],
     enabled: input.enabled !== false,
     source: "user" as const
   };
@@ -192,6 +246,12 @@ function resolveProviderForTest(id: string): AiProviderConfig {
   const userProvider = getUserAiProvider(id);
   if (userProvider) return userProvider;
   throw new Error(`AI provider "${id}" was not found`);
+}
+
+/** Resolves a configured provider for an Agent request without changing the desktop-wide active provider. */
+export function resolveAiProviderForExecution(id: string): AiProviderConfig {
+  const provider = resolveProviderForTest(id);
+  return { ...provider, apiKey: resolveProviderApiKey(provider) };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

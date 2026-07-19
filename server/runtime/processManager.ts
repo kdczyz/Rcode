@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { analyzeShellCommand, getWorkspaceRoot } from "../security/sandbox";
+import { redactSecrets, resolveSecretEnvironment } from "../security/secrets";
 import type { ManagedProcessSnapshot, ManagedProcessStatus } from "../shared/types";
 
 const MAX_OUTPUT_CHARS = 100_000;
@@ -23,6 +24,8 @@ interface ManagedProcessRecord {
   output: string;
   outputVersion: number;
   stopRequested: boolean;
+  secretValues: string[];
+  redactionCarry: string;
 }
 
 export interface StartManagedProcessInput {
@@ -31,6 +34,7 @@ export interface StartManagedProcessInput {
   projectPath?: string;
   label?: string;
   startupWaitMs?: number;
+  secretRefs?: unknown;
 }
 
 function safeEnvironment() {
@@ -49,8 +53,40 @@ function stripAnsi(value: string) {
 }
 
 function appendOutput(record: ManagedProcessRecord, chunk: Buffer | string) {
-  const next = stripAnsi(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+  const raw = stripAnsi(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+  if (record.secretValues.length === 0) {
+    record.output = `${record.output}${raw}`.slice(-MAX_OUTPUT_CHARS);
+    record.outputVersion += 1;
+    return;
+  }
+  const combined = `${record.redactionCarry}${raw}`;
+  const maxSecretLength = Math.max(...record.secretValues.map((secret) => secret.length));
+  let safeCutoff = Math.max(0, combined.length - (maxSecretLength - 1));
+  let extended = true;
+  while (extended) {
+    extended = false;
+    for (const secret of record.secretValues) {
+      let index = combined.indexOf(secret);
+      while (index >= 0) {
+        const end = index + secret.length;
+        if (index < safeCutoff && end > safeCutoff) {
+          safeCutoff = end;
+          extended = true;
+        }
+        index = combined.indexOf(secret, index + 1);
+      }
+    }
+  }
+  const next = redactSecrets(combined.slice(0, safeCutoff), record.secretValues);
+  record.redactionCarry = combined.slice(safeCutoff);
   record.output = `${record.output}${next}`.slice(-MAX_OUTPUT_CHARS);
+  record.outputVersion += 1;
+}
+
+function flushRedactionCarry(record: ManagedProcessRecord) {
+  if (!record.redactionCarry) return;
+  record.output = `${record.output}${redactSecrets(record.redactionCarry, record.secretValues)}`.slice(-MAX_OUTPUT_CHARS);
+  record.redactionCarry = "";
   record.outputVersion += 1;
 }
 
@@ -110,11 +146,12 @@ export class ManagedProcessManager {
       (analysis.interactive ? "Interactive terminal applications are not supported by managed process sessions." : undefined) ??
       (analysis.leaksEnvironment ? "Command may expose sensitive environment variables." : undefined);
     if (blockedReason) throw new Error(blockedReason);
+    const secrets = resolveSecretEnvironment(input.secretRefs);
 
     const id = `process_${randomUUID()}`;
     const child = spawn("zsh", ["-lc", input.command], {
       cwd: analysis.cwd,
-      env: safeEnvironment(),
+      env: { ...safeEnvironment(), ...secrets.env },
       detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"]
     });
@@ -130,7 +167,9 @@ export class ManagedProcessManager {
       startedAt: new Date().toISOString(),
       output: "",
       outputVersion: 0,
-      stopRequested: false
+      stopRequested: false,
+      secretValues: secrets.values,
+      redactionCarry: ""
     };
     this.records.set(id, record);
 
@@ -138,10 +177,12 @@ export class ManagedProcessManager {
     child.stderr.on("data", (chunk) => appendOutput(record, chunk));
     child.on("error", (error) => {
       appendOutput(record, `${error.message}\n`);
+      flushRedactionCarry(record);
       record.status = "failed";
       record.endedAt = new Date().toISOString();
     });
     child.on("exit", (code, signal) => {
+      flushRedactionCarry(record);
       record.exitCode = code ?? undefined;
       record.signal = signal ?? undefined;
       record.endedAt = new Date().toISOString();

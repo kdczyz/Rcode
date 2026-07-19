@@ -82,6 +82,10 @@ export class RemoteController {
       action,
       status: "queued",
       summary: action === "agent.run" && typeof payload.prompt === "string" ? payload.prompt : undefined,
+      projectId: typeof payload.projectId === "string" ? payload.projectId : undefined,
+      sessionId: typeof payload.sessionId === "string" ? payload.sessionId : undefined,
+      model: typeof payload.model === "string" ? payload.model : undefined,
+      conversationId: typeof payload.conversationId === "string" ? payload.conversationId : undefined,
       createdAt: now,
       updatedAt: now
     };
