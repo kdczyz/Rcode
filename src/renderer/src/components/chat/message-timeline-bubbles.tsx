@@ -1,0 +1,2069 @@
+import type { ReactElement } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { ArrowDown, Check, ChevronDown, ChevronLeft, ChevronRight, Copy, Download, File, FileEdit, GitFork, ImageIcon, Loader2, MessageSquareQuote, PencilLine, RotateCcw, Terminal, Video, Wrench } from 'lucide-react'
+import type { AttachmentReference, ChatBlock, GeneratedFileReference, RuntimeDisclosureMetadata, ToolBlock, UserFileReference, UserInputAnswer } from '../../agent/types'
+import { extractUnifiedDiffText } from '../../lib/diff-stats'
+import { useChatStore } from '../../store/chat-store'
+import { runTrustedUserActivation } from '../../extensions/protected-user-activation'
+import { getProvider } from '../../agent/registry'
+import { parseWritePromptForDisplay } from '../../write/quoted-selection'
+import { parseClawUserPromptForDisplay, type ClawUserPromptDisplay } from '@shared/app-settings'
+import { parseBackgroundShellCompletionNotice } from '@shared/background-shell-notice'
+import { parseBackgroundSubagentCompletionNotice } from '@shared/background-subagent-notice'
+import type { WriteExportFormat } from '@shared/write-export'
+import { isBackgroundShellNoticeBlock, isBackgroundSubagentNoticeBlock } from './message-timeline-turns'
+import { openWorkspacePathInEditor } from '../../lib/open-workspace-path'
+import { DiffView } from '../DiffView'
+import { AssistantMarkdown } from './AssistantMarkdown'
+import { ImagePreviewLightbox } from './ImagePreviewLightbox'
+import { ModelMetaTag, WritePromptMetaDisclosure } from './message-timeline-cards'
+import { readNumber, formatDuration, formatToolTitle, summarizeBackgroundShellToolBlock } from './message-timeline-tools'
+import {
+  answerDisplayValues,
+  answersByQuestionId,
+  shouldShowQuestionHeader
+} from './user-input-panel-logic'
+import { InjectedMemoryMetaChip } from './injected-memory-meta-chip'
+import { isPresentationArtifactPath } from './presentation-file-artifacts'
+import { readGeneratedWorkspaceImagePreview } from './generated-media-preview'
+import { useTimelineFilePreviewWorkspaceRoot } from './timeline-file-preview-workspace'
+
+const COPY_FEEDBACK_RESET_MS = 1600
+const ASSISTANT_EXPORT_FORMATS: WriteExportFormat[] = ['pdf', 'docx', 'png', 'html']
+
+function BackgroundShellNoticeBubble({
+  block,
+  nested = false
+}: {
+  block: Extract<ChatBlock, { kind: 'user' }>
+  nested?: boolean
+}): ReactElement {
+  const { t } = useTranslation('common')
+  const [outputExpanded, setOutputExpanded] = useState(false)
+  const parsed = useMemo(() => parseBackgroundShellCompletionNotice(block.text), [block.text])
+  const title =
+    block.meta?.displayText?.trim() ||
+    t('backgroundShellNotice.title', { defaultValue: 'Background shell completed' })
+  const outputPreview = parsed?.outputPreview ?? ''
+  const canExpandOutput = outputPreview.length > 180
+  const exitCodeTone =
+    parsed && parsed.exitCode === 0
+      ? 'border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+      : 'border-orange-400/30 bg-orange-500/10 text-orange-800 dark:text-orange-200'
+
+  return (
+    <div className={nested ? 'min-w-0' : 'flex w-full justify-start'}>
+      <div className="w-full max-w-[min(640px,calc(100vw-3rem))] rounded-[18px] border border-accent/25 bg-[linear-gradient(180deg,rgba(79,124,255,0.06),rgba(79,124,255,0.1))] px-3.5 py-3 text-ds-muted shadow-sm">
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          <span className="rounded-full border border-accent/25 bg-accent/10 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-accent">
+            {t('backgroundShellNotice.kindLabel', { defaultValue: 'Background callback' })}
+          </span>
+          {parsed ? (
+            <>
+              <span
+                className="inline-flex items-center gap-1 rounded-full border border-ds-border/80 bg-ds-card/70 px-2 py-0.5 font-mono text-[11px] text-ds-ink"
+                title={parsed.sessionId}
+              >
+                <span className="font-sans font-medium text-ds-muted">
+                  {t('backgroundShellNotice.sessionId', { defaultValue: 'Session' })}
+                </span>
+                <span>{parsed.sessionId}</span>
+              </span>
+              <span
+                className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-[11px] ${exitCodeTone}`}
+              >
+                <span className="font-sans font-medium opacity-80">
+                  {t('backgroundShellNotice.exitCode', { defaultValue: 'Exit code' })}
+                </span>
+                <span>{parsed.exitCode}</span>
+              </span>
+            </>
+          ) : null}
+        </div>
+        <div className="min-w-0">
+            <p className="text-[13px] font-medium text-ds-ink">{title}</p>
+            {parsed ? (
+              <dl className="mt-2 space-y-1.5 text-[12.5px] leading-5">
+                <div className="flex flex-wrap gap-x-2">
+                  <dt className="font-medium text-ds-muted">
+                    {t('backgroundShellNotice.command', { defaultValue: 'Command' })}
+                  </dt>
+                  <dd className="min-w-0 break-all font-mono text-ds-ink">{parsed.command}</dd>
+                </div>
+              </dl>
+            ) : null}
+            {outputPreview ? (
+              <div className="mt-2.5">
+                <button
+                  type="button"
+                  className={`flex w-full items-center justify-between gap-2 text-left text-[12px] font-medium text-ds-muted ${
+                    canExpandOutput ? 'hover:text-ds-ink' : 'cursor-default'
+                  }`}
+                  onClick={() => {
+                    if (canExpandOutput) setOutputExpanded((value) => !value)
+                  }}
+                  disabled={!canExpandOutput}
+                >
+                  <span>{t('backgroundShellNotice.outputPreview', { defaultValue: 'Output preview' })}</span>
+                  {canExpandOutput ? (
+                    outputExpanded ? (
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    ) : (
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    )
+                  ) : null}
+                </button>
+                <pre
+                  className={`mt-1 overflow-auto whitespace-pre-wrap break-words rounded-[10px] border border-ds-border/70 bg-ds-card/70 px-2.5 py-2 font-mono text-[11.5px] leading-5 text-ds-ink ${
+                    canExpandOutput && !outputExpanded ? 'max-h-24' : 'max-h-72'
+                  }`}
+                >
+                  {outputPreview}
+                </pre>
+              </div>
+            ) : null}
+            {parsed?.outputFile ? (
+              <p className="mt-2 truncate font-mono text-[11px] text-ds-muted" title={parsed.outputFile}>
+                {t('backgroundShellNotice.outputFile', { defaultValue: 'Full output file' })}: {parsed.outputFile}
+              </p>
+            ) : null}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function BackgroundSubagentNoticeBubble({
+  block,
+  nested = false
+}: {
+  block: Extract<ChatBlock, { kind: 'user' }>
+  nested?: boolean
+}): ReactElement {
+  const { t } = useTranslation('common')
+  const parsed = useMemo(() => parseBackgroundSubagentCompletionNotice(block.text), [block.text])
+  const title =
+    block.meta?.displayText?.trim() ||
+    t('backgroundSubagentNotice.title', { defaultValue: 'Background subagent completed' })
+  const isFailed = parsed?.status === 'failed'
+  const statusTone = isFailed
+    ? 'border-orange-400/30 bg-orange-500/10 text-orange-800 dark:text-orange-200'
+    : 'border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+
+  return (
+    <div className={nested ? 'min-w-0' : 'flex w-full justify-start'}>
+      <div className="w-full max-w-[min(640px,calc(100vw-3rem))] rounded-[18px] border border-accent/25 bg-[linear-gradient(180deg,rgba(79,124,255,0.06),rgba(79,124,255,0.1))] px-3.5 py-3 text-ds-muted shadow-sm">
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          <span className="rounded-full border border-accent/25 bg-accent/10 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-accent">
+            {t('backgroundSubagentNotice.kindLabel', { defaultValue: 'Background callback' })}
+          </span>
+          {parsed ? (
+            <>
+              <span
+                className="inline-flex items-center gap-1 rounded-full border border-ds-border/80 bg-ds-card/70 px-2 py-0.5 font-mono text-[11px] text-ds-ink"
+                title={parsed.childId}
+              >
+                <span className="font-sans font-medium text-ds-muted">
+                  {t('backgroundSubagentNotice.childId', { defaultValue: 'Child' })}
+                </span>
+                <span>{parsed.childId}</span>
+              </span>
+              <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] ${statusTone}`}>
+                <span className="font-medium opacity-80">
+                  {t('backgroundSubagentNotice.status', { defaultValue: 'Status' })}
+                </span>
+                <span>{parsed.status}</span>
+              </span>
+            </>
+          ) : null}
+        </div>
+        <div className="min-w-0">
+          <p className="text-[13px] font-medium text-ds-ink">{title}</p>
+          {parsed?.label ? (
+            <dl className="mt-2 space-y-1.5 text-[12.5px] leading-5">
+              <div className="flex flex-wrap gap-x-2">
+                <dt className="font-medium text-ds-muted">
+                  {t('backgroundSubagentNotice.agent', { defaultValue: 'Agent' })}
+                </dt>
+                <dd className="min-w-0 break-words text-ds-ink">{parsed.label}</dd>
+              </div>
+            </dl>
+          ) : null}
+          {parsed?.summary ? (
+            <div className="mt-2.5">
+              <p className="text-[12px] font-medium text-ds-muted">
+                {t('backgroundSubagentNotice.summary', { defaultValue: 'Summary' })}
+              </p>
+              <div className="ds-markdown mt-1 rounded-[10px] border border-ds-border/70 bg-ds-card/70 px-2.5 py-2 text-[12.5px] leading-5 text-ds-ink">
+                <AssistantMarkdown text={parsed.summary} streaming={false} />
+              </div>
+            </div>
+          ) : null}
+          {parsed?.error ? (
+            <pre className="mt-2.5 overflow-auto whitespace-pre-wrap break-words rounded-[10px] border border-orange-400/30 bg-orange-500/10 px-2.5 py-2 font-mono text-[11.5px] leading-5 text-orange-900 dark:text-orange-100">
+              {parsed.error}
+            </pre>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * User message bubble with hover affordance to rewind/edit. Click the rewind
+ * pill, the bubble flips into a textarea, and Resend submits an edited
+ * version of the message — locally truncating subsequent turns and starting
+ * a fresh turn on the same thread (see chat-store `rewindAndResend`).
+ */
+function UserMessageBubble({
+  block
+}: {
+  block: Extract<ChatBlock, { kind: 'user' }>
+}): ReactElement {
+  const { t } = useTranslation('common')
+  const busy = useChatStore((s) => s.busy)
+  const route = useChatStore((s) => s.route)
+  const rewindAndResend = useChatStore((s) => s.rewindAndResend)
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(block.text)
+  const [writeMetaOpen, setWriteMetaOpen] = useState(false)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const parsedWritePrompt = useMemo(() => {
+    if (route !== 'write') return null
+    const parsed = parseWritePromptForDisplay(block.text)
+    return parsed?.userInput.trim() ? parsed : null
+  }, [block.text, route])
+  const parsedClawPrompt = useMemo(() => {
+    const parsed = parseClawUserPromptForDisplay(block.text)
+    if (!parsed.managed && !parsed.inbound && block.managedBy !== 'claw' && route !== 'claw') return null
+    return parsed
+  }, [block.managedBy, block.text, route])
+  const metaDisplayText =
+    typeof block.meta?.displayText === 'string' && block.meta.displayText.trim()
+      ? block.meta.displayText.trim()
+      : null
+  const displayText = metaDisplayText ?? parsedWritePrompt?.userInput ?? parsedClawPrompt?.text ?? block.text
+  const canEdit = route === 'chat' || !metaDisplayText
+  const showClawInboundCard = route === 'claw' && parsedClawPrompt?.inbound === true
+
+  useEffect(() => {
+    if (!editing) return
+    const el = textareaRef.current
+    if (!el) return
+    el.focus()
+    const len = el.value.length
+    el.setSelectionRange(len, len)
+    // Auto-size to content
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, 360)}px`
+  }, [editing])
+
+  useEffect(() => {
+    setWriteMetaOpen(false)
+  }, [block.id])
+
+  const startEdit = (): void => {
+    if (busy || !canEdit) return
+    setDraft(displayText)
+    setEditing(true)
+  }
+
+  const cancelEdit = (): void => {
+    setDraft(block.text)
+    setEditing(false)
+  }
+
+  const submit = async (): Promise<void> => {
+    const trimmed = draft.trim()
+    if (!trimmed || busy) return
+    setEditing(false)
+    await rewindAndResend(block.id, trimmed)
+  }
+
+  if (editing) {
+    return (
+      <div className="ds-user-message">
+        <UserAttachmentPreviews meta={block.meta} />
+        <div className="ds-user-message-bubble min-w-0 border border-accent/35 ring-1 ring-accent/15">
+          <textarea
+            ref={textareaRef}
+            value={draft}
+            onChange={(e) => {
+              setDraft(e.target.value)
+              const el = e.currentTarget
+              el.style.height = 'auto'
+              el.style.height = `${Math.min(el.scrollHeight, 360)}px`
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') {
+                e.preventDefault()
+                cancelEdit()
+              } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault()
+                void submit()
+              }
+            }}
+            rows={2}
+            className="block w-full min-w-0 resize-none break-words bg-transparent text-[15px] font-medium leading-[1.58] text-ds-ink outline-none [overflow-wrap:anywhere]"
+          />
+          <div className="mt-2 flex items-center justify-between gap-3">
+            <span className="text-[12px] text-ds-faint">{t('rewindHint')}</span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={cancelEdit}
+                className="rounded-md px-3 py-1 text-[13px] font-medium text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink"
+              >
+                {t('rewindCancel')}
+              </button>
+              <button
+                type="button"
+                onClick={() => void submit()}
+                disabled={!draft.trim() || busy}
+                className="rounded-md bg-accent px-3 py-1 text-[13px] font-medium text-white shadow-sm transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {t('rewindResend')}
+              </button>
+            </div>
+          </div>
+        </div>
+        <div className="mt-2 flex min-w-0 items-center justify-between gap-3">
+          {block.meta?.workspaceCheckpointId ? (
+            <span className="min-w-0 flex-1 text-left text-[12px] font-medium leading-5 text-ds-faint">
+              {t('rewindFileRollbackNotice')}
+            </span>
+          ) : (
+            <span className="min-w-0 flex-1" />
+          )}
+          <ModelMetaTag label={block.modelLabel} />
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="ds-user-message group relative">
+      <UserAttachmentPreviews meta={block.meta} />
+      {showClawInboundCard && parsedClawPrompt ? (
+        <ClawInboundMessageCard display={parsedClawPrompt} text={displayText} />
+      ) : (
+        <div className="ds-user-message-bubble min-w-0">
+          <div className="whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-left">
+            {displayText}
+          </div>
+          {parsedWritePrompt ? (
+            <WritePromptMetaDisclosure
+              display={parsedWritePrompt}
+              expanded={writeMetaOpen}
+              onToggle={() => setWriteMetaOpen((value) => !value)}
+            />
+          ) : null}
+          <UserFileReferenceChips meta={block.meta} />
+          <RuntimeMetaChips meta={block.meta} align="right" hideAttachments />
+        </div>
+      )}
+      <div className="mt-2 flex min-w-0 items-center justify-between gap-3 text-ds-faint opacity-90 transition group-hover:opacity-100">
+        <ModelMetaTag label={block.modelLabel} className="flex-1 justify-start text-left" />
+        <div className="flex items-center justify-end gap-3">
+          <CopyFeedbackButton text={displayText} iconOnly />
+          {canEdit ? (
+            <button
+              type="button"
+              onClick={startEdit}
+              disabled={busy}
+              title={t('rewindEditMessage')}
+              aria-label={t('rewindEditMessage')}
+              className="rounded-md p-1 transition hover:bg-ds-hover hover:text-ds-muted disabled:cursor-not-allowed disabled:hover:text-ds-faint"
+            >
+              <PencilLine className="h-4 w-4" strokeWidth={1.8} />
+            </button>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ClawInboundMessageCard({
+  display,
+  text
+}: {
+  display: ClawUserPromptDisplay
+  text: string
+}): ReactElement {
+  const { t } = useTranslation('common')
+  const meta = [
+    display.sender ? t('clawTimelineSender', { sender: display.sender }) : '',
+    display.chatType ? t('clawTimelineChatType', { chatType: display.chatType }) : '',
+    display.messageType ? t('clawTimelineMessageType', { messageType: display.messageType }) : '',
+    display.mentions ? t('clawTimelineMentions', { mentions: display.mentions }) : ''
+  ].filter(Boolean)
+
+  return (
+    <div className="w-full max-w-[min(560px,calc(100vw-3rem))] rounded-[18px] border border-ds-border bg-ds-card px-4 py-3 text-left shadow-[0_14px_34px_rgba(86,103,136,0.08)]">
+      <div className="flex items-center gap-2 text-[12px] font-semibold text-ds-muted">
+        <MessageSquareQuote className="h-3.5 w-3.5" strokeWidth={1.8} />
+        <span>{t('clawTimelineInbound', { source: display.sourceLabel ?? t('claw') })}</span>
+      </div>
+      <div className="mt-2 whitespace-pre-wrap break-words text-[15px] leading-6 text-ds-ink [overflow-wrap:anywhere]">
+        {text}
+      </div>
+      {meta.length > 0 ? (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {meta.map((item) => (
+            <span
+              key={item}
+              className="rounded-md border border-ds-border-muted bg-ds-subtle px-2 py-0.5 text-[11px] text-ds-muted"
+            >
+              {item}
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function metaStringArray(meta: Record<string, unknown> | undefined, key: string): string[] {
+  const value = meta?.[key]
+  if (!Array.isArray(value)) return []
+  return value.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+}
+
+function metaInstructionSources(meta: Record<string, unknown> | undefined): Array<{ path: string; scope: string }> {
+  const value = meta?.injectedInstructionSources
+  if (!Array.isArray(value)) return []
+  return value
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return null
+      const raw = entry as Record<string, unknown>
+      const path = typeof raw.path === 'string' && raw.path.trim() ? raw.path.trim() : ''
+      const scope = typeof raw.scope === 'string' && raw.scope.trim() ? raw.scope.trim() : ''
+      return path ? { path, scope } : null
+    })
+    .filter((entry): entry is { path: string; scope: string } => entry !== null)
+}
+
+function metaString(meta: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = meta?.[key]
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function metaAttachmentReferences(meta: RuntimeDisclosureMetadata | undefined): AttachmentReference[] {
+  const value = meta?.attachments
+  if (!Array.isArray(value)) return []
+  return value
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return null
+      const raw = entry as Record<string, unknown>
+      const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : ''
+      if (!id) return null
+      const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : undefined
+      const mimeType = typeof raw.mimeType === 'string' && raw.mimeType.trim() ? raw.mimeType.trim() : undefined
+      const byteSize = typeof raw.byteSize === 'number' && Number.isFinite(raw.byteSize) ? raw.byteSize : undefined
+      const previewUrl = typeof raw.previewUrl === 'string' && raw.previewUrl.trim() ? raw.previewUrl.trim() : undefined
+      const width = typeof raw.width === 'number' && Number.isFinite(raw.width) ? raw.width : undefined
+      const height = typeof raw.height === 'number' && Number.isFinite(raw.height) ? raw.height : undefined
+      return {
+        id,
+        ...(name ? { name } : {}),
+        ...(mimeType ? { mimeType } : {}),
+        ...(byteSize ? { byteSize } : {}),
+        ...(width ? { width } : {}),
+        ...(height ? { height } : {}),
+        ...(previewUrl ? { previewUrl } : {})
+      }
+    })
+    .filter((entry): entry is AttachmentReference => entry !== null)
+}
+
+function metaUserFileReferences(meta: RuntimeDisclosureMetadata | undefined): UserFileReference[] {
+  const value = meta?.fileReferences
+  if (!Array.isArray(value)) return []
+  return value
+    .map((entry): UserFileReference | null => {
+      if (!entry || typeof entry !== 'object') return null
+      const raw = entry as Record<string, unknown>
+      const path = typeof raw.path === 'string' && raw.path.trim() ? raw.path.trim() : ''
+      const relativePath =
+        typeof raw.relativePath === 'string' && raw.relativePath.trim() ? raw.relativePath.trim() : ''
+      const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : ''
+      const kind = raw.kind === 'directory' ? 'directory' : 'file'
+      if (!path || !relativePath || !name) return null
+      return { path, relativePath, name, kind }
+    })
+    .filter((entry): entry is UserFileReference => entry !== null)
+}
+
+function UserFileReferenceChips({
+  meta
+}: {
+  meta?: RuntimeDisclosureMetadata
+}): ReactElement | null {
+  const { t } = useTranslation('common')
+  const references = useMemo(() => metaUserFileReferences(meta), [meta])
+  if (references.length === 0) return null
+
+  return (
+    <div className="mt-3 flex min-w-0 flex-col items-end gap-1.5 border-t border-white/10 pt-2">
+      <div className="text-[11px] font-medium text-ds-faint">
+        {t('messageFileReferences', { count: references.length })}
+      </div>
+      <div className="flex max-w-full flex-wrap justify-end gap-1.5">
+        {references.map((reference) => {
+          const isDirectory = reference.kind === 'directory'
+          const label = isDirectory
+            ? `${reference.relativePath.replace(/\/+$/g, '')}/`
+            : reference.relativePath
+          return (
+            <span
+              key={`${reference.kind ?? 'file'}:${reference.path}`}
+              title={reference.path}
+              className="inline-flex max-w-[260px] items-center gap-1.5 rounded-md border border-white/10 bg-white/8 px-2 py-1 text-[11.5px] font-medium text-ds-muted"
+            >
+              <File className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
+              <span className="truncate">{label}</span>
+            </span>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+type TimelineMediaReference = GeneratedFileReference & {
+  id?: string
+}
+
+function readMediaString(raw: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = raw[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
+function normalizeGeneratedFileReference(entry: unknown): GeneratedFileReference | null {
+  if (!entry || typeof entry !== 'object') return null
+  const raw = entry as Record<string, unknown>
+  const id = readMediaString(raw, 'id', 'attachmentId')
+  const artifactId = readMediaString(raw, 'artifactId')
+  const mediaHandleId = readMediaString(raw, 'mediaHandleId')
+  const ownerExtensionId = readMediaString(raw, 'ownerExtensionId')
+  const ownerExtensionVersion = readMediaString(raw, 'ownerExtensionVersion')
+  const workspaceId = readMediaString(raw, 'workspaceId')
+  const name = readMediaString(raw, 'name', 'fileName', 'filename')
+  const mimeType = readMediaString(raw, 'mimeType', 'type', 'mediaType')
+  const previewUrl = readMediaString(raw, 'previewUrl', 'dataUrl', 'url')
+  const path = readMediaString(raw, 'path', 'file')
+  const relativePath = readMediaString(raw, 'relativePath', 'relative_path')
+  const absolutePath = readMediaString(raw, 'absolutePath', 'absolute_path')
+  const byteSize = typeof raw.byteSize === 'number' && Number.isFinite(raw.byteSize) ? raw.byteSize : undefined
+  const width = typeof raw.width === 'number' && Number.isFinite(raw.width) ? raw.width : undefined
+  const height = typeof raw.height === 'number' && Number.isFinite(raw.height) ? raw.height : undefined
+  const availability = raw.availability === 'available' || raw.availability === 'unavailable'
+    ? raw.availability
+    : undefined
+  const normalized: GeneratedFileReference = {
+    ...(id ? { id } : {}),
+    ...(artifactId ? { artifactId } : {}),
+    ...(mediaHandleId ? { mediaHandleId } : {}),
+    ...(availability ? { availability } : {}),
+    ...(ownerExtensionId ? { ownerExtensionId } : {}),
+    ...(ownerExtensionVersion ? { ownerExtensionVersion } : {}),
+    ...(workspaceId ? { workspaceId } : {}),
+    ...(name ? { name } : {}),
+    ...(mimeType ? { mimeType } : {}),
+    ...(byteSize ? { byteSize } : {}),
+    ...(width ? { width } : {}),
+    ...(height ? { height } : {}),
+    ...(previewUrl ? { previewUrl } : {}),
+    ...(path ? { path } : {}),
+    ...(relativePath ? { relativePath } : {}),
+    ...(absolutePath ? { absolutePath } : {})
+  }
+  return Object.keys(normalized).length > 0 ? normalized : null
+}
+
+function metaGeneratedFileReferences(meta: Record<string, unknown> | undefined): GeneratedFileReference[] {
+  const value = meta?.generatedFiles
+  if (!Array.isArray(value)) return []
+  return value
+    .map((entry) => normalizeGeneratedFileReference(entry))
+    .filter((entry): entry is GeneratedFileReference => entry !== null)
+}
+
+function mediaKey(media: TimelineMediaReference): string {
+  return (
+    media.id ||
+    media.absolutePath ||
+    media.relativePath ||
+    media.path ||
+    media.previewUrl ||
+    media.name ||
+    'media'
+  )
+}
+
+function mediaName(media: TimelineMediaReference): string {
+  const path = media.relativePath || media.path || media.absolutePath || ''
+  const fromPath = path.split(/[\\/]/).filter(Boolean).at(-1)
+  return media.name || fromPath || media.id || 'file'
+}
+
+function mediaPath(media: TimelineMediaReference): string | undefined {
+  return media.relativePath || media.path || media.absolutePath
+}
+
+function mediaMime(media: TimelineMediaReference): string {
+  return media.mimeType?.toLowerCase() ?? ''
+}
+
+function mediaIsImage(media: TimelineMediaReference): boolean {
+  const mimeType = mediaMime(media)
+  if (mimeType.startsWith('image/')) return true
+  return /\.(?:png|jpe?g|webp|gif|bmp|svg)$/i.test(mediaName(media))
+}
+
+function mediaIsVideo(media: TimelineMediaReference): boolean {
+  const mimeType = mediaMime(media)
+  if (mimeType.startsWith('video/')) return true
+  return /\.(?:mp4|webm|mov|m4v|ogg)$/i.test(mediaName(media))
+}
+
+function formatByteSize(byteSize: number | undefined): string {
+  if (typeof byteSize !== 'number' || !Number.isFinite(byteSize) || byteSize <= 0) return ''
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = byteSize
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  const digits = value >= 10 || unit === 0 ? 0 : 1
+  return `${value.toFixed(digits)} ${units[unit]}`
+}
+
+function dataUrlPayload(dataUrl: string | undefined): { dataBase64: string; mimeType?: string } | null {
+  if (!dataUrl?.startsWith('data:')) return null
+  const match = dataUrl.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,(.*)$/)
+  if (!match?.[2]) return null
+  return {
+    dataBase64: match[2],
+    ...(match[1] ? { mimeType: match[1] } : {})
+  }
+}
+
+function mergeMediaReferences(
+  attachments: AttachmentReference[],
+  generatedFiles: GeneratedFileReference[]
+): TimelineMediaReference[] {
+  const media: TimelineMediaReference[] = []
+  const indexByKey = new Map<string, number>()
+  const indexByName = new Map<string, number>()
+
+  const add = (entry: TimelineMediaReference, allowNameMerge: boolean): void => {
+    const key = mediaKey(entry)
+    const normalizedName = mediaName(entry).toLowerCase()
+    const existingIndex = indexByKey.get(key) ?? (allowNameMerge ? indexByName.get(normalizedName) : undefined)
+    if (existingIndex !== undefined) {
+      media[existingIndex] = { ...media[existingIndex], ...entry }
+      indexByKey.set(mediaKey(media[existingIndex]), existingIndex)
+      indexByName.set(mediaName(media[existingIndex]).toLowerCase(), existingIndex)
+      return
+    }
+    indexByKey.set(key, media.length)
+    indexByName.set(normalizedName, media.length)
+    media.push(entry)
+  }
+
+  for (const file of generatedFiles) add(file, false)
+  for (const attachment of attachments) add(attachment, true)
+  return media
+}
+
+type MediaPreviewRequest =
+  | { key: string; id: string; mode: 'attachment' }
+  | { key: string; path: string; mode: 'workspace-image' }
+
+type GeneratedMediaScrollAvailability = {
+  canScrollBackward: boolean
+  canScrollForward: boolean
+}
+
+export function generatedMediaScrollAvailability({
+  scrollLeft,
+  clientWidth,
+  scrollWidth
+}: {
+  scrollLeft: number
+  clientWidth: number
+  scrollWidth: number
+}): GeneratedMediaScrollAvailability {
+  const edgeTolerance = 2
+  return {
+    canScrollBackward: scrollLeft > edgeTolerance,
+    canScrollForward: scrollLeft + clientWidth < scrollWidth - edgeTolerance
+  }
+}
+
+function isMediaPreviewRequest(entry: MediaPreviewRequest | null): entry is MediaPreviewRequest {
+  return entry !== null
+}
+
+function useMediaPreviewUrls(media: TimelineMediaReference[]): Record<string, string> {
+  const activeThreadId = useChatStore((s) => s.activeThreadId)
+  const globalWorkspaceRoot = useChatStore((s) => s.workspaceRoot)
+  const timelineWorkspaceRoot = useTimelineFilePreviewWorkspaceRoot()
+  const workspaceRoot = timelineWorkspaceRoot || globalWorkspaceRoot
+  const [resolvedPreviewUrls, setResolvedPreviewUrls] = useState<Record<string, string>>({})
+  const [failedPreviewIds, setFailedPreviewIds] = useState<Record<string, true>>({})
+  const previewRequests = useMemo(
+    () =>
+      media
+        .map((item) => {
+          const key = mediaKey(item)
+          if (item.previewUrl || resolvedPreviewUrls[key] || failedPreviewIds[key]) return null
+          if (item.id && !item.artifactId && (mediaIsImage(item) || mediaIsVideo(item) || !item.mimeType)) {
+            return { key, id: item.id, mode: 'attachment' } satisfies MediaPreviewRequest
+          }
+          const path = mediaIsImage(item) ? mediaPath(item) : undefined
+          if (path) return { key, path, mode: 'workspace-image' } satisfies MediaPreviewRequest
+          return null
+        })
+        .filter(isMediaPreviewRequest),
+    [failedPreviewIds, media, resolvedPreviewUrls]
+  )
+  const missingPreviewKey = previewRequests
+    .map((request) =>
+      request.mode === 'attachment'
+        ? `attachment:${request.id}`
+        : `workspace-image:${request.path}`
+    )
+    .join('\n')
+
+  useEffect(() => {
+    if (!missingPreviewKey) return
+    const provider = getProvider()
+    let cancelled = false
+    void Promise.all(
+      previewRequests.map(async (request) => {
+        try {
+          if (request.mode === 'attachment' && request.id && typeof provider.getAttachmentContent === 'function') {
+            const content = await provider.getAttachmentContent(request.id, {
+              ...(activeThreadId ? { threadId: activeThreadId } : {}),
+              ...(workspaceRoot ? { workspace: workspaceRoot } : {})
+            })
+            return {
+              key: request.key,
+              previewUrl: `data:${content.attachment.mimeType};base64,${content.dataBase64}`
+            }
+          }
+          if (request.mode === 'workspace-image' && request.path && typeof window.kunGui?.readWorkspaceImage === 'function') {
+            const previewUrl = await readGeneratedWorkspaceImagePreview({
+              path: request.path,
+              ...(workspaceRoot ? { workspaceRoot } : {}),
+              readImage: window.kunGui.readWorkspaceImage
+            })
+            if (previewUrl) return { key: request.key, previewUrl }
+          }
+          return { key: request.key, failed: true as const }
+        } catch {
+          return { key: request.key, failed: true as const }
+        }
+      })
+    ).then((results) => {
+      if (cancelled) return
+      setResolvedPreviewUrls((current) => {
+        const next = { ...current }
+        for (const result of results) {
+          if ('previewUrl' in result && typeof result.previewUrl === 'string') {
+            next[result.key] = result.previewUrl
+          }
+        }
+        return next
+      })
+      setFailedPreviewIds((current) => {
+        const next = { ...current }
+        for (const result of results) {
+          if ('failed' in result) next[result.key] = true
+        }
+        return next
+      })
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [activeThreadId, missingPreviewKey, previewRequests, workspaceRoot])
+
+  return resolvedPreviewUrls
+}
+
+function MediaPreviewTile({
+  media,
+  previewUrl,
+  variant
+}: {
+  media: TimelineMediaReference
+  previewUrl?: string
+  variant: 'user' | 'tool' | 'conversation'
+}): ReactElement {
+  const { t } = useTranslation('common')
+  const globalWorkspaceRoot = useChatStore((s) => s.workspaceRoot)
+  const timelineWorkspaceRoot = useTimelineFilePreviewWorkspaceRoot()
+  const workspaceRoot = timelineWorkspaceRoot || globalWorkspaceRoot
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [imagePreviewOpen, setImagePreviewOpen] = useState(false)
+  const unavailable = 'availability' in media && media.availability === 'unavailable'
+  const title = mediaName(media)
+  const filePath = mediaPath(media)
+  const mimeType = media.mimeType || (mediaIsImage(media) ? 'image' : mediaIsVideo(media) ? 'video' : '')
+  const byteSize = formatByteSize(media.byteSize)
+  const tileClass =
+    variant === 'conversation'
+      ? 'group aspect-square w-52 shrink-0 snap-start overflow-hidden rounded-xl border border-ds-border-muted bg-ds-card shadow-sm'
+      : variant === 'tool'
+        ? 'block h-32 w-40 overflow-hidden rounded-lg border border-ds-border-muted bg-ds-card shadow-sm'
+        : 'block h-28 w-36 overflow-hidden rounded-lg border border-ds-border-muted bg-ds-card shadow-sm'
+  const revealClass = variant === 'user' ? '' : ' ds-media-printer-reveal'
+  const mediaClass = `h-full w-full ${variant === 'conversation' ? 'object-cover' : 'object-contain'}`
+  const canSave = !unavailable && Boolean(filePath || dataUrlPayload(previewUrl))
+  const canOpenArtifact = !unavailable && Boolean(
+    media.artifactId && media.ownerExtensionId && media.ownerExtensionVersion &&
+    media.workspaceId && workspaceRoot
+  )
+  const saveLabel =
+    saveState === 'saving'
+      ? t('generatedFileSaving')
+      : saveState === 'saved'
+        ? t('generatedFileSaved')
+        : saveState === 'error'
+          ? t('generatedFileSaveFailed')
+          : t('generatedFileDownload')
+  const handleSaveAs = async (): Promise<void> => {
+    if (saveState === 'saving' || typeof window.kunGui?.saveWorkspaceFileAs !== 'function') return
+    const data = dataUrlPayload(previewUrl)
+    if (!filePath && !data) {
+      setSaveState('error')
+      return
+    }
+    setSaveState('saving')
+    try {
+      const result = await window.kunGui.saveWorkspaceFileAs({
+        suggestedName: title,
+        ...(filePath ? { sourcePath: filePath } : {}),
+        ...(workspaceRoot ? { workspaceRoot } : {}),
+        ...(media.mimeType || data?.mimeType ? { mimeType: media.mimeType ?? data?.mimeType } : {}),
+        ...(data && !filePath ? { dataBase64: data.dataBase64 } : {})
+      })
+      if (result.ok) {
+        setSaveState('saved')
+        window.setTimeout(() => setSaveState('idle'), 1600)
+      } else if (result.canceled) {
+        setSaveState('idle')
+      } else {
+        setSaveState('error')
+      }
+    } catch (error) {
+      setSaveState('error')
+      void window.kunGui?.logError?.('file-save-as', 'Failed to save generated file', {
+        message: error instanceof Error ? error.message : String(error),
+        filePath,
+        title
+      }).catch(() => undefined)
+    }
+  }
+  const handleArtifactAction = async (action: 'open' | 'reveal'): Promise<void> => {
+    if (!canOpenArtifact || typeof window.kunGui?.openExtensionArtifact !== 'function') return
+    const result = await window.kunGui.openExtensionArtifact({
+      artifactId: media.artifactId!,
+      ownerExtensionId: media.ownerExtensionId!,
+      ownerExtensionVersion: media.ownerExtensionVersion!,
+      workspaceId: media.workspaceId!,
+      workspaceRoot: workspaceRoot!,
+      action
+    })
+    setSaveState(result.ok ? 'saved' : 'error')
+  }
+  const saveButtonClass =
+    'inline-flex h-7 items-center justify-center rounded-md border border-ds-border-muted bg-ds-card/90 px-2 text-[11.5px] font-medium text-ds-muted shadow-sm transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-50'
+  const iconButtonClass =
+    `absolute right-2 top-2 inline-flex h-8 w-8 items-center justify-center rounded-md border border-ds-border-muted bg-ds-card/92 text-ds-muted shadow-sm backdrop-blur transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-50 ${
+      variant === 'conversation'
+        ? 'opacity-0 focus-visible:opacity-100 group-hover:opacity-100'
+        : ''
+    }`
+  const saveIcon = saveState === 'saving'
+    ? <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.9} />
+    : saveState === 'saved'
+      ? <Check className="h-3.5 w-3.5" strokeWidth={2} />
+      : <Download className="h-3.5 w-3.5" strokeWidth={1.9} />
+  const extensionAttachmentContext = {
+    'data-extension-attachment-item': '',
+    'data-extension-attachment-id': media.id ?? '',
+    'data-extension-attachment-mime': media.mimeType ?? ''
+  }
+
+  if (previewUrl && mediaIsImage(media)) {
+    return (
+      <figure className={`${tileClass}${revealClass} relative`} title={title} {...extensionAttachmentContext}>
+        <button
+          type="button"
+          onClick={() => setImagePreviewOpen(true)}
+          className="block h-full w-full cursor-zoom-in"
+          title={t('imagePreviewOpen', { name: title })}
+          aria-label={t('imagePreviewOpen', { name: title })}
+        >
+          <img src={previewUrl} alt={title} className={mediaClass} loading="lazy" />
+        </button>
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation()
+            void handleSaveAs()
+          }}
+          disabled={!canSave || saveState === 'saving'}
+          title={saveLabel}
+          aria-label={saveLabel}
+          className={iconButtonClass}
+        >
+          {saveIcon}
+        </button>
+        <ImagePreviewLightbox
+          open={imagePreviewOpen}
+          src={previewUrl}
+          alt={title}
+          title={title}
+          downloadDisabled={!canSave || saveState === 'saving'}
+          downloadLabel={saveLabel}
+          onDownload={() => void handleSaveAs()}
+          onClose={() => setImagePreviewOpen(false)}
+        />
+      </figure>
+    )
+  }
+
+  if (previewUrl && mediaIsVideo(media)) {
+    return (
+      <figure className={`${tileClass} relative`} title={title} {...extensionAttachmentContext}>
+        <video src={previewUrl} className={mediaClass} controls preload="metadata" />
+        <button
+          type="button"
+          onClick={() => void handleSaveAs()}
+          disabled={!canSave || saveState === 'saving'}
+          title={saveLabel}
+          aria-label={saveLabel}
+          className={iconButtonClass}
+        >
+          {saveIcon}
+        </button>
+      </figure>
+    )
+  }
+
+  const Icon = mediaIsVideo(media) ? Video : mediaIsImage(media) ? ImageIcon : File
+  return (
+    <div className={`${tileClass} flex flex-col justify-between p-3`} title={title} {...extensionAttachmentContext}>
+      <div className="flex min-w-0 items-start gap-2">
+        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-ds-border-muted bg-ds-subtle text-ds-muted">
+          <Icon className="h-4 w-4" strokeWidth={1.8} />
+        </span>
+        <div className="min-w-0">
+          <div className="line-clamp-2 break-words text-[12.5px] font-semibold leading-5 text-ds-ink">
+            {title}
+          </div>
+          <div className="mt-0.5 truncate text-[11px] text-ds-faint">
+            {unavailable
+              ? t('generatedFilePreviewUnavailable')
+              : [mimeType, byteSize].filter(Boolean).join(' · ') || t('generatedFilePreviewUnavailable')}
+          </div>
+        </div>
+      </div>
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={() => void handleSaveAs()}
+          disabled={!canSave || saveState === 'saving'}
+          className={saveButtonClass}
+          title={saveLabel}
+        >
+          <span className="mr-1.5">{saveIcon}</span>
+          {t('generatedFileDownload')}
+        </button>
+      {canOpenArtifact ? (
+        <>
+          <button
+            type="button"
+            onClick={() => void handleArtifactAction('open')}
+            className={saveButtonClass}
+          >
+            {t('filePreviewOpenEditor')}
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleArtifactAction('reveal')}
+            className={saveButtonClass}
+          >
+            {t('fileTreeRevealInFileManager')}
+          </button>
+        </>
+      ) : null}
+      {filePath && !unavailable ? (
+        <button
+          type="button"
+          onClick={() => void openWorkspacePathInEditor({ path: filePath }, workspaceRoot)}
+          className={saveButtonClass}
+        >
+          {t('filePreviewOpenEditor')}
+        </button>
+      ) : null}
+      </div>
+    </div>
+  )
+}
+
+function MediaAttachmentGallery({
+  media,
+  variant
+}: {
+  media: TimelineMediaReference[]
+  variant: 'user' | 'tool' | 'conversation'
+}): ReactElement | null {
+  const { t } = useTranslation('common')
+  const resolvedPreviewUrls = useMediaPreviewUrls(media)
+  const conversationScrollerRef = useRef<HTMLDivElement>(null)
+  const [scrollAvailability, setScrollAvailability] = useState<GeneratedMediaScrollAvailability>({
+    canScrollBackward: false,
+    canScrollForward: false
+  })
+
+  useEffect(() => {
+    if (variant !== 'conversation') return
+    const scroller = conversationScrollerRef.current
+    if (!scroller) return
+
+    const updateAvailability = (): void => {
+      const next = generatedMediaScrollAvailability(scroller)
+      setScrollAvailability((current) =>
+        current.canScrollBackward === next.canScrollBackward &&
+        current.canScrollForward === next.canScrollForward
+          ? current
+          : next
+      )
+    }
+    updateAvailability()
+    scroller.addEventListener('scroll', updateAvailability, { passive: true })
+
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', updateAvailability)
+      return () => {
+        scroller.removeEventListener('scroll', updateAvailability)
+        window.removeEventListener('resize', updateAvailability)
+      }
+    }
+
+    const resizeObserver = new ResizeObserver(updateAvailability)
+    resizeObserver.observe(scroller)
+    return () => {
+      scroller.removeEventListener('scroll', updateAvailability)
+      resizeObserver.disconnect()
+    }
+  }, [media.length, variant])
+
+  if (media.length === 0) return null
+  const wrapperClass =
+    variant === 'tool'
+        ? 'flex min-w-0 flex-wrap gap-2 border-t border-ds-border-muted/60 px-4 py-3'
+        : 'flex max-w-[80%] flex-wrap justify-end gap-2'
+
+  const tiles = media.map((item) => {
+    const key = mediaKey(item)
+    return (
+      <MediaPreviewTile
+        key={key}
+        media={item}
+        previewUrl={item.previewUrl ?? resolvedPreviewUrls[key]}
+        variant={variant}
+      />
+    )
+  })
+
+  if (variant === 'conversation') {
+    const moveCarousel = (direction: -1 | 1): void => {
+      const scroller = conversationScrollerRef.current
+      if (!scroller) return
+      scroller.scrollBy({
+        left: direction * Math.max(220, scroller.clientWidth * 0.72),
+        behavior: 'smooth'
+      })
+    }
+    const showCarouselControls = scrollAvailability.canScrollBackward || scrollAvailability.canScrollForward
+
+    return (
+      <div className="group/gallery relative min-w-0 w-full" data-extension-attachment-context data-generated-media-carousel>
+        <div
+          ref={conversationScrollerRef}
+          className="flex w-full snap-x snap-mandatory gap-2 overflow-x-auto px-0.5 pb-1 scroll-smooth [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          data-generated-media-strip
+        >
+          {tiles}
+        </div>
+        {showCarouselControls ? (
+          <div className="absolute bottom-3 right-3 flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => moveCarousel(-1)}
+              disabled={!scrollAvailability.canScrollBackward}
+              className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-white/20 bg-black/55 text-white shadow-md backdrop-blur-sm transition hover:bg-black/70 disabled:cursor-default disabled:opacity-35"
+              title={t('generatedFilesPreviousImages')}
+              aria-label={t('generatedFilesPreviousImages')}
+            >
+              <ChevronLeft className="h-5 w-5" strokeWidth={2} />
+            </button>
+            <button
+              type="button"
+              onClick={() => moveCarousel(1)}
+              disabled={!scrollAvailability.canScrollForward}
+              className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-white/20 bg-black/55 text-white shadow-md backdrop-blur-sm transition hover:bg-black/70 disabled:cursor-default disabled:opacity-35"
+              title={t('generatedFilesNextImages')}
+              aria-label={t('generatedFilesNextImages')}
+            >
+              <ChevronRight className="h-5 w-5" strokeWidth={2} />
+            </button>
+          </div>
+        ) : null}
+      </div>
+    )
+  }
+
+  return (
+    <div className={wrapperClass} data-extension-attachment-context>
+      {tiles}
+    </div>
+  )
+}
+
+export function GeneratedFilesPanel({ blocks }: { blocks: ToolBlock[] }): ReactElement | null {
+  const { t } = useTranslation('common')
+  const media = useMemo(() => {
+    const attachments: AttachmentReference[] = []
+    const generatedFiles: GeneratedFileReference[] = []
+    for (const block of blocks) {
+      attachments.push(...metaAttachmentReferences(block.meta as RuntimeDisclosureMetadata | undefined))
+      generatedFiles.push(...metaGeneratedFileReferences(block.meta))
+    }
+    return mergeMediaReferences(attachments, generatedFiles).filter(
+      (file) => !isPresentationArtifactPath(mediaPath(file))
+    )
+  }, [blocks])
+
+  if (media.length === 0) return null
+
+  return (
+    <div className="flex min-w-0 flex-col gap-2">
+      <div className="flex items-center gap-1.5 text-[12px] font-semibold text-ds-faint">
+        <ImageIcon className="h-3.5 w-3.5" strokeWidth={1.8} aria-hidden="true" />
+        <span>{t('generatedFilesTitle')}</span>
+      </div>
+      <MediaAttachmentGallery media={media} variant="conversation" />
+    </div>
+  )
+}
+
+function UserAttachmentPreviews({
+  meta
+}: {
+  meta?: RuntimeDisclosureMetadata
+}): ReactElement | null {
+  const attachments = useMemo(() => {
+    const attachmentIds = metaStringArray(meta, 'attachmentIds')
+    const byId = new Map<string, AttachmentReference>()
+    for (const attachment of metaAttachmentReferences(meta)) {
+      byId.set(attachment.id, attachment)
+    }
+    for (const id of attachmentIds) {
+      if (!byId.has(id)) byId.set(id, { id })
+    }
+    return [...byId.values()]
+  }, [meta])
+
+  if (attachments.length === 0) return null
+
+  return (
+    <div className="mb-2 flex min-w-0 justify-end">
+      <MediaAttachmentGallery media={attachments} variant="user" />
+    </div>
+  )
+}
+
+function ToolAttachmentPreviews({
+  meta
+}: {
+  meta?: Record<string, unknown>
+}): ReactElement | null {
+  const attachments = useMemo(
+    () => metaAttachmentReferences(meta as RuntimeDisclosureMetadata | undefined),
+    [meta]
+  )
+
+  if (attachments.length === 0) return null
+
+  return <MediaAttachmentGallery media={attachments} variant="tool" />
+}
+
+function metaSources(meta: Record<string, unknown> | undefined): Array<{ title?: string; url?: string }> {
+  const value = meta?.sources
+  if (!Array.isArray(value)) return []
+  return value
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return null
+      const raw = entry as Record<string, unknown>
+      const title = typeof raw.title === 'string' && raw.title.trim() ? raw.title.trim() : undefined
+      const url = typeof raw.url === 'string' && raw.url.trim() ? raw.url.trim() : undefined
+      return title || url ? { ...(title ? { title } : {}), ...(url ? { url } : {}) } : null
+    })
+    .filter((entry): entry is { title?: string; url?: string } => entry !== null)
+}
+
+function metaComposerContextLabels(meta: Record<string, unknown> | undefined): string[] {
+  const value = meta?.composerContexts
+  if (!Array.isArray(value)) return []
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') return []
+    const record = entry as Record<string, unknown>
+    const title = typeof record.title === 'string' ? record.title.trim() : ''
+    const provenance = record.provenance && typeof record.provenance === 'object'
+      ? record.provenance as Record<string, unknown>
+      : undefined
+    const extensionId = typeof provenance?.extensionId === 'string'
+      ? provenance.extensionId.trim()
+      : ''
+    return title ? [`${title}${extensionId ? ` (${extensionId})` : ''}`] : []
+  })
+}
+
+function RuntimeMetaChips({
+  meta,
+  align = 'left',
+  hideAttachments = false,
+  hideTurnDisclosure = false
+}: {
+  meta?: Record<string, unknown>
+  align?: 'left' | 'right'
+  hideAttachments?: boolean
+  hideTurnDisclosure?: boolean
+}): ReactElement | null {
+  const { t } = useTranslation('common')
+  const attachmentIds = hideTurnDisclosure || hideAttachments ? [] : metaStringArray(meta, 'attachmentIds')
+  const activeSkillIds = hideTurnDisclosure ? [] : metaStringArray(meta, 'activeSkillIds')
+  const injectedMemoryIds = hideTurnDisclosure ? [] : metaStringArray(meta, 'injectedMemoryIds')
+  const injectedInstructionSources = hideTurnDisclosure ? [] : metaInstructionSources(meta)
+  const composerContextLabels = hideTurnDisclosure ? [] : metaComposerContextLabels(meta)
+  const sources = metaSources(meta)
+  const child = meta?.child && typeof meta.child === 'object' ? meta.child as Record<string, unknown> : null
+  const childLabel =
+    typeof child?.childLabel === 'string' && child.childLabel.trim()
+      ? child.childLabel.trim()
+      : typeof child?.childProfile === 'string' && child.childProfile.trim()
+        ? child.childProfile.trim()
+        : typeof child?.childId === 'string'
+          ? child.childId
+          : ''
+  if (
+    (hideAttachments || attachmentIds.length === 0) &&
+    activeSkillIds.length === 0 &&
+    injectedMemoryIds.length === 0 &&
+    injectedInstructionSources.length === 0 &&
+    composerContextLabels.length === 0 &&
+    sources.length === 0 &&
+    !childLabel
+  ) {
+    return null
+  }
+  const chipClass = 'inline-flex max-w-full items-center gap-1 rounded-md border border-ds-border-muted bg-ds-card/75 px-1.5 py-0.5 text-[11px] font-medium text-ds-faint'
+  return (
+    <div className={`mt-2 flex min-w-0 flex-wrap gap-1.5 ${align === 'right' ? 'justify-end' : ''}`}>
+      {!hideAttachments && attachmentIds.length > 0 ? (
+        <span className={chipClass} title={attachmentIds.join(', ')}>
+          {t('toolAttachments')} {attachmentIds.length}
+        </span>
+      ) : null}
+      {activeSkillIds.length > 0 ? (
+        <span className={chipClass} title={activeSkillIds.join(', ')}>
+          {t('toolActiveSkills')} {activeSkillIds.length}
+        </span>
+      ) : null}
+      {injectedMemoryIds.length > 0 ? (
+        <InjectedMemoryMetaChip meta={meta} memoryIds={injectedMemoryIds} chipClass={chipClass} />
+      ) : null}
+      {injectedInstructionSources.length > 0 ? (
+        <span className={chipClass} title={injectedInstructionSources.map((source) => `${source.scope}: ${source.path}`).join('\n')}>
+          {t('toolInjectedInstructions')} {injectedInstructionSources.length}
+        </span>
+      ) : null}
+      {composerContextLabels.length > 0 ? (
+        <span className={chipClass} title={composerContextLabels.join('\n')}>
+          {t('toolExtensionContexts')} {composerContextLabels.length}
+        </span>
+      ) : null}
+      {childLabel ? (
+        <span className={chipClass} title={childLabel}>
+          {t('toolChildAgent')} <span className="max-w-28 truncate font-mono text-ds-muted">{childLabel}</span>
+        </span>
+      ) : null}
+      {sources.slice(0, 4).map((source, index) =>
+        source.url ? (
+          <a
+            key={`${source.url}-${index}`}
+            href={source.url}
+            target="_blank"
+            rel="noreferrer"
+            className={chipClass}
+            title={source.url}
+          >
+            {t('toolSources')} {index + 1}
+          </a>
+        ) : (
+          <span key={`${source.title}-${index}`} className={chipClass} title={source.title}>
+            {t('toolSources')} {index + 1}
+          </span>
+        )
+      )}
+    </div>
+  )
+}
+
+function CopyFeedbackButton({
+  text,
+  iconOnly = false
+}: {
+  text: string
+  iconOnly?: boolean
+}): ReactElement {
+  const { t } = useTranslation('common')
+  const [status, setStatus] = useState<'idle' | 'success' | 'error'>('idle')
+  const resetRef = useRef<number | null>(null)
+
+  useEffect(
+    () => () => {
+      if (resetRef.current !== null) window.clearTimeout(resetRef.current)
+    },
+    []
+  )
+
+  const scheduleReset = (): void => {
+    if (resetRef.current !== null) window.clearTimeout(resetRef.current)
+    resetRef.current = window.setTimeout(() => {
+      setStatus('idle')
+      resetRef.current = null
+    }, COPY_FEEDBACK_RESET_MS)
+  }
+
+  const handleCopy = async (): Promise<void> => {
+    try {
+      if (!navigator?.clipboard?.writeText) throw new Error('Clipboard unavailable')
+      await navigator.clipboard.writeText(text)
+      setStatus('success')
+    } catch {
+      setStatus('error')
+    }
+    scheduleReset()
+  }
+
+  const success = status === 'success'
+  const error = status === 'error'
+  const label = success ? t('copySuccess') : error ? t('copyFailed') : t('copyMessage')
+  const iconClassName = iconOnly ? 'h-4 w-4' : 'h-3.5 w-3.5'
+
+  return (
+    <button
+      type="button"
+      onClick={() => void handleCopy()}
+      title={label}
+      aria-label={label}
+      className={`flex shrink-0 items-center rounded-md transition ${
+        iconOnly
+          ? 'gap-0 p-1 hover:bg-ds-hover'
+          : 'gap-1 px-1.5 py-0.5 hover:bg-ds-hover'
+      } ${
+        success
+          ? 'text-emerald-500'
+          : error
+            ? 'text-rose-400'
+            : 'text-ds-faint hover:text-ds-muted'
+      }`}
+    >
+      {success ? (
+        <Check className={iconClassName} strokeWidth={2} />
+      ) : (
+        <Copy className={iconClassName} strokeWidth={1.8} />
+      )}
+      {!iconOnly ? <span>{label}</span> : null}
+    </button>
+  )
+}
+
+function AssistantExportButton({
+  text,
+  createdAt
+}: {
+  text: string
+  createdAt?: string
+}): ReactElement {
+  const { t } = useTranslation('common')
+  const workspaceRoot = useChatStore((state) => state.workspaceRoot)
+  const detailsRef = useRef<HTMLDetailsElement | null>(null)
+  const [exportingFormat, setExportingFormat] = useState<WriteExportFormat | null>(null)
+  const [error, setError] = useState('')
+
+  const handleExport = async (format: WriteExportFormat): Promise<void> => {
+    if (typeof window.kunGui?.exportWriteDocument !== 'function') {
+      setError(t('writeExportUnavailable'))
+      return
+    }
+
+    setError('')
+    setExportingFormat(format)
+    try {
+      const parsedDate = createdAt ? new Date(createdAt) : new Date()
+      const date = Number.isNaN(parsedDate.getTime()) ? new Date() : parsedDate
+      const title = `Kun-answer-${date.toISOString().replace(/[:.]/g, '-')}`
+      const result = await window.kunGui.exportWriteDocument({
+        title,
+        workspaceRoot: workspaceRoot || undefined,
+        format,
+        content: text
+      })
+      if (!result.ok && !result.canceled) {
+        setError(result.message)
+      } else if (result.ok) {
+        detailsRef.current?.removeAttribute('open')
+      }
+    } catch (exportError) {
+      setError(exportError instanceof Error ? exportError.message : String(exportError))
+    } finally {
+      setExportingFormat(null)
+    }
+  }
+
+  return (
+    <details ref={detailsRef} className="relative">
+      <summary
+        className="flex cursor-pointer list-none items-center gap-1 rounded-md px-1.5 py-0.5 text-ds-faint transition hover:bg-ds-hover hover:text-ds-muted"
+        title={error ? t('exportAnswerFailed', { message: error }) : t('exportAnswer')}
+        aria-label={t('exportAnswer')}
+      >
+        {exportingFormat ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.8} />
+        ) : (
+          <Download className="h-3.5 w-3.5" strokeWidth={1.8} />
+        )}
+        <span>{exportingFormat ? t('writeExporting') : t('exportAnswer')}</span>
+      </summary>
+      <div className="absolute bottom-full right-0 z-30 mb-1 min-w-36 rounded-xl border border-ds-border-muted bg-ds-card p-1.5 shadow-xl">
+        {ASSISTANT_EXPORT_FORMATS.map((format) => {
+          const label =
+            format === 'pdf'
+              ? t('writeExportPdf')
+              : format === 'png'
+                ? t('writeExportPng')
+                : format === 'html'
+                  ? t('writeExportHtml')
+                  : t('writeExportDocx')
+          return (
+            <button
+              key={format}
+              type="button"
+              disabled={exportingFormat !== null}
+              onClick={() => void handleExport(format)}
+              className="flex w-full items-center rounded-lg px-2.5 py-1.5 text-left text-[12px] text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink disabled:opacity-60"
+            >
+              {label}
+            </button>
+          )
+        })}
+        {error ? (
+          <p className="max-w-64 px-2.5 py-1 text-[11px] leading-4 text-rose-500">
+            {t('exportAnswerFailed', { message: error })}
+          </p>
+        ) : null}
+      </div>
+    </details>
+  )
+}
+
+function UserInputBubble({
+  block,
+  nested = false
+}: {
+  block: Extract<ChatBlock, { kind: 'user_input' }>
+  nested?: boolean
+}): ReactElement {
+  const { t } = useTranslation('common')
+  const resolveUserInput = useChatStore((s) => s.resolveUserInput)
+  const [answers, setAnswers] = useState<Record<string, UserInputAnswer>>(() =>
+    answersByQuestionId(block.answers)
+  )
+  // A `pending` block is only actionable while the live runtime is awaiting it.
+  // One rehydrated from a finished thread keeps its stored `pending` status but
+  // is not live, so it renders as a read-only ended record rather than a live
+  // prompt — and crucially never offers cancel, which would hit a dead gate and
+  // raise "user input not found" (issue #606).
+  const pending = block.status === 'pending' && block.live === true
+  const done = block.status !== 'pending'
+
+  useEffect(() => {
+    setAnswers(answersByQuestionId(block.answers))
+  }, [block.id, block.answers])
+
+  // Answering moved to the composer-docked panel (FloatingComposerUserInputPanel);
+  // this bubble is now the read-only record of what was asked and answered. It
+  // keeps only the cancel affordance while pending.
+  const cancel = (): void => {
+    if (!pending) return
+    void resolveUserInput(block.id, { kind: 'cancel' })
+  }
+
+  const statusLabel =
+    block.status === 'submitted'
+      ? t('userInputSubmitted')
+      : block.status === 'cancelled'
+        ? t('userInputCancelled')
+        : block.status === 'error'
+          ? t('userInputFailed')
+          : pending
+            ? t('userInputPending')
+            : t('userInputCancelled')
+  const tone =
+    block.status === 'error'
+      ? 'error'
+      : block.status === 'submitted'
+        ? 'success'
+        : block.status === 'cancelled'
+          ? 'muted'
+          : pending
+            ? 'active'
+            : 'muted'
+  const questionCount = block.questions.length
+  const containerClass = nested
+    ? `overflow-hidden rounded-[14px] border px-3.5 py-3 text-[13px] leading-5 shadow-[0_8px_22px_rgba(20,47,95,0.035)] ${
+        tone === 'error'
+          ? 'border-red-300/65 bg-ds-card/88 dark:border-red-800/55 dark:bg-red-950/20'
+          : tone === 'success'
+            ? 'border-emerald-500/22 bg-ds-card/88 dark:border-emerald-600/30 dark:bg-ds-card/82'
+            : tone === 'muted'
+              ? 'border-ds-border-muted bg-ds-card/78'
+              : 'border-accent/22 bg-ds-card/90'
+      }`
+    : `overflow-hidden rounded-[16px] border px-4 py-4 text-[13px] leading-6 shadow-[0_14px_36px_rgba(20,47,95,0.055)] ${
+        tone === 'error'
+          ? 'border-red-300/70 bg-ds-card/90 dark:border-red-800/60 dark:bg-red-950/20'
+          : tone === 'success'
+            ? 'border-emerald-500/24 bg-ds-card/90 dark:border-emerald-600/32 dark:bg-ds-card/84'
+            : tone === 'muted'
+              ? 'border-ds-border bg-ds-card/82'
+              : 'border-accent/24 bg-ds-card/95 text-ds-ink'
+      }`
+  const iconFrameClass =
+    tone === 'error'
+      ? 'border-red-300/60 bg-red-500/10 text-red-700 dark:border-red-800/45 dark:text-red-300'
+      : tone === 'success'
+        ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+        : tone === 'active'
+          ? 'border-accent/20 bg-accent/10 text-accent'
+          : 'border-ds-border-muted bg-ds-subtle text-ds-muted'
+  const statusClass =
+    tone === 'error'
+      ? 'text-red-700 dark:text-red-300'
+      : tone === 'success'
+        ? 'text-emerald-700 dark:text-emerald-300'
+        : tone === 'active'
+          ? 'text-accent'
+          : 'text-ds-muted'
+  const statusIcon =
+    tone === 'active' ? (
+      <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={2} />
+    ) : tone === 'success' ? (
+      <Check className="h-3.5 w-3.5" strokeWidth={2} />
+    ) : tone === 'error' ? (
+      <span className="flex h-3.5 w-3.5 items-center justify-center rounded-full border border-current text-[10px] font-bold leading-none">
+        !
+      </span>
+    ) : (
+      <span className="h-1.5 w-1.5 rounded-full bg-current opacity-70" />
+    )
+
+  return (
+    <div className={containerClass}>
+      <div className="flex min-w-0 items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-2.5">
+          <span
+            className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] border ${iconFrameClass}`}
+          >
+            {statusIcon}
+          </span>
+          <div className="min-w-0 pt-0.5">
+            <div className="font-semibold text-ds-ink">{t('userInputTitle')}</div>
+            <div className={`mt-0.5 text-[12px] font-medium ${statusClass}`}>{statusLabel}</div>
+          </div>
+        </div>
+        {questionCount > 1 ? (
+          <span className="shrink-0 rounded-full border border-ds-border-muted bg-ds-subtle px-2 py-0.5 text-[11.5px] font-medium text-ds-muted">
+            {questionCount}
+          </span>
+        ) : null}
+      </div>
+
+      <div className={nested ? 'mt-3 flex flex-col gap-2.5' : 'mt-3.5 flex flex-col gap-3'}>
+        {block.questions.map((question, index) => {
+          const answer = answers[question.id]
+          const hasOptions = question.options.length > 0
+          const submittedValues = done ? answerDisplayValues(answer) : []
+          const submittedAnswer = submittedValues.join(', ')
+          const showProgress = questionCount > 1
+          const showHeader = shouldShowQuestionHeader(question, questionCount)
+          return (
+            <div
+              key={question.id}
+              className={`min-w-0 rounded-[12px] border px-3 py-3 ${
+                submittedAnswer
+                  ? 'border-ds-border-muted bg-ds-main/35'
+                  : 'border-ds-border-muted bg-ds-main/45'
+              }`}
+            >
+              {showHeader || showProgress ? (
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    {showHeader ? (
+                      <div className="min-w-0 text-[12px] font-semibold text-ds-muted">
+                        {question.header}
+                      </div>
+                    ) : null}
+                  </div>
+                  {showProgress ? (
+                    <div className="rounded-full bg-ds-card/70 px-2 py-0.5 text-[11.5px] font-medium text-ds-faint">
+                      {t('userInputQuestionProgress', {
+                        current: index + 1,
+                        total: block.questions.length
+                      })}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+              <p
+                className={`whitespace-pre-wrap break-words text-[14px] font-semibold leading-6 text-ds-ink [overflow-wrap:anywhere] ${
+                  showHeader || showProgress ? 'mt-2' : ''
+                }`}
+              >
+                {question.question}
+              </p>
+
+              {submittedValues.length > 0 ? (
+                <div className="mt-3 flex min-w-0 items-start gap-2 rounded-[10px] border border-emerald-500/14 bg-ds-card/78 px-3 py-2.5">
+                  <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-500/12 text-emerald-700 dark:text-emerald-300">
+                    <Check className="h-3.5 w-3.5" strokeWidth={2.1} />
+                  </span>
+                  {submittedValues.length > 1 ? (
+                    <span className="flex min-w-0 flex-1 flex-wrap gap-1.5">
+                      {submittedValues.map((value) => (
+                        <span
+                          key={value}
+                          className="max-w-full rounded-full border border-emerald-500/16 bg-emerald-500/8 px-2 py-0.5 text-[12.5px] font-medium leading-5 text-ds-ink"
+                        >
+                          <span className="block truncate">{value}</span>
+                        </span>
+                      ))}
+                    </span>
+                  ) : (
+                    <span className="min-w-0 flex-1 break-words text-[13.5px] font-medium leading-5 text-ds-ink [overflow-wrap:anywhere]">
+                      {submittedAnswer}
+                    </span>
+                  )}
+                </div>
+              ) : done ? (
+                <div className="mt-3 rounded-[10px] border border-ds-border-muted bg-ds-card/70 px-3 py-2 text-[12.5px] font-medium text-ds-muted">
+                  {statusLabel}
+                </div>
+              ) : hasOptions ? (
+                <div className="mt-2.5 flex flex-wrap gap-1.5">
+                  {question.options.map((option) => (
+                    <span
+                      key={option.label}
+                      title={option.description || undefined}
+                      className="inline-flex min-w-0 max-w-full items-center rounded-full border border-ds-border-muted bg-ds-card/70 px-2.5 py-1 text-[12px] text-ds-muted"
+                    >
+                      <span className="truncate">{option.label}</span>
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          )
+        })}
+      </div>
+
+      {block.errorMessage ? (
+        <p className="mt-3 text-[12px] text-red-700 dark:text-red-300">{block.errorMessage}</p>
+      ) : null}
+
+      {pending ? (
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-ds-border-muted pt-3">
+          <span className="inline-flex min-w-0 items-center gap-1.5 text-[12px] font-medium text-accent">
+            <ArrowDown className="h-3.5 w-3.5 shrink-0" strokeWidth={2} />
+            <span className="min-w-0">{t('userInputAnswerBelowHint')}</span>
+          </span>
+          <button
+            type="button"
+            className="min-h-8 rounded-[9px] border border-ds-border-muted bg-ds-card/80 px-3 py-1.5 text-[13px] font-medium text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink"
+            onClick={cancel}
+          >
+            {t('userInputCancel')}
+          </button>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function formatMessageDateTime(input: string, locale: string): string {
+  const date = new Date(input)
+  if (Number.isNaN(date.getTime())) return input
+  const now = new Date()
+  const sameYear = date.getFullYear() === now.getFullYear()
+  return new Intl.DateTimeFormat(locale, {
+    ...(sameYear ? {} : { year: 'numeric' }),
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  }).format(date)
+}
+
+/**
+ * Memoized so settled bubbles skip re-render while streaming deltas
+ * re-render only the live bubble; block references stay stable in the
+ * store for unchanged blocks.
+ */
+export const MessageBubble = memo(MessageBubbleImpl)
+
+function MessageBubbleImpl({
+  block,
+  nested = false,
+  forkAction,
+  rollbackAction
+}: {
+  block: ChatBlock
+  nested?: boolean
+  forkAction?: {
+    busy: boolean
+    onFork: () => void
+  }
+  rollbackAction?: {
+    busy: boolean
+    onRollback: () => void
+  }
+}): ReactElement {
+  const { t, i18n } = useTranslation('common')
+  const resolveApproval = useChatStore((s) => s.resolveApproval)
+  if (block.kind === 'user' && isBackgroundShellNoticeBlock(block)) {
+    return <BackgroundShellNoticeBubble block={block} nested={nested} />
+  }
+  if (block.kind === 'user' && isBackgroundSubagentNoticeBlock(block)) {
+    return <BackgroundSubagentNoticeBubble block={block} nested={nested} />
+  }
+  if (block.kind === 'user') {
+    return <UserMessageBubble block={block} />
+  }
+  if (block.kind === 'assistant') {
+    const streaming = block.id === 'live-assistant'
+    const createdAtLabel = block.createdAt
+      ? formatMessageDateTime(block.createdAt, i18n.language)
+      : null
+    return (
+      <div className="group/message flex min-w-0 max-w-full flex-col">
+        <div className="ds-markdown ds-chat-answer min-w-0 max-w-full text-ds-ink">
+          <AssistantMarkdown text={block.text} streaming={streaming} />
+        </div>
+        {!streaming ? (
+          <div className="mt-1 flex min-h-5 min-w-0 items-center justify-between gap-3 text-[11.5px] text-ds-faint opacity-0 transition duration-150 group-hover/message:opacity-100">
+            <span className="min-w-0 truncate">{createdAtLabel ?? ''}</span>
+            <div className="flex shrink-0 items-center gap-1.5">
+              {rollbackAction ? (
+                <button
+                  type="button"
+                  onClick={() => rollbackAction.onRollback()}
+                  disabled={rollbackAction.busy}
+                  className="flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 transition hover:bg-ds-hover hover:text-ds-muted disabled:cursor-not-allowed disabled:opacity-60"
+                  title={t('rollbackWorkspaceFromAssistantResponse')}
+                  aria-label={t('rollbackWorkspaceFromAssistantResponse')}
+                >
+                  <RotateCcw className="h-3.5 w-3.5" strokeWidth={1.8} />
+                  <span>{rollbackAction.busy ? t('rollingBackWorkspace') : t('rollbackWorkspace')}</span>
+                </button>
+              ) : null}
+              {forkAction ? (
+                <button
+                  type="button"
+                  onClick={() => forkAction.onFork()}
+                  disabled={forkAction.busy}
+                  className="flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 transition hover:bg-ds-hover hover:text-ds-muted disabled:cursor-not-allowed disabled:opacity-60"
+                  title={t('forkFromAssistantResponse')}
+                  aria-label={t('forkFromAssistantResponse')}
+                >
+                  <GitFork className="h-3.5 w-3.5" strokeWidth={1.8} />
+                  <span>{forkAction.busy ? t('forkingThread') : t('forkResponse')}</span>
+                </button>
+              ) : null}
+              <AssistantExportButton text={block.text} createdAt={block.createdAt} />
+              <CopyFeedbackButton text={block.text} />
+            </div>
+          </div>
+        ) : null}
+      </div>
+    )
+  }
+  if (block.kind === 'reasoning') {
+    return (
+      <div className="ds-card-soft rounded-[20px] px-4 py-3 text-[13.5px] leading-6 text-ds-muted">
+        <div className="ds-markdown">
+          <AssistantMarkdown text={block.text} streaming={false} />
+        </div>
+      </div>
+    )
+  }
+  if (block.kind === 'tool') {
+    return <ToolEntry block={block} nested={nested} />
+  }
+  if (block.kind === 'user_input') {
+    return <UserInputBubble block={block} nested={nested} />
+  }
+  if (block.kind === 'approval') {
+    const submitting = block.status === 'submitting'
+    const done = block.status !== 'pending' && !submitting
+    const statusLabel =
+      block.status === 'allowed'
+        ? t('approvalAllowed')
+        : block.status === 'denied'
+          ? t('approvalDenied')
+          : block.status === 'expired'
+            ? t('approvalExpired')
+          : block.status === 'error'
+            ? t('approvalFailed')
+            : submitting
+              ? t('approvalSubmitting')
+              : t('approvalPending')
+    return (
+      <div
+        className={`rounded-[22px] border px-4 py-4 text-[13px] leading-6 shadow-[0_12px_30px_rgba(86,103,136,0.04)] ${
+          block.status === 'error'
+            ? 'border-red-300/80 bg-red-500/10 dark:border-red-800/60 dark:bg-red-950/35'
+            : block.status === 'expired'
+              ? 'border-amber-300/80 bg-amber-500/10 dark:border-amber-800/60 dark:bg-amber-950/30'
+            : 'border-accent/35 bg-[linear-gradient(180deg,rgba(79,124,255,0.08),rgba(79,124,255,0.12))] text-ds-ink'
+        }`}
+      >
+        <div className="font-semibold text-accent">{t('approvalTitle')}</div>
+        {block.toolName ? (
+          <div className="mt-1 text-[12px] text-ds-muted">
+            {t('approvalTool', { name: block.toolName })}
+          </div>
+        ) : null}
+        <p className="mt-2 whitespace-pre-wrap text-[14px] text-ds-ink">{block.summary}</p>
+        {block.errorMessage ? (
+          <p className="mt-2 text-[12px] text-red-700 dark:text-red-300">{block.errorMessage}</p>
+        ) : null}
+        {!done ? (
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={submitting}
+              className="rounded-lg bg-emerald-600 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-emerald-700 disabled:cursor-wait disabled:opacity-60"
+              onClick={(event) => runTrustedUserActivation(
+                event,
+                () => void resolveApproval(block.id, 'allow')
+              )}
+            >
+              {t('approvalAllow')}
+            </button>
+            <button
+              type="button"
+              disabled={submitting}
+              className="rounded-lg border border-ds-border bg-ds-card px-3 py-1.5 text-[13px] font-medium text-ds-ink hover:bg-ds-hover disabled:cursor-wait disabled:opacity-60"
+              onClick={(event) => runTrustedUserActivation(
+                event,
+                () => void resolveApproval(block.id, 'deny')
+              )}
+            >
+              {t('approvalDeny')}
+            </button>
+            {submitting ? (
+              <span className="self-center text-[12px] font-medium text-ds-muted">{statusLabel}</span>
+            ) : null}
+          </div>
+        ) : (
+          <p className="mt-2 text-[12px] font-medium text-ds-muted">{statusLabel}</p>
+        )}
+      </div>
+    )
+  }
+  if (block.kind === 'compaction') {
+    return (
+      <div className="ds-card-soft rounded-[18px] px-3 py-2 text-[13.5px] text-ds-muted">
+        {block.detail || block.summary}
+      </div>
+    )
+  }
+  if (block.kind === 'review') {
+    return (
+      <div className="ds-card-soft rounded-[18px] px-3 py-2 text-[13.5px] text-ds-muted">
+        {block.reviewText || block.title}
+      </div>
+    )
+  }
+  if (block.kind === 'system') {
+    const errorTone = block.severity === 'error'
+    const warningTone = block.severity === 'warning'
+    return (
+      <div
+        className={`rounded-[18px] border px-3 py-2 text-[13.5px] leading-6 ${
+          errorTone
+            ? 'border-red-300/80 bg-red-500/10 text-red-800 dark:border-red-800/60 dark:bg-red-950/35 dark:text-red-200'
+            : warningTone
+              ? 'border-amber-300/80 bg-amber-500/10 text-amber-900 dark:border-amber-800/60 dark:bg-amber-950/35 dark:text-amber-100'
+              : 'border-ds-border bg-ds-subtle text-ds-muted'
+        }`}
+      >
+        <p className="whitespace-pre-wrap break-words">{block.text}</p>
+        {block.code ? (
+          <p className="mt-1 font-mono text-[11px] opacity-70">{block.code}</p>
+        ) : null}
+      </div>
+    )
+  }
+  return <></>
+}
+
+function ToolEntry({ block, nested = false }: { block: ToolBlock; nested?: boolean }): ReactElement {
+  const { t } = useTranslation('common')
+  // Errored tool calls stay collapsed by default — only the red header is shown so the
+  // (often verbose) error payload doesn't disrupt reading. The user can still expand it.
+  const [open, setOpen] = useState(() => block.status === 'running')
+
+  useEffect(() => {
+    if (block.status === 'running') {
+      setOpen(true)
+    }
+  }, [block.status, block.id])
+
+  const effectiveOpen = block.status === 'running' ? true : open
+
+  const tone =
+    block.status === 'error'
+      ? 'border-orange-300/80 bg-orange-500/10 text-orange-950 dark:border-orange-800/60 dark:bg-orange-950/35 dark:text-orange-100'
+      : block.status === 'running'
+        ? 'border-amber-300/80 bg-amber-500/10 text-amber-950 dark:border-amber-800/50 dark:bg-amber-950/30 dark:text-amber-100'
+        : 'border-ds-border bg-ds-subtle text-ds-ink'
+
+  const toolName = typeof block.meta?.toolName === 'string' ? block.meta.toolName.trim() : ''
+  const displaySummary =
+    toolName === 'background_shell'
+      ? summarizeBackgroundShellToolBlock(block, t)
+      : block.summary
+
+  const Icon = block.toolKind === 'file_change' ? FileEdit : block.toolKind === 'command_execution' ? Terminal : Wrench
+  const kindLabel =
+    toolName === 'background_shell'
+      ? t('toolBuiltinBackgroundShell', { defaultValue: 'Background shell' })
+      : block.toolKind === 'file_change'
+        ? t('toolKindFile')
+        : block.toolKind === 'command_execution'
+          ? t('toolKindCommand')
+          : t('toolKindTool')
+
+  const exitCode = readNumber(block.meta, 'exit_code')
+  const durationMs = readNumber(block.meta, 'duration_ms')
+  const sessionId = metaString(block.meta, 'session_id')
+  const sessionStatus = metaString(block.meta, 'status')
+
+  const hasDetail = !!(block.detail && block.detail.trim().length > 0)
+  const patchText = block.toolKind === 'file_change' ? extractUnifiedDiffText(block.detail) : undefined
+  const canExpand = hasDetail || block.status === 'running'
+
+  return (
+    <div className={`rounded-[22px] border shadow-[0_12px_30px_rgba(86,103,136,0.04)] ${tone}`}>
+      <button
+        type="button"
+        onClick={() => {
+          if (!canExpand || block.status === 'running') return
+          setOpen((v) => !v)
+        }}
+        className={`flex w-full items-start gap-2 px-4 py-3 text-left text-[13.5px] leading-6 ${
+          canExpand && block.status !== 'running' ? 'cursor-pointer' : 'cursor-default'
+        }`}
+      >
+        <Icon className="mt-0.5 h-3.5 w-3.5 shrink-0 opacity-80" strokeWidth={1.75} />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="font-semibold uppercase tracking-[0.12em] text-[11px] opacity-75">
+              {kindLabel}
+            </span>
+            {block.status === 'running' ? (
+              <span className="rounded-full bg-amber-200/40 px-2 py-0.5 text-[11px] font-medium text-amber-900 dark:bg-amber-700/30 dark:text-amber-100">
+                {t('inspectorStatusRunning')}
+              </span>
+            ) : null}
+            {typeof exitCode === 'number' ? (
+              <span
+                className={`rounded-full px-2 py-0.5 text-[11px] font-mono ${
+                  exitCode === 0
+                    ? 'bg-ds-success-soft text-ds-success'
+                    : 'bg-orange-500/10 text-orange-800 dark:text-orange-200'
+                }`}
+              >
+                exit {exitCode}
+              </span>
+            ) : null}
+            {sessionId ? (
+              <span className="rounded-full bg-ds-card px-2 py-0.5 text-[11px] font-mono text-ds-muted" title={sessionId}>
+                {sessionStatus === 'running' ? t('inspectorStatusRunning') : sessionStatus || 'session'} {sessionId.slice(0, 12)}
+              </span>
+            ) : null}
+            {typeof durationMs === 'number' ? (
+              <span className="rounded-full bg-ds-card px-2 py-0.5 text-[11px] font-mono text-ds-muted">
+                {formatDuration(durationMs)}
+              </span>
+            ) : null}
+          </div>
+          <div className="mt-0.5 break-words">
+            {block.filePath ? (
+              <span className="font-mono text-[12px] opacity-90">{block.filePath} — </span>
+            ) : null}
+            <span>{displaySummary}</span>
+          </div>
+          <RuntimeMetaChips meta={block.meta} hideTurnDisclosure />
+        </div>
+        {canExpand ? (
+          effectiveOpen ? (
+            <ChevronDown className="mt-0.5 h-3.5 w-3.5 shrink-0 opacity-70" strokeWidth={1.75} />
+          ) : (
+            <ChevronRight className="mt-0.5 h-3.5 w-3.5 shrink-0 opacity-70" strokeWidth={1.75} />
+          )
+        ) : null}
+      </button>
+      <ToolAttachmentPreviews meta={block.meta} />
+      {effectiveOpen && hasDetail ? (
+        <div className="ds-panel-strip min-w-0 border-t border-ds-border-muted/60 px-4 py-3">
+          {patchText !== undefined ? (
+            <DiffView patch={patchText} filePath={block.filePath} />
+          ) : (
+            <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words font-mono text-[12px] leading-6 text-ds-ink">
+              {block.detail}
+            </pre>
+          )}
+        </div>
+      ) : null}
+    </div>
+  )
+}

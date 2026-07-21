@@ -1,0 +1,280 @@
+import type { ComponentPropsWithRef, MouseEvent, ReactElement } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { Streamdown, type StreamdownProps } from 'streamdown'
+import remarkGfm from 'remark-gfm'
+import { harden } from 'rehype-harden'
+import 'streamdown/styles.css'
+import { parseFileReferenceHref, rehypeFileReferences } from '../../lib/file-references'
+import { useValidatedFileReference } from '../../lib/file-reference-validation'
+import { openWorkspacePathInEditor } from '../../lib/open-workspace-path'
+import { previewWorkspaceFile } from '../../lib/workspace-file-preview'
+import { sanitizeAssistantCanvasToolDisplay } from '../../design/canvas/strip-canvas-tool-display'
+import { StreamdownCode } from './StreamdownCode'
+import { useTimelineFilePreviewWorkspaceRoot } from './timeline-file-preview-workspace'
+import { createMathPlugin } from '@streamdown/math'
+import 'katex/dist/katex.min.css'
+
+/** Reveal ~1/8 of the outstanding backlog per frame… */
+const CATCHUP_DIVISOR = 8
+/** …but never more than this, so a huge backlog (tab refocus, resumed
+ * thread, burst from a fast model) drains as fast typing instead of a
+ * near-instant wall of text. */
+const MAX_STEP_PER_FRAME = 32
+const COMBINING_MARK_REGEX = /\p{Mark}/u
+const VARIATION_SELECTOR_REGEX = /\p{Variation_Selector}/u
+const graphemeSegmenter =
+  typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function'
+    ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+    : null
+
+export function nextVisibleLength(current: number, target: number): number {
+  if (current === target) return current
+  // Live text shrank (interrupt / reset) — snap, never animate backwards.
+  if (current > target) return target
+  const backlog = target - current
+  return current + Math.min(MAX_STEP_PER_FRAME, Math.max(1, Math.ceil(backlog / CATCHUP_DIVISOR)))
+}
+
+function fallbackBoundary(text: string, length: number): number {
+  let boundary = length
+  const previousCode = text.charCodeAt(boundary - 1)
+  if (previousCode >= 0xd800 && previousCode <= 0xdbff && boundary < text.length) {
+    boundary += 1
+  }
+
+  while (boundary < text.length) {
+    const codePoint = text.codePointAt(boundary)
+    if (codePoint == null) break
+    const char = String.fromCodePoint(codePoint)
+    if (COMBINING_MARK_REGEX.test(char) || VARIATION_SELECTOR_REGEX.test(char)) {
+      boundary += char.length
+      continue
+    }
+    if (codePoint === 0x200d) {
+      boundary += 1
+      const joinedCodePoint = text.codePointAt(boundary)
+      if (joinedCodePoint == null) break
+      boundary += String.fromCodePoint(joinedCodePoint).length
+      continue
+    }
+    break
+  }
+
+  return boundary
+}
+
+function nextTextBoundary(text: string, visibleLength: number): number {
+  const length = Math.max(0, Math.min(visibleLength, text.length))
+  if (length === 0 || length === text.length) return length
+
+  if (graphemeSegmenter) {
+    for (const segment of graphemeSegmenter.segment(text)) {
+      const boundary = segment.index + segment.segment.length
+      if (boundary >= length) return boundary
+    }
+  }
+
+  return fallbackBoundary(text, length)
+}
+
+export function visibleTextForTypewriter(text: string, visibleLength: number): string {
+  return text.slice(0, nextTextBoundary(text, visibleLength))
+}
+
+/**
+ * Paces streaming text so it reveals sequentially, decoupled from SSE
+ * chunk sizes. Without this, one bursty chunk spans several markdown
+ * blocks and every affected line blurs in at once — the half-faded
+ * patches scattered across bullets read as holes instead of typing.
+ */
+function useTypewriterText(text: string, streaming: boolean): string {
+  // Start at the current length: re-entering a thread mid-turn must not
+  // replay everything already on screen.
+  const [visibleLength, setVisibleLength] = useState(() => text.length)
+  const targetRef = useRef(text.length)
+  targetRef.current = text.length
+
+  useEffect(() => {
+    if (!streaming) return
+    let raf = requestAnimationFrame(function tick() {
+      // When caught up this returns the same value, so React bails out of
+      // re-rendering and the idle loop costs only the rAF callback.
+      setVisibleLength((current) => nextVisibleLength(current, targetRef.current))
+      raf = requestAnimationFrame(tick)
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [streaming])
+
+  if (!streaming) return text
+  return visibleTextForTypewriter(text, visibleLength)
+}
+
+const rehypePlugins = [
+  rehypeFileReferences,
+  [
+    harden,
+    {
+      allowedLinkPrefixes: ['*']
+    }
+  ]
+] satisfies StreamdownProps['rehypePlugins']
+
+type MarkdownAstNode = {
+  type?: unknown
+  value?: unknown
+  children?: MarkdownAstNode[]
+}
+
+function removeHtmlCommentNodes(node: MarkdownAstNode): void {
+  if (!Array.isArray(node.children)) return
+  node.children = node.children.filter((child) => {
+    return !(
+      child.type === 'html' &&
+      typeof child.value === 'string' &&
+      child.value.trimStart().startsWith('<!--')
+    )
+  })
+  for (const child of node.children) removeHtmlCommentNodes(child)
+}
+
+/** Hide model-supplied HTML comments without touching code/inlineCode AST nodes. */
+export function remarkHideHtmlComments(): (tree: MarkdownAstNode) => void {
+  return removeHtmlCommentNodes
+}
+
+const math = createMathPlugin({
+  singleDollarTextMath: false,
+  errorColor: 'var(--ds-text-muted)'
+})
+
+const components = {
+  code: StreamdownCode,
+  a: StreamdownLink
+} satisfies StreamdownProps['components']
+
+type StreamdownLinkProps = ComponentPropsWithRef<'a'> & { node?: unknown }
+
+function StreamdownLink({
+  href,
+  children,
+  className,
+  title
+}: StreamdownLinkProps): ReactElement {
+  const workspaceRoot = useTimelineFilePreviewWorkspaceRoot()
+  const fileTarget = parseFileReferenceHref(href)
+  const validation = useValidatedFileReference(fileTarget, workspaceRoot)
+  const isExternal = href ? /^(https?:|mailto:)/i.test(href) : false
+  const cleanClassName = className?.replace(/\bds-file-reference-link\b/g, '').trim()
+
+  if (fileTarget && validation.status !== 'valid') {
+    return (
+      <span className={cleanClassName} title={title}>
+        {children}
+      </span>
+    )
+  }
+
+  const resolvedFileTarget =
+    fileTarget && validation.status === 'valid'
+      ? { ...fileTarget, path: validation.path }
+      : null
+
+  const handleClick = (event: MouseEvent<HTMLAnchorElement>): void => {
+    if (resolvedFileTarget) {
+      event.preventDefault()
+      previewWorkspaceFile({ ...resolvedFileTarget, workspaceRoot })
+      return
+    }
+
+    if (isExternal && href && typeof window.kunGui?.openExternal === 'function') {
+      event.preventDefault()
+      void window.kunGui.openExternal(href).catch(() => undefined)
+    }
+  }
+
+  const handleDoubleClick = (event: MouseEvent<HTMLAnchorElement>): void => {
+    if (!resolvedFileTarget) return
+    event.preventDefault()
+    void openWorkspacePathInEditor(resolvedFileTarget, workspaceRoot).then((result) => {
+      if (!result.ok) {
+        void window.kunGui?.logError?.('editor-open', 'Failed to open file reference', {
+          message: result.message,
+          target: resolvedFileTarget
+        })?.catch(() => undefined)
+      }
+    })
+  }
+
+  return (
+    <a
+      href={href}
+      title={title}
+      className={[
+        resolvedFileTarget ? 'ds-file-reference-link' : '',
+        cleanClassName
+      ]
+        .filter(Boolean)
+        .join(' ')}
+      onClick={handleClick}
+      onDoubleClick={handleDoubleClick}
+    >
+      {children}
+    </a>
+  )
+}
+
+type Props = {
+  /** Markdown source */
+  text: string
+  /**
+   * When true (live SSE chunking), uses Streamdown `streaming` mode with a
+   * char-level blur-in on newly appended content.
+   */
+  streaming: boolean
+  className?: string
+  /** Hide HTML comment nodes for reasoning-summary presentation. */
+  hideHtmlComments?: boolean
+}
+
+export function StreamdownAssistant({
+  text,
+  streaming,
+  className,
+  hideHtmlComments = false
+}: Props): ReactElement {
+  const displayText = sanitizeAssistantCanvasToolDisplay(text)
+  const pacedText = useTypewriterText(displayText, streaming)
+  const remarkPlugins = hideHtmlComments
+    ? [remarkGfm, remarkHideHtmlComments]
+    : [remarkGfm]
+
+  // While streaming, keep a stable key so the typewriter doesn't tear down
+  // mid-stroke. Once settled, key on `text.length` — any subsequent edit
+  // remounts Streamdown clean instead of relying on its block-diff to swap
+  // children in place, which has been observed to leave stale fragments
+  // (bullet tail spliced into the next paragraph) on bullet→paragraph
+  // transitions containing inline code.
+  const streamdownKey = streaming ? 'live' : `static:${displayText.length}`
+
+  return (
+    <Streamdown
+      key={streamdownKey}
+      className={className}
+      mode="static"
+      parseIncompleteMarkdown={false}
+      isAnimating={false}
+      // The pacing hook above is the typewriter. Keep Streamdown's own
+      // streaming/remend pipeline disabled here: in long Markdown responses
+      // with GFM tables, its block repair path can leave stale text fragments
+      // next to the repaired block, producing copied DOM text such as
+      // "Work Workstreamstream".
+      animated={false}
+      remarkPlugins={remarkPlugins}
+      rehypePlugins={rehypePlugins}
+      components={components}
+      plugins={{ math }}
+    >
+      {pacedText}
+    </Streamdown>
+  )
+}

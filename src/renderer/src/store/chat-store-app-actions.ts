@@ -1,0 +1,349 @@
+import type i18next from 'i18next'
+import type { AppSettingsV1, ModelReasoningEffort } from '@shared/app-settings'
+import type { ModelProviderModelGroup } from '@shared/kun-gui-api'
+import { rendererRuntimeClient } from '../agent/runtime-client'
+import { extensionWorkbenchClient } from '../extensions/extension-workbench-client'
+import type { ChatState, ChatStoreGet, ChatStoreSet, InitialSetupMode, PluginHostRoute, SettingsRouteSection } from './chat-store-types'
+import type { ComposerPlanMode } from './chat-store-helpers'
+import {
+  composerModelSelectable,
+  composerModeForThread,
+  composerReasoningEffortForSelection,
+  persistComposerMode,
+  persistComposerProviderId,
+  providerIdForComposerModel,
+  providerIdMatchesComposerModel,
+  readThreadComposerMode,
+  readThreadComposerSelection,
+  rememberThreadComposerMode,
+  rememberThreadComposerSelection,
+  readStoredComposerProviderId
+} from './chat-store-helpers'
+
+type CreateAppActionsOptions = {
+  set: ChatStoreSet
+  get: ChatStoreGet
+  i18n: typeof i18next
+  persistComposerModel: (model: string) => void
+  persistComposerMode: (mode: ComposerPlanMode) => void
+  persistComposerReasoningEffort: (
+    modelId: string,
+    providerId: string,
+    effort: ModelReasoningEffort
+  ) => void
+  rememberThreadComposerMode: (threadId: string, mode: ComposerPlanMode) => void
+  readStoredComposerModel: (allowedIds: readonly string[]) => string
+  mergeComposerPickList: (upstreamOk: boolean, upstreamIds: string[]) => string[]
+  fallbackComposerModel: (
+    pickList: readonly string[],
+    runtimeDefault: string,
+    modelGroups?: readonly ModelProviderModelGroup[]
+  ) => string
+  getComposerModelLoadPromise: () => Promise<void> | null
+  setComposerModelLoadPromise: (promise: Promise<void> | null) => void
+  applyTheme: (theme: AppSettingsV1['theme']) => void
+  applyUiFontScale: (scale: AppSettingsV1['uiFontScale']) => void
+  applyChatContentMaxWidth: (widthPx: AppSettingsV1['chatContentMaxWidthPx']) => void
+  applyCursorSpotlight: (enabled: boolean) => void
+  applyCursorSpotlightColor: (color: AppSettingsV1['cursorSpotlightColor']) => void
+  applyWriteTypography: (typography: AppSettingsV1['write']['typography']) => void
+  applyDocumentLocale: (locale: AppSettingsV1['locale']) => void
+  workspaceLabelFromPath: (workspaceRoot: string) => string
+  normalizeWorkspaceRoot: (workspaceRoot?: string | null) => string
+}
+
+export function createAppActions(options: CreateAppActionsOptions): Pick<
+  ChatState,
+  | 'setError'
+  | 'setComposerMode'
+  | 'setComposerModel'
+  | 'setComposerReasoningEffort'
+  | 'setComposerAgentId'
+  | 'loadComposerModels'
+  | 'setRoute'
+  | 'openWrite'
+  | 'openSettings'
+  | 'openPlugins'
+  | 'openClaw'
+  | 'openSchedule'
+  | 'openWorkflow'
+  | 'openDesign'
+  | 'openInitialSetup'
+  | 'closeInitialSetup'
+  | 'selectInspectorItem'
+  | 'applyI18nFromSettings'
+  | 'reloadUiSettings'
+> {
+  const {
+    set,
+    get,
+    i18n,
+    persistComposerModel,
+    persistComposerMode,
+    persistComposerReasoningEffort,
+    rememberThreadComposerMode,
+    readStoredComposerModel,
+    mergeComposerPickList,
+    fallbackComposerModel,
+    getComposerModelLoadPromise,
+    setComposerModelLoadPromise,
+    applyTheme,
+    applyUiFontScale,
+    applyChatContentMaxWidth,
+    applyCursorSpotlight,
+    applyCursorSpotlightColor,
+    applyWriteTypography,
+    applyDocumentLocale,
+    workspaceLabelFromPath,
+    normalizeWorkspaceRoot
+  } = options
+
+  return {
+    setError: (message) => set({ error: message }),
+
+    setComposerMode: (mode) => {
+      const activeThreadId = get().activeThreadId
+      if (activeThreadId) {
+        rememberThreadComposerMode(activeThreadId, mode)
+      } else {
+        persistComposerMode(mode)
+      }
+      set({ composerMode: mode })
+    },
+
+    setComposerModel: (modelId, providerId) => {
+      const nextProviderId = providerId?.trim() || providerIdForComposerModel(get().composerModelGroups, modelId)
+      const state = get()
+      const activeThreadId = state.activeThreadId
+      if (activeThreadId) {
+        rememberThreadComposerSelection(activeThreadId, modelId, nextProviderId)
+      } else {
+        persistComposerModel(modelId)
+        persistComposerProviderId(nextProviderId)
+      }
+      set({
+        composerModel: modelId,
+        composerProviderId: nextProviderId,
+        composerReasoningEffort: composerReasoningEffortForSelection(
+          state.composerModelGroups,
+          modelId,
+          nextProviderId
+        )
+      })
+      const trimmed = modelId.trim()
+      const extensionProvider = state.composerModelGroups.find(
+        (group) => group.providerId === nextProviderId
+      )?.extensionProvider
+      if (
+        !activeThreadId &&
+        !extensionProvider &&
+        trimmed &&
+        trimmed.toLowerCase() !== 'auto' &&
+        typeof window.kunGui !== 'undefined'
+      ) {
+        void window.kunGui.saveSettingsSilent({
+          agents: { kun: { model: trimmed, providerId: nextProviderId } }
+        })
+      }
+    },
+
+    setComposerReasoningEffort: (effort) => {
+      const state = get()
+      persistComposerReasoningEffort(
+        state.composerModel,
+        state.composerProviderId,
+        effort
+      )
+      set({ composerReasoningEffort: effort })
+    },
+
+    setComposerAgentId: (agentId) => {
+      set({ composerAgentId: agentId.trim() })
+    },
+
+    loadComposerModels: async () => {
+      if (getComposerModelLoadPromise()) return getComposerModelLoadPromise()!
+      if (typeof window.kunGui === 'undefined') return
+      const task = (async () => {
+        const [res, extensionProviders] = await Promise.all([
+          window.kunGui.fetchUpstreamModels(),
+          extensionWorkbenchClient.listModelProviders(get().workspaceRoot || undefined).catch(() => [])
+        ])
+        const extensionGroups: ModelProviderModelGroup[] = extensionProviders.flatMap((provider) => {
+          if (!provider.binding?.valid) return []
+          const model = provider.models.find((candidate) => candidate.id === provider.binding?.modelId)
+          if (!model) return []
+          const inputModalities = [
+            'text' as const,
+            ...(model.capabilities.input.includes('image') ? ['image' as const] : [])
+          ]
+          return [{
+            providerId: provider.providerId,
+            label: `${provider.displayName} · ${provider.extensionDisplayName}`,
+            modelIds: [model.id],
+            accountId: provider.binding.accountId,
+            extensionProvider: {
+              extensionId: provider.extensionId,
+              extensionVersion: provider.extensionVersion,
+              localProviderId: provider.localProviderId
+            },
+            modelProfiles: {
+              [model.id]: {
+                inputModalities,
+                outputModalities: ['text'],
+                supportsToolCalling: model.capabilities.tools,
+                messageParts: model.capabilities.input.includes('image')
+                  ? ['text', 'image_url', 'input_image']
+                  : ['text'],
+                ...(model.capabilities.maxContextTokens
+                  ? { contextWindowTokens: model.capabilities.maxContextTokens }
+                  : {}),
+                ...(model.capabilities.maxOutputTokens
+                  ? { maxOutputTokens: model.capabilities.maxOutputTokens }
+                  : {}),
+                ...(model.capabilities.reasoning ? {
+                  reasoning: {
+                    supportedEfforts: ['low', 'medium', 'high'],
+                    defaultEffort: 'medium',
+                    requestProtocol: 'none'
+                  }
+                } : {})
+              }
+            }
+          }]
+        })
+        const upstreamGroups = res.ok ? res.modelGroups ?? [] : []
+        const groups = [...upstreamGroups, ...extensionGroups]
+        const pick = mergeComposerPickList(
+          res.ok || extensionGroups.length > 0,
+          [...(res.ok ? res.modelIds : []), ...extensionGroups.flatMap((group) => group.modelIds)]
+        )
+        const runtimeDefault = res.ok ? res.defaultModelId?.trim() ?? '' : ''
+        set((state) => {
+          const isSelectable = (model: string): boolean => composerModelSelectable(pick, groups, model)
+          const activeThread = state.activeThreadId
+            ? state.threads.find((thread) => thread.id === state.activeThreadId) ?? null
+            : null
+          const threadSelection = activeThread ? readThreadComposerSelection(activeThread.id) : null
+          const currentModel = state.composerModel.trim()
+          const normalizedCurrentModel = currentModel.toLowerCase() === 'auto' ? '' : currentModel
+          const storedModel = readStoredComposerModel(pick)
+          let model = activeThread
+            ? threadSelection?.model?.trim() || activeThread.model.trim()
+            : normalizedCurrentModel
+          let shouldPersist = !activeThread && model !== state.composerModel
+          if (model === '' || !isSelectable(model)) {
+            model = activeThread ? '' : storedModel
+            shouldPersist = false
+          }
+          if (model === '' || !isSelectable(model)) {
+            model = fallbackComposerModel(pick, runtimeDefault, groups)
+            shouldPersist = false
+          }
+          if (shouldPersist) persistComposerModel(model)
+          const threadProviderId =
+            threadSelection && providerIdMatchesComposerModel(groups, threadSelection.providerId, model)
+              ? threadSelection.providerId
+              : ''
+          const storedProviderId = activeThread ? '' : readStoredComposerProviderId(groups, model)
+          const providerId = threadProviderId || storedProviderId || providerIdForComposerModel(groups, model)
+          if (!activeThread && providerId !== state.composerProviderId) persistComposerProviderId(providerId)
+          if (
+            activeThread &&
+            (!threadSelection || threadSelection.model !== model || threadSelection.providerId !== providerId) &&
+            composerModelSelectable(pick, groups, model)
+          ) {
+            rememberThreadComposerSelection(activeThread.id, model, providerId)
+          }
+          return {
+            composerPickList: pick,
+            composerModel: model,
+            composerProviderId: providerId,
+            composerReasoningEffort: composerReasoningEffortForSelection(groups, model, providerId),
+            composerModelGroups: groups
+          }
+        })
+      })().finally(() => {
+        setComposerModelLoadPromise(null)
+      })
+      setComposerModelLoadPromise(task)
+      return task
+    },
+
+    setRoute: (route) => set({ route }),
+
+    openWrite: async () => {
+      set({ route: 'write' })
+    },
+
+    openSettings: (section: SettingsRouteSection = 'general') =>
+      set((state) => ({
+        route: 'settings',
+        settingsSection: section,
+        settingsReturnRoute: state.route === 'settings' ? state.settingsReturnRoute : state.route
+      })),
+
+    openPlugins: (host?: PluginHostRoute) =>
+      set((state) => ({
+        route: 'plugins',
+        pluginHostRoute: host ?? (state.route === 'claw' ? 'claw' : 'chat')
+      })),
+
+    openClaw: () => {
+      set({ route: 'claw' })
+      void get().refreshClawChannels()
+    },
+
+    openSchedule: () => {
+      set({ route: 'schedule' })
+    },
+
+    openWorkflow: () => {
+      set({ route: 'workflow' })
+    },
+    openDesign: () => {
+      set({ route: 'design' })
+    },
+
+    openInitialSetup: (mode: InitialSetupMode = 'required') =>
+      set({ initialSetupOpen: true, initialSetupMode: mode }),
+
+    closeInitialSetup: () => set({ initialSetupOpen: false, initialSetupMode: 'required' }),
+
+    selectInspectorItem: (id) => set({ inspectorSelectedId: id }),
+
+    applyI18nFromSettings: async (locale) => {
+      await i18n.changeLanguage(locale)
+      applyDocumentLocale(locale)
+    },
+
+    reloadUiSettings: async () => {
+      if (typeof window.kunGui === 'undefined') return
+      const settings = await rendererRuntimeClient.getSettings({ forceRefresh: true })
+      const workspaceRoot = normalizeWorkspaceRoot(settings.workspaceRoot)
+      applyTheme(settings.theme)
+      applyUiFontScale(settings.uiFontScale)
+      applyChatContentMaxWidth(settings.chatContentMaxWidthPx)
+      applyCursorSpotlight(settings.cursorSpotlight !== false)
+      applyCursorSpotlightColor(settings.cursorSpotlightColor)
+      if (settings.write?.typography) applyWriteTypography(settings.write.typography)
+      set({
+        workspaceRoot,
+        workspaceLabel: workspaceLabelFromPath(workspaceRoot),
+        conversationWorkspaceRoot: settings.conversationWorkspaceRoot || '',
+        disabledSkillIds: settings.disabledSkillIds,
+        clawChannels: settings.claw.channels,
+        activeClawChannelId: settings.claw.channels.some(
+          (channel) => channel.id === get().activeClawChannelId && channel.enabled
+        )
+          ? get().activeClawChannelId
+          : settings.claw.channels.find((channel) => channel.enabled)?.id ?? ''
+      })
+      await get().applyI18nFromSettings(settings.locale)
+      if (get().runtimeConnection === 'ready') {
+        void get().refreshThreads()
+      }
+      void get().loadComposerModels()
+    }
+  }
+}
