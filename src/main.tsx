@@ -1,11 +1,16 @@
-import React from "react";
-import ReactDOM from "react-dom/client";
-import App from "./App";
-import { AuthGate } from "./auth/AuthGate";
-import "./styles.css";
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import './index.css'
+import App from './App'
+import './i18n'
+import { installDsGuiBridge } from './rcode/ds-gui-web'
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
+installDsGuiBridge()
+
+document.documentElement.dataset.platform = window.dsGui?.platform ?? 'unknown'
+
+ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <AuthGate><App /></AuthGate>
+    <App />
   </React.StrictMode>
-);
+)
