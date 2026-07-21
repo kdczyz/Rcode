@@ -1,6 +1,16 @@
 {
-  "activeProvider": "mimo",
+  "activeProvider": "nvidia",
   "providers": {
+    "nvidia": {
+      "type": "openai-compatible",
+      "displayName": "NVIDIA NIM",
+      "baseUrl": "https://integrate.api.nvidia.com/v1",
+      "apiKeyEnv": "NVIDIA_API_KEY",
+      "chatCompletionsPath": "/chat/completions",
+      "modelsPath": "/models",
+      "defaultModel": "deepseek-ai/deepseek-v4-pro",
+      "source": "builtin"
+    },
     "mimo": {
       "type": "openai-compatible",
       "displayName": "Xiaomi MiMo",

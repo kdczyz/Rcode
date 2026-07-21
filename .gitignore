@@ -1,6 +1,14 @@
-node_modules
-build
-dist
+### Node / Electron (Kun)
+node_modules/
+out/
+dist/
+resources/bundled-extensions/
+.cache/
+.deepseek/
+*.log
+.DS_Store
+
+### Rcode 后端与构建产物
 dist-server
 dist-server-bundle
 dist-worker
@@ -13,12 +21,29 @@ generated-images
 *.tsbuildinfo
 *.sqlite-wal
 *.sqlite-shm
-.workbuddy
 .uploads
 .idea
-.env
-.env.local
 .dev.vars
 .wrangler
-.DS_Store
 npm-debug.log*
+
+### Local environment
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+### Local release secrets
+scripts/release.local.env
+release.local.env
+*.p12
+*.p8
+*.pem
+*.key
+*.mobileprovision
+
+### Tool data
+.workbuddy/
+.kun-design/
+.kun-canvas/
+openspec/

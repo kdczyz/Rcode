@@ -1,31 +1,70 @@
-import type { ClawModel } from './app-settings'
-
 export type ClawCommand =
   | { kind: 'clear' }
   | { kind: 'help' }
+  | { kind: 'showSkills' }
+  | { kind: 'showMcp' }
+  | { kind: 'showGoal' }
+  | { kind: 'showWorkspace' }
+  | { kind: 'showUsage' }
+  | { kind: 'invalidGoal' }
+  | { kind: 'setGoal'; objective: string }
+  | { kind: 'stop' }
+  | { kind: 'showThreads' }
+  | { kind: 'showCurrentThread' }
+  | { kind: 'switchThread'; target: string }
   | { kind: 'showModel' }
-  | { kind: 'model'; model: ClawModel }
-  | { kind: 'invalidModel' }
+  | { kind: 'model'; model: string }
 
 export function parseClawCommand(text: string): ClawCommand | null {
   const raw = text.trim()
   const lower = raw.toLowerCase()
-  if (['/clear', '/reset', '/new', '/清空', '/重置', '/新会话'].includes(lower)) {
+  if (/^[/-](?:new|clear)$/.test(lower)) {
     return { kind: 'clear' }
   }
-  if (['/help', '/帮助', '/命令'].includes(lower)) {
+  if (/^[/-]stop$/.test(lower)) {
+    return { kind: 'stop' }
+  }
+  if (/^[/-]help$/.test(lower)) {
     return { kind: 'help' }
   }
-  const match = raw.match(/^\/(?:model|模型)(?:\s+(.+))?$/i)
-  if (!match) return null
-  const value = (match[1] ?? '').trim().toLowerCase()
-  if (!value) return { kind: 'showModel' }
-  if (value === 'auto' || value === '自动') return { kind: 'model', model: 'auto' }
-  if (value === 'pro' || value === 'deepseek-v4-pro') {
-    return { kind: 'model', model: 'deepseek-v4-pro' }
+  if (/^[/-]list-skills$/.test(lower)) {
+    return { kind: 'showSkills' }
   }
-  if (value === 'flash' || value === 'deepseek-v4-flash') {
-    return { kind: 'model', model: 'deepseek-v4-flash' }
+  if (/^[/-]list-mcp$/.test(lower)) {
+    return { kind: 'showMcp' }
   }
-  return { kind: 'invalidModel' }
+  if (/^[/-]list-goal$/.test(lower)) {
+    return { kind: 'showGoal' }
+  }
+  if (/^[/-]pwd$/.test(lower)) {
+    return { kind: 'showWorkspace' }
+  }
+  if (/^[/-]usage$/.test(lower)) {
+    return { kind: 'showUsage' }
+  }
+  const goalMatch = raw.match(/^[/-]goal(?:\s*(.*))?$/i)
+  if (goalMatch) {
+    const objective = (goalMatch[1] ?? '').trim()
+    return objective ? { kind: 'setGoal', objective } : { kind: 'invalidGoal' }
+  }
+  if (/^[/-]list-threads$/.test(lower)) {
+    return { kind: 'showThreads' }
+  }
+  if (/^[/-]current$/.test(lower)) {
+    return { kind: 'showCurrentThread' }
+  }
+  const switchMatch = raw.match(/^[/-]switch(?:\s+(.+))?$/i)
+  if (switchMatch) {
+    const target = (switchMatch[1] ?? '').trim()
+    return target ? { kind: 'switchThread', target } : { kind: 'showThreads' }
+  }
+  if (/^[/-]list-model$/.test(lower)) {
+    return { kind: 'showModel' }
+  }
+  const match = raw.match(/^[/-]model(?:\s+(.+))?$/i)
+  if (match) {
+    const value = (match[1] ?? '').trim()
+    return value ? { kind: 'model', model: value } : { kind: 'showModel' }
+  }
+  return null
 }
