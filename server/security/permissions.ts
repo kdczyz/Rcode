@@ -11,6 +11,9 @@ const toolRisks: Record<BuiltinToolName, ToolRisk> = {
   project_diagnostics: "low",
   generate_image: "high",
   record_learning: "low",
+  memory_search: "low",
+  memory_store: "low",
+  memory_forget: "medium",
   apply_patch: "high",
   web_fetch: "medium",
   run_shell: "high",
@@ -26,7 +29,8 @@ const toolRisks: Record<BuiltinToolName, ToolRisk> = {
   git_branch: "medium",
   git_stage: "medium",
   git_commit: "high",
-  git_push: "high"
+  git_push: "high",
+  delegate_agents: "low"
 };
 
 export function getToolRisk(toolName: AgentToolName): ToolRisk {

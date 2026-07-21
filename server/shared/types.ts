@@ -47,6 +47,21 @@ export interface TaskPlan {
   steps: TaskPlanStep[];
 }
 
+export type SubagentRunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+
+export interface SubagentRunUpdate {
+  id: string;
+  batchId: string;
+  agentName: string;
+  task: string;
+  status: SubagentRunStatus;
+  summary?: string;
+  error?: string;
+  startedAt?: string;
+  completedAt?: string;
+  turns?: number;
+}
+
 export type LegacyPermissionMode = "request_approval" | "auto_approve";
 
 export type ToolRisk = "low" | "medium" | "high";
@@ -60,6 +75,9 @@ export type BuiltinToolName =
   | "project_diagnostics"
   | "generate_image"
   | "record_learning"
+  | "memory_search"
+  | "memory_store"
+  | "memory_forget"
   | "apply_patch"
   | "web_fetch"
   | "run_shell"
@@ -75,7 +93,8 @@ export type BuiltinToolName =
   | "git_branch"
   | "git_stage"
   | "git_commit"
-  | "git_push";
+  | "git_push"
+  | "delegate_agents";
 
 export type AgentToolName = BuiltinToolName | `mcp__${string}__${string}` | string;
 
@@ -270,6 +289,7 @@ export type StreamEvent =
   | { type: "tool_call"; toolCall: ToolCall }
   | { type: "permission_decision"; toolCallId: string; effect: PermissionEffect; reason: string }
   | { type: "tool_result"; result: ToolResult }
+  | { type: "subagent_update"; run: SubagentRunUpdate }
   | { type: "diff_created"; diffs: DiffResult[]; auditEventId?: string }
   | { type: "learning_result"; status: LearningRunStatus; recordsSaved: number; reason: string; createdAt: string }
   | { type: "approval_required"; conversationId: string; answer: string; approvals: PendingApproval[] }

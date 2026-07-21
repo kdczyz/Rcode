@@ -32,6 +32,22 @@ Call record_learning after verified work.
     assert.equal(skills[0]?.name, "auto-learning");
     assert.equal(skills[0]?.displayName, "自动学习测试");
     assert.match(skills[0]?.content ?? "", /record_learning/);
+
+    const manuallySelected = await activateSkills(
+      "answer an ordinary question",
+      projectPath,
+      3,
+      ["auto-learning"]
+    );
+    assert.equal(manuallySelected[0]?.name, "auto-learning");
+
+    const deduplicated = await activateSkills(
+      "use $auto-learning after this verified task",
+      projectPath,
+      3,
+      ["auto-learning"]
+    );
+    assert.equal(deduplicated.filter((skill) => skill.name === "auto-learning").length, 1);
   } finally {
     await rm(projectPath, { recursive: true, force: true });
   }

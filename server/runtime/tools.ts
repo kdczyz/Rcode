@@ -3,11 +3,13 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { getRuntimeConfig } from "./config";
-import { recordAuditEvent, saveArtifact, saveLearningRecord, type LearningRecordCategory } from "../storage/database";
+import { deleteMemory, recordAuditEvent, saveArtifact, saveLearningRecord, saveMemory, searchMemories, type LearningRecordCategory } from "../storage/database";
+import { getMemorySettings } from "../agent/memory";
 import { portableExecutor } from "./executor";
 import { managedProcessManager } from "./processManager";
 import { executeMcpTool, listMcpToolDefinitions } from "../integrations/mcpClient";
 import { generateImage, type ImageQuality, type ImageSize } from "../providers/imageProvider";
+import { listSubagents } from "../agent/subagents";
 import { assertNotSymlinkEscape, assertPathInsideWorkspace, getWorkspaceRoot, resolveWorkspacePath, sandboxPolicyName } from "../security/sandbox";
 import type { AgentToolName, BuiltinToolName, DiffResult, ExecutorResult, ManagedProcessSnapshot, PermissionMode, ToolCall, ToolDefinition, ToolResult } from "../shared/types";
 
@@ -92,6 +94,29 @@ const inputSchemas: Record<BuiltinToolName, Record<string, unknown>> = {
       dedupeKey: { type: "string", description: "Stable concept key used to update an equivalent lesson instead of creating a duplicate." }
     },
     required: ["title", "insight", "category"]
+  },
+  memory_search: {
+    type: "object",
+    properties: {
+      query: { type: "string", description: "Natural-language query for relevant long-term memories." },
+      limit: { type: "number", minimum: 1, maximum: 50, description: "Maximum results." }
+    },
+    required: ["query"]
+  },
+  memory_store: {
+    type: "object",
+    properties: {
+      content: { type: "string", description: "Durable, self-contained fact or preference to remember." },
+      kind: { type: "string", description: "Memory category, such as preference, decision, project, or workflow." },
+      importance: { type: "number", minimum: 1, maximum: 5 },
+      ttlDays: { type: "number", minimum: 1, maximum: 3650, description: "Optional expiry in days; omit for permanent memory." }
+    },
+    required: ["content"]
+  },
+  memory_forget: {
+    type: "object",
+    properties: { id: { type: "string", description: "Exact memory ID returned by memory_search." } },
+    required: ["id"]
   },
   apply_patch: {
     type: "object",
@@ -214,6 +239,31 @@ const inputSchemas: Record<BuiltinToolName, Record<string, unknown>> = {
       branch: { type: "string", description: "Optional branch name. Defaults to the current branch." },
       setUpstream: { type: "boolean", description: "Set upstream tracking for the branch." }
     }
+  },
+  delegate_agents: {
+    type: "object",
+    properties: {
+      tasks: {
+        type: "array",
+        minItems: 1,
+        maxItems: 6,
+        description: "Independent, non-overlapping tasks to delegate. Use multiple items when work can be investigated in parallel.",
+        items: {
+          type: "object",
+          properties: {
+            agent: { type: "string", description: "Exact available subagent name." },
+            task: { type: "string", description: "Self-contained assignment with scope, constraints, and expected output." }
+          },
+          required: ["agent", "task"]
+        }
+      },
+      strategy: {
+        type: "string",
+        enum: ["auto", "parallel", "sequential"],
+        description: "Auto runs read-only tasks in parallel and serializes agents that can mutate the workspace."
+      }
+    },
+    required: ["tasks"]
   }
 };
 
@@ -226,6 +276,9 @@ export const registeredTools: ToolDefinition[] = [
   { id: "project_diagnostics", name: "project_diagnostics", description: "Run configured project typecheck, lint, test, or build diagnostics inside the workspace.", inputSchema: inputSchemas.project_diagnostics, source: "builtin", risk: "low", requiresSandbox: true, requiresExecutor: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "generate_image", name: "generate_image", description: "Generate images when the user requests an actual image. Uses the selected provider's automatically detected image model; omit model unless the user explicitly chooses one.", inputSchema: inputSchemas.generate_image, source: "builtin", risk: "high", requiresSandbox: false, defaultApproval: "allow", approvalMode: "allow" },
   { id: "record_learning", name: "record_learning", description: "Save a verified reusable lesson to this project's learning records. Never store credentials, personal data, raw logs, or unverified guesses.", inputSchema: inputSchemas.record_learning, source: "builtin", risk: "low", requiresSandbox: false, defaultApproval: "allow", approvalMode: "allow" },
+  { id: "memory_search", name: "memory_search", description: "Search relevant project-scoped long-term memory. Compatible with memory skills that need explicit recall.", inputSchema: inputSchemas.memory_search, source: "builtin", risk: "low", requiresSandbox: false, defaultApproval: "allow", approvalMode: "allow" },
+  { id: "memory_store", name: "memory_store", description: "Store a durable project memory after the user asks to remember it or a memory skill identifies a stable fact. Never store secrets.", inputSchema: inputSchemas.memory_store, source: "builtin", risk: "low", requiresSandbox: false, defaultApproval: "allow", approvalMode: "allow" },
+  { id: "memory_forget", name: "memory_forget", description: "Delete one project memory by exact ID when the user asks to forget it.", inputSchema: inputSchemas.memory_forget, source: "builtin", risk: "medium", requiresSandbox: false, defaultApproval: "ask", approvalMode: "ask" },
   { id: "apply_patch", name: "apply_patch", description: "Patch an existing file using unified diff or exact oldText/newText replacement.", inputSchema: inputSchemas.apply_patch, source: "builtin", risk: "high", requiresSandbox: true, defaultApproval: "allow", approvalMode: "allow" },
   { id: "web_fetch", name: "web_fetch", description: "Fetch documentation or API references from a URL.", inputSchema: inputSchemas.web_fetch, source: "builtin", risk: "medium", requiresSandbox: false, defaultApproval: "ask", approvalMode: "ask" },
   { id: "run_shell", name: "run_shell", description: "Run a shell command through portable guarded execution.", inputSchema: inputSchemas.run_shell, source: "builtin", risk: "high", requiresSandbox: true, requiresExecutor: true, defaultApproval: "ask", approvalMode: "ask" },
@@ -242,20 +295,49 @@ export const registeredTools: ToolDefinition[] = [
   { id: "git_stage", name: "git_stage", description: "Stage selected workspace paths for commit.", inputSchema: inputSchemas.git_stage, source: "builtin", risk: "medium", requiresSandbox: true, requiresExecutor: true, defaultApproval: "ask", approvalMode: "ask" },
   { id: "git_commit", name: "git_commit", description: "Create a git commit with the staged changes.", inputSchema: inputSchemas.git_commit, source: "builtin", risk: "high", requiresSandbox: true, requiresExecutor: true, defaultApproval: "ask", approvalMode: "ask" },
   { id: "git_push", name: "git_push", description: "Push a branch to a Git remote after explicit approval.", inputSchema: inputSchemas.git_push, source: "builtin", risk: "high", requiresSandbox: true, requiresExecutor: true, defaultApproval: "ask", approvalMode: "ask" }
+  ,{ id: "delegate_agents", name: "delegate_agents", description: "Delegate independent research, review, debugging, or test-analysis tasks to isolated subagents and merge their concise reports. Prefer this when two or more scopes can be investigated independently.", inputSchema: inputSchemas.delegate_agents, source: "builtin", risk: "low", requiresSandbox: false, defaultApproval: "allow", approvalMode: "allow" }
 ];
 
 export async function getRegisteredTools(projectPath?: string): Promise<ToolDefinition[]> {
-  return [...registeredTools, ...(await listMcpToolDefinitions(projectPath))];
+  const memory = getMemorySettings();
+  const builtins = memory.skillIntegration.enabled && memory.skillIntegration.exposeTools
+    ? registeredTools
+    : registeredTools.filter((tool) => !tool.name.startsWith("memory_"));
+  return [...builtins, ...(await listMcpToolDefinitions(projectPath))];
 }
 
 export async function getToolDefinitions(projectPath?: string) {
   const tools = await getRegisteredTools(projectPath);
+  const agents = await listSubagents(projectPath);
   return tools.map((tool) => ({
     type: "function",
     function: {
       name: tool.name,
-      description: tool.description,
-      parameters: tool.inputSchema
+      description: tool.name === "delegate_agents"
+        ? `${tool.description} Available agents: ${agents.map((agent) => `${agent.name} (${agent.description})`).join("; ")}.`
+        : tool.description,
+      parameters: tool.name === "delegate_agents"
+        ? {
+            ...tool.inputSchema,
+            properties: {
+              ...(tool.inputSchema.properties as Record<string, unknown>),
+              tasks: {
+                ...((tool.inputSchema.properties as Record<string, Record<string, unknown>>).tasks),
+                items: {
+                  ...(((tool.inputSchema.properties as Record<string, Record<string, unknown>>).tasks.items as Record<string, unknown>)),
+                  properties: {
+                    ...((((tool.inputSchema.properties as Record<string, Record<string, unknown>>).tasks.items as Record<string, Record<string, unknown>>).properties)),
+                    agent: {
+                      type: "string",
+                      enum: agents.map((agent) => agent.name),
+                      description: "Exact available subagent name."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        : tool.inputSchema
     }
   })) as Array<{ type: "function"; function: { name: AgentToolName; description: string; parameters: Record<string, unknown> } }>;
 }
@@ -574,6 +656,39 @@ export async function executeTool(call: ToolCall, projectPath?: string, context?
         ok: true,
         content: `Learning recorded: ${record.title}`
       };
+    } else if (call.name === "memory_search") {
+      const settings = getMemorySettings();
+      if (!settings.longTerm.enabled) throw new Error("Long-term memory is disabled in settings");
+      const memories = searchMemories(
+        getWorkspaceRoot(projectPath),
+        getString(call.arguments.query, "query"),
+        Math.min(getNumber(call.arguments.limit, settings.longTerm.maxResults), settings.longTerm.maxResults),
+        settings.longTerm.minImportance
+      );
+      result = {
+        toolCallId: call.id,
+        name: call.name,
+        ok: true,
+        content: memories.length
+          ? memories.map((memory) => `[${memory.id}] (${memory.kind}, importance ${memory.importance}) ${memory.content}`).join("\n")
+          : "No relevant long-term memories found."
+      };
+    } else if (call.name === "memory_store") {
+      const settings = getMemorySettings();
+      if (!settings.longTerm.enabled) throw new Error("Long-term memory is disabled in settings");
+      const ttlDays = getNumber(call.arguments.ttlDays, 0);
+      const expiresAt = ttlDays > 0 ? new Date(Date.now() + Math.min(ttlDays, 3650) * 86_400_000).toISOString() : undefined;
+      const id = saveMemory(
+        getWorkspaceRoot(projectPath),
+        typeof call.arguments.kind === "string" ? call.arguments.kind : "note",
+        getString(call.arguments.content, "content"),
+        getNumber(call.arguments.importance, 2),
+        { source: "skill", expiresAt }
+      );
+      result = { toolCallId: call.id, name: call.name, ok: true, content: `Memory stored: ${id}` };
+    } else if (call.name === "memory_forget") {
+      deleteMemory(getString(call.arguments.id, "id"), getWorkspaceRoot(projectPath));
+      result = { toolCallId: call.id, name: call.name, ok: true, content: "Memory deleted." };
     } else if (call.name === "web_fetch") {
       const url = getString(call.arguments.url, "url");
       const response = await fetch(url, { signal: context?.signal });

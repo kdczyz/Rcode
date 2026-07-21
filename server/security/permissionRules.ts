@@ -174,11 +174,18 @@ export async function evaluatePermission(
   }
 
   if (mode === "plan") {
-    const effect: PermissionEffect = toolCall.name === "read_file" || toolCall.name === "list_files" || toolCall.name === "search_text" || toolCall.name === "inspect_tree" || toolCall.name === "project_diagnostics" || toolCall.name === "git_status" || toolCall.name === "git_diff" || toolCall.name === "read_process" || toolCall.name === "list_processes"
+    const effect: PermissionEffect = toolCall.name === "read_file" || toolCall.name === "list_files" || toolCall.name === "search_text" || toolCall.name === "inspect_tree" || toolCall.name === "project_diagnostics" || toolCall.name === "git_status" || toolCall.name === "git_diff" || toolCall.name === "read_process" || toolCall.name === "list_processes" || toolCall.name === "delegate_agents"
       ? "allow"
       : "deny";
     return decision(effect, effect === "allow" ? "Plan mode allows read-only inspection." : "Plan mode blocks writes, shell commands, and network access.", {
       enforcement: effect === "allow" ? "guarded" : "denied",
+      requiresApproval: false
+    });
+  }
+
+  if (toolCall.name === "delegate_agents") {
+    return decision("allow", "Subagents inherit the parent permission boundary and cannot approve their own elevated operations.", {
+      enforcement: "guarded",
       requiresApproval: false
     });
   }

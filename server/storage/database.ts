@@ -144,6 +144,20 @@ export interface LearningRun {
   createdAt: string;
 }
 
+export interface MemoryRecord {
+  id: string;
+  projectPath: string;
+  kind: string;
+  content: string;
+  importance: number;
+  source: "manual" | "agent" | "skill" | "imported";
+  accessCount: number;
+  lastAccessedAt?: string;
+  expiresAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface AuditEvent {
   id: string;
   createdAt: string;
@@ -414,6 +428,11 @@ function migrateDatabase(db: DatabaseSync) {
   tryExec(db, "ALTER TABLE agent_usage_events ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0");
   tryExec(db, "ALTER TABLE agent_usage_events ADD COLUMN raw_input_tokens INTEGER NOT NULL DEFAULT 0");
   tryExec(db, "ALTER TABLE agent_usage_events ADD COLUMN input_token_semantics INTEGER NOT NULL DEFAULT 0");
+  tryExec(db, "ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'");
+  tryExec(db, "ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0");
+  tryExec(db, "ALTER TABLE memories ADD COLUMN last_accessed_at TEXT");
+  tryExec(db, "ALTER TABLE memories ADD COLUMN expires_at TEXT");
+  tryExec(db, "CREATE INDEX IF NOT EXISTS memories_project_updated ON memories(project_path, updated_at DESC)");
   tryExec(db, "UPDATE agent_usage_events SET cache_read_tokens = cached_tokens WHERE cache_read_tokens = 0 AND cached_tokens > 0");
   tryExec(db, `
     UPDATE agent_usage_events
@@ -986,29 +1005,128 @@ export function setActiveAiProviderId(id: string | undefined) {
   `).run("active_ai_provider", id, new Date().toISOString());
 }
 
-export function listMemories(projectPath: string, limit = 12) {
-  const rows = getDatabase().prepare(`
-    SELECT id, kind, content, importance, created_at, updated_at
-    FROM memories
-    WHERE project_path = ?
-    ORDER BY importance DESC, updated_at DESC
-    LIMIT ?
-  `).all(projectPath, limit);
-  return rows;
+function mapMemory(row: Record<string, unknown>): MemoryRecord {
+  return {
+    id: String(row.id),
+    projectPath: String(row.project_path),
+    kind: String(row.kind),
+    content: String(row.content),
+    importance: Number(row.importance),
+    source: (row.source || "manual") as MemoryRecord["source"],
+    accessCount: Number(row.access_count ?? 0),
+    lastAccessedAt: row.last_accessed_at ? String(row.last_accessed_at) : undefined,
+    expiresAt: row.expires_at ? String(row.expires_at) : undefined,
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at)
+  };
 }
 
-export function saveMemory(projectPath: string, kind: string, content: string, importance = 1) {
+const memorySelect = `
+  SELECT id, project_path, kind, content, importance, source, access_count,
+         last_accessed_at, expires_at, created_at, updated_at
+  FROM memories
+`;
+
+export function listMemories(projectPath: string, limit = 12): MemoryRecord[] {
+  const rows = getDatabase().prepare(`${memorySelect}
+    WHERE project_path = ? AND (expires_at IS NULL OR expires_at > ?)
+    ORDER BY importance DESC, updated_at DESC
+    LIMIT ?
+  `).all(projectPath, new Date().toISOString(), Math.max(1, Math.min(limit, 250))) as Record<string, unknown>[];
+  return rows.map(mapMemory);
+}
+
+function memoryTerms(query: string) {
+  const normalized = query.toLocaleLowerCase();
+  const terms: string[] = normalized.match(/[a-z0-9_-]{2,}/g) ?? [];
+  for (const run of normalized.match(/[\u3400-\u9fff]{2,}/gu) ?? []) {
+    if (run.length <= 6) terms.push(run);
+    for (let index = 0; index < run.length - 1; index++) terms.push(run.slice(index, index + 2));
+  }
+  return [...new Set(terms)].slice(0, 24);
+}
+
+/** Lightweight hybrid retrieval: keyword coverage + importance + recency. */
+export function searchMemories(projectPath: string, query: string, limit = 12, minImportance = 1): MemoryRecord[] {
+  const candidates = getDatabase().prepare(`${memorySelect}
+    WHERE project_path = ? AND importance >= ? AND (expires_at IS NULL OR expires_at > ?)
+    ORDER BY updated_at DESC
+    LIMIT 250
+  `).all(projectPath, minImportance, new Date().toISOString()) as Record<string, unknown>[];
+  const terms = memoryTerms(query);
+  const now = Date.now();
+  const ranked = candidates.map((row) => {
+    const memory = mapMemory(row);
+    const haystack = `${memory.kind} ${memory.content}`.toLocaleLowerCase();
+    const matches = terms.reduce((score, term) => score + (haystack.includes(term) ? 1 : 0), 0);
+    const ageDays = Math.max(0, (now - Date.parse(memory.updatedAt)) / 86_400_000);
+    const recency = 1 / (1 + ageDays / 30);
+    return { memory, score: matches * 10 + memory.importance * 1.5 + recency };
+  }).filter((item) => terms.length === 0 || item.score >= 10);
+  ranked.sort((a, b) => b.score - a.score || b.memory.updatedAt.localeCompare(a.memory.updatedAt));
+  const selected = ranked.slice(0, Math.max(1, Math.min(limit, 50))).map((item) => item.memory);
+  if (selected.length > 0) {
+    const nowIso = new Date().toISOString();
+    const update = getDatabase().prepare("UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?");
+    for (const memory of selected) {
+      update.run(nowIso, memory.id);
+      memory.accessCount += 1;
+      memory.lastAccessedAt = nowIso;
+    }
+  }
+  return selected;
+}
+
+export function saveMemory(
+  projectPath: string,
+  kind: string,
+  content: string,
+  importance = 1,
+  options: { source?: MemoryRecord["source"]; expiresAt?: string; deduplicate?: boolean } = {}
+) {
   const now = new Date().toISOString();
+  const normalized = content.trim().replace(/\s+/g, " ").slice(0, 8000);
+  if (!normalized) throw new Error("Memory content is required");
+  if (/(?:\bsk-[a-z0-9_-]{12,}|\bapi[_ -]?key\s*[:=]|\bauthorization\s*:\s*bearer|\bpassword\s*[:=]|\bcookie\s*:)/i.test(normalized)) {
+    throw new Error("Memories cannot contain credentials or authentication data");
+  }
+  if (options.deduplicate !== false) {
+    const existing = getDatabase().prepare(`
+      SELECT id FROM memories WHERE project_path = ? AND kind = ? AND lower(content) = lower(?) LIMIT 1
+    `).get(projectPath, kind, normalized) as { id: string } | undefined;
+    if (existing) {
+      getDatabase().prepare(`UPDATE memories SET importance = MAX(importance, ?), updated_at = ?, expires_at = COALESCE(?, expires_at) WHERE id = ?`)
+        .run(Math.max(1, Math.min(importance, 5)), now, options.expiresAt ?? null, existing.id);
+      return existing.id;
+    }
+  }
   const id = createId("memory");
   getDatabase().prepare(`
-    INSERT INTO memories (id, project_path, kind, content, importance, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(id, projectPath, kind, content, importance, now, now);
+    INSERT INTO memories (id, project_path, kind, content, importance, source, expires_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, projectPath, kind.slice(0, 80), normalized, Math.max(1, Math.min(importance, 5)), options.source ?? "manual", options.expiresAt ?? null, now, now);
   return id;
 }
 
-export function deleteMemory(id: string) {
+export function deleteMemory(id: string, projectPath?: string) {
+  if (projectPath) {
+    getDatabase().prepare("DELETE FROM memories WHERE id = ? AND project_path = ?").run(id, projectPath);
+    return;
+  }
   getDatabase().prepare("DELETE FROM memories WHERE id = ?").run(id);
+}
+
+export function getAppSetting<T>(key: string, fallback: T): T {
+  const row = getDatabase().prepare("SELECT value FROM app_settings WHERE key = ?").get(key) as { value: string } | undefined;
+  if (!row) return fallback;
+  try { return JSON.parse(row.value) as T; } catch { return fallback; }
+}
+
+export function setAppSetting<T>(key: string, value: T) {
+  getDatabase().prepare(`
+    INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+  `).run(key, JSON.stringify(value), new Date().toISOString());
+  return value;
 }
 
 const learningCategories = new Set<LearningRecordCategory>(["preference", "project", "pattern", "bugfix", "workflow"]);

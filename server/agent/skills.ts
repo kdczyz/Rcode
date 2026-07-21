@@ -126,9 +126,12 @@ export function skillMatchScore(prompt: string, skill: AgentSkill) {
   return score;
 }
 
-export async function activateSkills(prompt: string, projectPath?: string, maxSkills = 3) {
+export async function activateSkills(prompt: string, projectPath?: string, maxSkills = 3, requestedNames: string[] = []) {
   const skills = await listSkills(projectPath);
-  const explicit = [...prompt.matchAll(/\$([a-zA-Z0-9_-]+)/g)].map((match) => match[1]);
+  const explicit = [
+    ...requestedNames,
+    ...[...prompt.matchAll(/\$([a-zA-Z0-9_-]+)/g)].map((match) => match[1])
+  ];
   const selected: AgentSkill[] = [];
 
   for (const name of explicit) {

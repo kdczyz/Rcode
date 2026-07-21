@@ -1,0 +1,4 @@
+interface:
+  display_name: "记忆管理"
+  short_description: "检索、保存和清除项目长期记忆"
+  default_prompt: "请回忆这个项目的相关约定，并在需要时更新长期记忆。"

@@ -26,6 +26,21 @@ test("maps DeepSeek modes to toggle and supported effort values", () => {
     buildReasoningRequestConfig("https://api.deepseek.com", "deepseek-v4-pro", "deep").parameters,
     { thinking: { type: "enabled" }, reasoning_effort: "max" }
   );
+
+  const gatewayBaseUrl = "https://relay.example.com/v1";
+  const gatewayModel = "deepseek-ai/deepseek-v4-pro";
+  assert.deepEqual(
+    buildReasoningRequestConfig(gatewayBaseUrl, gatewayModel, "fast").parameters,
+    { thinking: { type: "disabled" } }
+  );
+  assert.deepEqual(
+    buildReasoningRequestConfig(gatewayBaseUrl, gatewayModel, "balanced").parameters,
+    { thinking: { type: "enabled" }, reasoning_effort: "high" }
+  );
+  assert.deepEqual(
+    buildReasoningRequestConfig(gatewayBaseUrl, gatewayModel, "deep").parameters,
+    { thinking: { type: "enabled" }, reasoning_effort: "max" }
+  );
 });
 
 test("maps OpenAI-compatible modes to reasoning_effort", () => {

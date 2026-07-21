@@ -41,7 +41,7 @@ type ProjectKind = "empty" | "folder" | "temporary";
 type MessageStatus = "completed" | "approval_required" | "error" | "running";
 type WorkflowPhase = "preparing" | "planning" | "thinking" | "inspecting" | "executing" | "awaiting_approval" | "plan_ready" | "completed" | "stopped" | "failed";
 type ActiveView = "chat" | "settings";
-type SettingsSectionId = "profile" | "general" | "usage" | "skills" | "learning" | "ai" | "mcp";
+type SettingsSectionId = "profile" | "general" | "usage" | "memory" | "skills" | "learning" | "ai" | "mcp";
 type UsageActivityMode = "daily" | "weekly" | "total";
 type AiProviderHealthState = "idle" | "checking" | "healthy" | "unhealthy";
 
@@ -310,6 +310,30 @@ interface LearningRunItem {
   createdAt: string;
 }
 
+interface MemorySettings {
+  shortTerm: { enabled: boolean; contextBudgetTokens: number; summaryTokenLimit: number; toolOutputTokenLimit: number };
+  longTerm: { enabled: boolean; maxResults: number; maxContextChars: number; minImportance: number; retrieval: "recent" | "hybrid" };
+  skillIntegration: { enabled: boolean; exposeTools: boolean };
+}
+
+interface MemoryItem {
+  id: string;
+  projectPath: string;
+  kind: string;
+  content: string;
+  importance: number;
+  source: "manual" | "agent" | "skill" | "imported";
+  accessCount: number;
+  expiresAt?: string;
+  updatedAt: string;
+}
+
+const defaultMemorySettings: MemorySettings = {
+  shortTerm: { enabled: true, contextBudgetTokens: 16_000, summaryTokenLimit: 1_600, toolOutputTokenLimit: 900 },
+  longTerm: { enabled: true, maxResults: 12, maxContextChars: 6_000, minImportance: 1, retrieval: "hybrid" },
+  skillIntegration: { enabled: true, exposeTools: true }
+};
+
 const learningCategoryLabels: Record<LearningCategory, string> = {
   preference: "偏好",
   project: "项目约定",
@@ -329,6 +353,7 @@ interface QueuedPrompt {
   content: string;
   kind?: "prompt" | "guide";
   attachments?: ComposerAttachment[];
+  skillNames?: string[];
 }
 
 interface TaskTimerState {
@@ -1527,6 +1552,7 @@ export default function App() {
   const [localApiToken, setLocalApiToken] = useState<string | undefined>();
   const [prompt, setPrompt] = useState("");
   const [composerAttachmentsBySession, setComposerAttachmentsBySession] = useState<Record<string, ComposerAttachment[]>>({});
+  const [composerSkillNamesBySession, setComposerSkillNamesBySession] = useState<Record<string, string[]>>({});
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
     const saved = localStorage.getItem("agent.themePreference");
     return saved === "dark" || saved === "light" || saved === "system" ? saved : "system";
@@ -1542,6 +1568,10 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState("");
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [providerMenuOpen, setProviderMenuOpen] = useState(false);
+  // 合并后的模型切换面板：当前高亮（未提交）的接口 id，以及各接口的模型缓存
+  const [modelPanelProviderId, setModelPanelProviderId] = useState("");
+  const [providerModelsById, setProviderModelsById] = useState<Record<string, string[]>>({});
+  const [providerModelsLoadingIds, setProviderModelsLoadingIds] = useState<Set<string>>(() => new Set());
   const [thinkingMode, setThinkingMode] = useState<ThinkingMode>(() => loadThinkingMode());
   const [permissionMenuOpen, setPermissionMenuOpen] = useState(false);
   const [managedProcessPanelOpen, setManagedProcessPanelOpen] = useState(false);
@@ -1557,6 +1587,11 @@ export default function App() {
   const [skills, setSkills] = useState<AgentSkill[]>([]);
   const [learningRecords, setLearningRecords] = useState<LearningRecordItem[]>([]);
   const [latestLearningRun, setLatestLearningRun] = useState<LearningRunItem | undefined>();
+  const [memorySettings, setMemorySettings] = useState<MemorySettings>(defaultMemorySettings);
+  const [memories, setMemories] = useState<MemoryItem[]>([]);
+  const [memorySearch, setMemorySearch] = useState("");
+  const [memoryDraft, setMemoryDraft] = useState({ content: "", kind: "note", importance: 2 });
+  const [memoryStatus, setMemoryStatus] = useState("");
   const [aiDraft, setAiDraft] = useState({
     id: "",
     displayName: "",
@@ -1602,7 +1637,9 @@ export default function App() {
   const usageActivityScrollRef = useRef<HTMLDivElement>(null);
   const workspaceStateRef = useRef(workspaceState);
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const interruptionIntentRef = useRef<Map<string, "stop" | "guide">>(new Map());
   const aiProviderHealthChecksRef = useRef<Set<string>>(new Set());
+  const providerModelRequestVersionsRef = useRef<Map<string, number>>(new Map());
   const aiProviderBalanceRequestRef = useRef(0);
   const themeToggleRef = useRef<HTMLButtonElement>(null);
   const themeTransitionRef = useRef<{ overlay: HTMLDivElement; timeoutId: number } | null>(null);
@@ -1690,10 +1727,12 @@ export default function App() {
     [aiActiveProviderId, aiProviders]
   );
   const textModelOptions = useMemo(
-    () => [...new Set([activeAiProvider?.defaultModel, ...modelOptions]
+    () => [...new Set([activeAiProvider?.defaultModel, ...(activeAiProvider && providerModelsById[activeAiProvider.id]
+      ? providerModelsById[activeAiProvider.id]
+      : modelOptions)]
       .filter((model): model is string => Boolean(model))
       .filter((model) => inferredImageModels([model]).length === 0))],
-    [activeAiProvider?.defaultModel, modelOptions]
+    [activeAiProvider, modelOptions, providerModelsById]
   );
   const requestedModelName = selectedModel || activeAiProvider?.defaultModel || health?.model || "";
   const modelName = inferredImageModels([requestedModelName]).length > 0
@@ -1833,6 +1872,12 @@ export default function App() {
   const activeQueueLength = useMemo(
     () => activeQueuedPrompts.length,
     [activeQueuedPrompts]
+  );
+  const activeSelectedSkillNames = useMemo(
+    () => activeSession
+      ? (composerSkillNamesBySession[activeSession.id] ?? []).filter((name) => skills.some((skill) => skill.name === name))
+      : [],
+    [activeSession, composerSkillNamesBySession, skills]
   );
   const shellStyle = useMemo(
     () => ({ "--sidebar-width": `${sidebarWidth}px` }) as CSSProperties,
@@ -2031,15 +2076,20 @@ export default function App() {
       fetch(`${API_BASE}/api/ai/providers`, { headers }).then((r) => r.ok ? r.json() : { providers: [], activeProviderId: "" }),
       fetch(`${API_BASE}/api/mcp/servers`, { headers }).then((r) => r.ok ? r.json() : { servers: [] }),
       fetch(`${API_BASE}/api/skills${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { skills: [] }),
-      fetch(`${API_BASE}/api/learning${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { records: [] })
-    ]).then(([usageData, aiData, mcpData, skillsData, learningData]) => {
+      fetch(`${API_BASE}/api/learning${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { records: [] }),
+      fetch(`${API_BASE}/api/memory${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { memories: [] }),
+      fetch(`${API_BASE}/api/memory/settings`, { headers }).then((r) => r.ok ? r.json() : { settings: defaultMemorySettings })
+    ]).then(([usageData, aiData, mcpData, skillsData, learningData, memoryData, memorySettingsData]) => {
       setUsageSummary(usageData);
       setAiProviders(aiData.providers ?? []);
       setAiActiveProviderId(aiData.activeProviderId ?? "");
+      void refreshProviderModels(aiData.providers ?? []);
       setMcpServers(mcpData.servers ?? []);
       setSkills(skillsData.skills ?? []);
       setLearningRecords(learningData.records ?? []);
       setLatestLearningRun(learningData.lastRun);
+      setMemories(memoryData.memories ?? []);
+      setMemorySettings(memorySettingsData.settings ?? defaultMemorySettings);
     }).catch(() => {
       setUsageSummary(undefined);
       setAiProviders([]);
@@ -2048,6 +2098,7 @@ export default function App() {
       setSkills([]);
       setLearningRecords([]);
       setLatestLearningRun(undefined);
+      setMemories([]);
     });
   }, [localApiToken, isDesktopClient, activeProject?.path]);
 
@@ -2222,6 +2273,12 @@ export default function App() {
   function archiveSession(projectId: string, sessionId: string) {
     resetSessionSwipe(sessionId);
     queuedPromptsRef.current.delete(sessionId);
+    setComposerSkillNamesBySession((current) => {
+      if (!(sessionId in current)) return current;
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
     abortControllersRef.current.get(sessionId)?.abort();
     abortControllersRef.current.delete(sessionId);
     setRunningSessionIds((cur) => {
@@ -2332,9 +2389,17 @@ export default function App() {
     setQueueVersion((v) => v + 1);
   }
 
-  function enqueuePrompt(sessionId: string, content: string, attachments: ComposerAttachment[] = []) {
+  function enqueuePrompt(
+    sessionId: string,
+    content: string,
+    attachments: ComposerAttachment[] = [],
+    skillNames: string[] = [],
+    kind: QueuedPrompt["kind"] = "prompt",
+    prepend = false
+  ) {
     const q = queuedPromptsRef.current.get(sessionId) ?? [];
-    queuedPromptsRef.current.set(sessionId, [...q, { id: createId("queue"), content, kind: "prompt", attachments }]);
+    const next = { id: createId("queue"), content, kind, attachments, skillNames };
+    queuedPromptsRef.current.set(sessionId, prepend ? [next, ...q] : [...q, next]);
     updateQueueState();
   }
 
@@ -2352,6 +2417,7 @@ export default function App() {
     const rest = q.filter((item) => item.id !== queueId);
     queuedPromptsRef.current.set(sessionId, [{ ...target, kind: "guide" }, ...rest]);
     updateQueueState();
+    if (runningSessionIds.has(sessionId)) interruptSessionForGuidance(sessionId);
   }
 
   function dequeuePrompt(sessionId: string) {
@@ -2374,11 +2440,41 @@ export default function App() {
     }));
   }
 
+  function interruptSessionForGuidance(sessionId: string) {
+    interruptionIntentRef.current.set(sessionId, "guide");
+    const controller = abortControllersRef.current.get(sessionId);
+    controller?.abort();
+    const projectId = findProjectIdForSession(sessionId);
+    if (projectId) {
+      updateSession(projectId, sessionId, (session) => ({
+        ...session,
+        workflowPhase: "preparing",
+        workflowLabel: "正在应用新引导"
+      }));
+    }
+    if (!controller && projectId) {
+      markSessionIdle(sessionId);
+      void processNextQueuedPrompt(sessionId);
+    }
+  }
+
+  function submitGuidance() {
+    if (!activeSession || !isActiveSessionRunning) return;
+    const content = prompt.trim();
+    if (!content && composerAttachments.length === 0) return;
+    enqueuePrompt(activeSession.id, content, composerAttachments, activeSelectedSkillNames, "guide", true);
+    setPrompt("");
+    setComposerAttachmentsBySession((current) => ({ ...current, [activeSession.id]: [] }));
+    interruptSessionForGuidance(activeSession.id);
+  }
+
   function stopActiveResponse() {
     if (!activeSession) return;
+    interruptionIntentRef.current.set(activeSession.id, "stop");
+    queuedPromptsRef.current.delete(activeSession.id);
+    updateQueueState();
     const controller = abortControllersRef.current.get(activeSession.id);
     controller?.abort();
-    abortControllersRef.current.delete(activeSession.id);
     if (activeProject) {
       updateSession(activeProject.id, activeSession.id, (session) => ({
         ...session,
@@ -2386,7 +2482,7 @@ export default function App() {
         workflowLabel: "已停止当前任务"
       }));
     }
-    markSessionIdle(activeSession.id);
+    if (!controller) markSessionIdle(activeSession.id);
   }
 
   async function processQueuedPrompt(projectId: string, sessionId: string) {
@@ -2396,7 +2492,7 @@ export default function App() {
       next.kind === "guide"
         ? `请把下面内容作为对当前会话/当前任务的引导和补充约束，优先参考，但不要机械复述：\n\n${next.content}`
         : next.content;
-    await runAgentForSession(projectId, sessionId, content, true, next.content, undefined, next.attachments ?? []);
+    await runAgentForSession(projectId, sessionId, content, true, next.content, undefined, next.attachments ?? [], next.skillNames ?? []);
     return true;
   }
 
@@ -2885,7 +2981,8 @@ export default function App() {
     addUserMessage = true,
     displayContent = content,
     modeOverride?: PermissionMode,
-    attachments: ComposerAttachment[] = []
+    attachments: ComposerAttachment[] = [],
+    skillNames: string[] = []
   ) {
     const context = getSessionContext(projectId, sessionId);
     if (!context) return;
@@ -2928,7 +3025,8 @@ export default function App() {
           thinkingMode,
           projectPath: context.project.path,
           providerId: aiActiveProviderId || undefined,
-          attachments
+          attachments,
+          skillNames
         })
       });
 
@@ -2940,6 +3038,8 @@ export default function App() {
       await consumeSseStream(result, projectId, sessionId, assistantMessageId, requestStartedAt);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
+        const interruptionIntent = interruptionIntentRef.current.get(sessionId);
+        const interruptionCopy = interruptionIntent === "guide" ? "已打断此轮，正在按新引导继续。" : "已停止当前任务。";
         updateSession(projectId, sessionId, (s) => ({
           ...s,
           messages: s.messages.map((m) =>
@@ -2947,8 +3047,8 @@ export default function App() {
               ? {
                   ...m,
                   isStreaming: false,
-                  status: "error" as const,
-                  content: m.content ? `${m.content}\n\n已停止当前回复。` : "已停止当前回复。",
+                  status: interruptionIntent === "guide" ? "completed" as const : "error" as const,
+                  content: m.content ? `${m.content}\n\n${interruptionCopy}` : interruptionCopy,
                   completedAt: Date.now(),
                   durationMs: Math.max(0, Date.now() - (m.startedAt ?? requestStartedAt))
                 }
@@ -2997,7 +3097,9 @@ export default function App() {
       if (abortControllersRef.current.get(sessionId) === abortController) abortControllersRef.current.delete(sessionId);
       markSessionIdle(sessionId);
       void reloadPlatformData();
-      void processNextQueuedPrompt(sessionId);
+      const interruptionIntent = interruptionIntentRef.current.get(sessionId);
+      interruptionIntentRef.current.delete(sessionId);
+      if (interruptionIntent !== "stop") void processNextQueuedPrompt(sessionId);
     }
   }
 
@@ -3007,15 +3109,13 @@ export default function App() {
     if ((!content && attachments.length === 0) || !activeProject || !activeSession) return;
 
     if (isActiveSessionRunning) {
-      enqueuePrompt(activeSession.id, content, attachments);
-      setPrompt("");
-      setComposerAttachmentsBySession((current) => ({ ...current, [activeSession.id]: [] }));
+      submitGuidance();
       return;
     }
 
     setPrompt("");
     setComposerAttachmentsBySession((current) => ({ ...current, [activeSession.id]: [] }));
-    await runAgentForSession(activeProject.id, activeSession.id, content, true, content, undefined, attachments);
+    await runAgentForSession(activeProject.id, activeSession.id, content, true, content, undefined, attachments, activeSelectedSkillNames);
   }
 
   function submitCurrentComposer() {
@@ -3062,7 +3162,8 @@ export default function App() {
           model: modelName,
           thinkingMode,
           projectPath: activeProject.path,
-          providerId: aiActiveProviderId || undefined
+          providerId: aiActiveProviderId || undefined,
+          skillNames: activeSelectedSkillNames
         })
       });
 
@@ -3107,21 +3208,20 @@ export default function App() {
       }));
       if (abortControllersRef.current.get(sessionId) === abortController) abortControllersRef.current.delete(sessionId);
       markSessionIdle(sessionId);
-      void processNextQueuedPrompt(sessionId);
+      const interruptionIntent = interruptionIntentRef.current.get(sessionId);
+      interruptionIntentRef.current.delete(sessionId);
+      if (interruptionIntent !== "stop") void processNextQueuedPrompt(sessionId);
     }
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
     event.preventDefault();
-    submitCurrentComposer();
+    if (isActiveSessionRunning) submitGuidance();
+    else submitCurrentComposer();
   }
 
   function handleSendButtonClick() {
-    if (isActiveSessionRunning) {
-      stopActiveResponse();
-      return;
-    }
     submitCurrentComposer();
   }
 
@@ -3150,7 +3250,9 @@ export default function App() {
       `请开始执行刚刚确认的计划。按顺序实施并完成验证；如项目实际情况与计划冲突，请说明后做最小必要调整。\n\n${planText}`,
       true,
       "确认计划并开始执行",
-      "workspace_write"
+      "workspace_write",
+      [],
+      composerSkillNamesBySession[sessionId] ?? []
     );
   }
 
@@ -3307,20 +3409,26 @@ export default function App() {
 
   async function reloadPlatformData() {
     const headers = getLocalApiHeaders();
-    const [mcpData, usageData, aiData, skillsData, learningData] = await Promise.all([
+    const [mcpData, usageData, aiData, skillsData, learningData, memoryData, memorySettingsData] = await Promise.all([
       fetch(`${API_BASE}/api/mcp/servers`, { headers }).then((r) => r.ok ? r.json() : { servers: [] }),
       fetch(`${API_BASE}/api/usage`, { headers }).then((r) => r.ok ? r.json() : undefined),
       fetch(`${API_BASE}/api/ai/providers`, { headers }).then((r) => r.ok ? r.json() : { providers: [], activeProviderId: "" }),
       fetch(`${API_BASE}/api/skills${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { skills: [] }),
-      fetch(`${API_BASE}/api/learning${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { records: [] })
+      fetch(`${API_BASE}/api/learning${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { records: [] }),
+      fetch(`${API_BASE}/api/memory${activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : ""}`, { headers }).then((r) => r.ok ? r.json() : { memories: [] }),
+      fetch(`${API_BASE}/api/memory/settings`, { headers }).then((r) => r.ok ? r.json() : { settings: defaultMemorySettings })
     ]);
     setMcpServers(mcpData.servers ?? []);
     setUsageSummary(usageData);
     setAiProviders(aiData.providers ?? []);
     setAiActiveProviderId(aiData.activeProviderId ?? "");
+    // 异步刷新每个接口的模型缓存，不阻塞主流程
+    void refreshProviderModels(aiData.providers ?? []);
     setSkills(skillsData.skills ?? []);
     setLearningRecords(learningData.records ?? []);
     setLatestLearningRun(learningData.lastRun);
+    setMemories(memoryData.memories ?? []);
+    setMemorySettings(memorySettingsData.settings ?? defaultMemorySettings);
   }
 
   async function reloadRuntimeData() {
@@ -3337,6 +3445,48 @@ export default function App() {
       const all = modelData.models?.map((m: { id: string }) => m.id) ?? [];
       setModelOptions([...new Set([...recommended, ...all])]);
     }
+  }
+
+  async function refreshProviderModel(provider: AiProviderConfig) {
+    const requestVersion = (providerModelRequestVersionsRef.current.get(provider.id) ?? 0) + 1;
+    providerModelRequestVersionsRef.current.set(provider.id, requestVersion);
+    setProviderModelsLoadingIds((current) => new Set(current).add(provider.id));
+    try {
+      const response = await fetch(`${API_BASE}/api/ai/providers/${encodeURIComponent(provider.id)}/models`, {
+        headers: getLocalApiHeaders()
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.error) throw new Error(typeof data.error === "string" ? data.error : "fetch failed");
+      if (providerModelRequestVersionsRef.current.get(provider.id) !== requestVersion) return;
+      const models: string[] = (data.models ?? []).map((model: { id: string }) => model.id).filter(Boolean);
+      const imageModels = inferredImageModels(models);
+      const textModels = models.filter((model) => !imageModels.includes(model));
+      const merged = [...new Set([provider.defaultModel, ...textModels].filter(Boolean))];
+      setProviderModelsById((current) => ({ ...current, [provider.id]: merged }));
+    } catch {
+      if (providerModelRequestVersionsRef.current.get(provider.id) !== requestVersion) return;
+      setProviderModelsById((current) => current[provider.id]
+        ? current
+        : { ...current, [provider.id]: provider.defaultModel ? [provider.defaultModel] : [] });
+    } finally {
+      if (providerModelRequestVersionsRef.current.get(provider.id) === requestVersion) {
+        setProviderModelsLoadingIds((current) => {
+          const next = new Set(current);
+          next.delete(provider.id);
+          return next;
+        });
+      }
+    }
+  }
+
+  // 首次加载时预取；模型面板打开或切换接口时还会再次读取上游最新列表。
+  async function refreshProviderModels(providers: AiProviderConfig[]) {
+    const usable = providers.filter((provider) => provider.configured && provider.enabled !== false);
+    if (usable.length === 0) {
+      setProviderModelsById({});
+      return;
+    }
+    await Promise.all(usable.map((provider) => refreshProviderModel(provider)));
   }
 
   async function loadAiProviderBalance(providerId = aiActiveProviderId) {
@@ -3765,6 +3915,52 @@ export default function App() {
     setLearningRecords((current) => current.filter((record) => record.id !== id));
   }
 
+  async function saveMemoryConfiguration() {
+    setMemoryStatus("正在保存…");
+    try {
+      const response = await fetch(`${API_BASE}/api/memory/settings`, {
+        method: "PUT",
+        headers: getJsonHeaders(),
+        body: JSON.stringify(memorySettings)
+      });
+      const data = await response.json().catch(() => ({})) as { settings?: MemorySettings; error?: string };
+      if (!response.ok || !data.settings) throw new Error(data.error ?? "保存失败");
+      setMemorySettings(data.settings);
+      setMemoryStatus("已保存，新对话轮次立即生效");
+    } catch (error) {
+      setMemoryStatus(error instanceof Error ? error.message : "保存失败");
+    }
+  }
+
+  async function addManualMemory() {
+    const content = memoryDraft.content.trim();
+    if (!content) return;
+    setMemoryStatus("正在写入…");
+    const response = await fetch(`${API_BASE}/api/memory`, {
+      method: "POST",
+      headers: getJsonHeaders(),
+      body: JSON.stringify({ projectPath: activeProject?.path, ...memoryDraft, content })
+    });
+    const data = await response.json().catch(() => ({})) as { memories?: MemoryItem[]; error?: string };
+    if (!response.ok) {
+      setMemoryStatus(data.error ?? "写入失败");
+      return;
+    }
+    setMemories(data.memories ?? []);
+    setMemoryDraft((current) => ({ ...current, content: "" }));
+    setMemoryStatus("长期记忆已保存");
+  }
+
+  async function removeMemory(id: string) {
+    if (!window.confirm("删除这条长期记忆？此操作不会影响聊天记录。")) return;
+    const params = activeProject?.path ? `?projectPath=${encodeURIComponent(activeProject.path)}` : "";
+    const response = await fetch(`${API_BASE}/api/memory/${encodeURIComponent(id)}${params}`, {
+      method: "DELETE",
+      headers: getLocalApiHeaders()
+    });
+    if (response.ok) setMemories((current) => current.filter((memory) => memory.id !== id));
+  }
+
   async function openSkillDetail(skill: AgentSkill) {
     setSelectedSkill(skill);
     setSkillDetailContent("");
@@ -3809,6 +4005,7 @@ export default function App() {
     {
       title: "智能",
       items: [
+        { id: "memory", label: "记忆" },
         { id: "skills", label: "Skill 库" },
         { id: "learning", label: "学习记录" }
       ]
@@ -3825,6 +4022,7 @@ export default function App() {
     if (section === "general") return <Settings size={size} />;
     if (section === "usage") return <Brain size={size} />;
     if (section === "learning") return <Archive size={size} />;
+    if (section === "memory") return <Brain size={size} />;
     if (section === "skills") return <Puzzle size={size} />;
     if (section === "ai") return <SlidersHorizontal size={size} />;
     return <Terminal size={size} />;
@@ -3933,6 +4131,82 @@ export default function App() {
                 </span>
                 <button type="button" onClick={() => setMode("workspace_write")}>重置</button>
               </div>
+            </div>
+          </section>
+        </div>
+      );
+    }
+
+    if (activeSettingsSection === "memory") {
+      const query = memorySearch.trim().toLocaleLowerCase();
+      const visibleMemories = memories.filter((memory) =>
+        !query || `${memory.kind} ${memory.content} ${memory.source}`.toLocaleLowerCase().includes(query)
+      );
+      return (
+        <div className="settingsContentStack">
+          <section className="settingsPaneSection memorySettingsSection">
+            <div className="settingsPaneHeader memorySettingsHeader">
+              <div>
+                <h3>记忆</h3>
+                <p>短时记忆维持当前会话连贯性，长期记忆按项目持久化并按需召回。</p>
+              </div>
+              <button className="settingsBtnPrimary" type="button" onClick={() => void saveMemoryConfiguration()}>
+                <Save size={14} />保存配置
+              </button>
+            </div>
+
+            <div className="memoryOverview">
+              <div><Brain size={18} /><span><strong>{memorySettings.shortTerm.enabled ? "已开启" : "已关闭"}</strong><small>短时记忆</small></span></div>
+              <div><Archive size={18} /><span><strong>{memories.length}</strong><small>长期记忆</small></span></div>
+              <div><Puzzle size={18} /><span><strong>{memorySettings.skillIntegration.exposeTools ? "3 个工具" : "未暴露"}</strong><small>Skill 适配</small></span></div>
+            </div>
+
+            <div className="memoryConfigGrid">
+              <article className="memoryConfigCard">
+                <header><span><Brain size={16} /></span><div><strong>短时记忆</strong><small>控制本次会话的上下文压缩与保留范围</small></div></header>
+                <label className="memoryToggleRow">
+                  <span>启用会话摘要</span>
+                  <input type="checkbox" checked={memorySettings.shortTerm.enabled} onChange={(event) => setMemorySettings((current) => ({ ...current, shortTerm: { ...current.shortTerm, enabled: event.target.checked } }))} />
+                </label>
+                <label className="memoryFieldRow"><span>上下文预算<small>4k–128k tokens</small></span><input type="number" min="4000" max="128000" step="1000" value={memorySettings.shortTerm.contextBudgetTokens} onChange={(event) => setMemorySettings((current) => ({ ...current, shortTerm: { ...current.shortTerm, contextBudgetTokens: Number(event.target.value) } }))} /></label>
+                <label className="memoryFieldRow"><span>摘要上限<small>保留旧轮次意图和结论</small></span><input type="number" min="400" max="8000" step="100" value={memorySettings.shortTerm.summaryTokenLimit} onChange={(event) => setMemorySettings((current) => ({ ...current, shortTerm: { ...current.shortTerm, summaryTokenLimit: Number(event.target.value) } }))} /></label>
+                <label className="memoryFieldRow"><span>工具输出上限<small>单条工具结果 token</small></span><input type="number" min="200" max="8000" step="100" value={memorySettings.shortTerm.toolOutputTokenLimit} onChange={(event) => setMemorySettings((current) => ({ ...current, shortTerm: { ...current.shortTerm, toolOutputTokenLimit: Number(event.target.value) } }))} /></label>
+              </article>
+
+              <article className="memoryConfigCard">
+                <header><span><Archive size={16} /></span><div><strong>长期记忆</strong><small>SQLite 持久化，按项目隔离并相关性召回</small></div></header>
+                <label className="memoryToggleRow"><span>启用长期记忆</span><input type="checkbox" checked={memorySettings.longTerm.enabled} onChange={(event) => setMemorySettings((current) => ({ ...current, longTerm: { ...current.longTerm, enabled: event.target.checked } }))} /></label>
+                <label className="memoryFieldRow"><span>检索策略<small>混合检索更适合长久使用</small></span><select value={memorySettings.longTerm.retrieval} onChange={(event) => setMemorySettings((current) => ({ ...current, longTerm: { ...current.longTerm, retrieval: event.target.value as "recent" | "hybrid" } }))}><option value="hybrid">相关性 + 重要度 + 时效</option><option value="recent">最近和最重要</option></select></label>
+                <label className="memoryFieldRow"><span>每轮召回<small>1–50 条</small></span><input type="number" min="1" max="50" value={memorySettings.longTerm.maxResults} onChange={(event) => setMemorySettings((current) => ({ ...current, longTerm: { ...current.longTerm, maxResults: Number(event.target.value) } }))} /></label>
+                <label className="memoryFieldRow"><span>注入上限<small>长期记忆最大字符数</small></span><input type="number" min="1000" max="32000" step="1000" value={memorySettings.longTerm.maxContextChars} onChange={(event) => setMemorySettings((current) => ({ ...current, longTerm: { ...current.longTerm, maxContextChars: Number(event.target.value) } }))} /></label>
+                <label className="memoryFieldRow"><span>最低重要度<small>过滤低价值记忆</small></span><select value={memorySettings.longTerm.minImportance} onChange={(event) => setMemorySettings((current) => ({ ...current, longTerm: { ...current.longTerm, minImportance: Number(event.target.value) } }))}>{[1, 2, 3, 4, 5].map((value) => <option key={value} value={value}>{value} / 5</option>)}</select></label>
+              </article>
+            </div>
+
+            <article className="memorySkillAdapter">
+              <span className="skillsCatalogIcon"><Puzzle size={17} /></span>
+              <div><strong>开源 Memory Skill 适配</strong><small>向 Skill 暴露 memory_search、memory_store、memory_forget，并由 Rcode 负责项目隔离、去重和敏感信息拦截。</small></div>
+              <label><input type="checkbox" checked={memorySettings.skillIntegration.enabled && memorySettings.skillIntegration.exposeTools} onChange={(event) => setMemorySettings((current) => ({ ...current, skillIntegration: { enabled: event.target.checked, exposeTools: event.target.checked } }))} /><span>启用</span></label>
+            </article>
+
+            <div className="memoryNotebookHeader">
+              <div><h4>长期记忆库</h4><p>{memoryStatus || `当前项目共 ${memories.length} 条`}</p></div>
+              <label className="learningSearchField"><Search size={15} /><input aria-label="搜索长期记忆" value={memorySearch} onChange={(event) => setMemorySearch(event.target.value)} placeholder="搜索内容或类型…" /></label>
+            </div>
+            <div className="memoryComposer">
+              <textarea value={memoryDraft.content} onChange={(event) => setMemoryDraft((current) => ({ ...current, content: event.target.value }))} placeholder="添加需要长期保留的偏好、决定或项目约定…" />
+              <select value={memoryDraft.kind} onChange={(event) => setMemoryDraft((current) => ({ ...current, kind: event.target.value }))}><option value="note">备注</option><option value="preference">偏好</option><option value="decision">决定</option><option value="project">项目约定</option><option value="workflow">工作流</option></select>
+              <select value={memoryDraft.importance} onChange={(event) => setMemoryDraft((current) => ({ ...current, importance: Number(event.target.value) }))}>{[1, 2, 3, 4, 5].map((value) => <option key={value} value={value}>重要度 {value}</option>)}</select>
+              <button className="settingsBtnPrimary" type="button" disabled={!memoryDraft.content.trim()} onClick={() => void addManualMemory()}><Plus size={14} />添加</button>
+            </div>
+            <div className="memoryList">
+              {visibleMemories.length === 0 ? <div className="learningEmptyState"><Brain size={24} /><strong>{memories.length ? "没有匹配的记忆" : "还没有长期记忆"}</strong><p>你可以在上方手动添加，也可以让 Memory Skill 在合适时写入。</p></div> : visibleMemories.map((memory) => (
+                <article className="memoryItem" key={memory.id}>
+                  <header><span className="memoryKindBadge">{memory.kind}</span><span>重要度 {memory.importance}/5</span><time>{new Date(memory.updatedAt).toLocaleString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</time><button type="button" onClick={() => void removeMemory(memory.id)} aria-label="删除记忆"><Trash2 size={14} /></button></header>
+                  <p>{memory.content}</p>
+                  <footer><span>来源：{memory.source}</span><span>召回 {memory.accessCount ?? 0} 次</span><code>{memory.id}</code></footer>
+                </article>
+              ))}
             </div>
           </section>
         </div>
@@ -5243,7 +5517,8 @@ export default function App() {
 	                            className="queueItemAction"
 	                            type="button"
 	                            onClick={() => guideQueuedPrompt(activeSession.id, item.id)}
-	                            disabled={item.kind === "guide"}
+	                            disabled={item.kind === "guide" && index === 0}
+	                            title="立即中止当前一轮并优先应用这条引导"
 	                          >
 	                            <CornerDownRight size={14} />
 	                            引导
@@ -5255,9 +5530,6 @@ export default function App() {
 	                            onClick={() => removeQueuedPrompt(activeSession.id, item.id)}
 	                          >
 	                            <Trash2 size={14} />
-	                          </button>
-	                          <button className="queueIconAction" type="button" aria-label="更多">
-	                            <MoreHorizontal size={15} />
 	                          </button>
 	                        </div>
 	                      ))}
@@ -5272,9 +5544,21 @@ export default function App() {
                     modelMenuOpen={modelMenuOpen}
                     providerId={aiActiveProviderId}
                     providerName={activeAiProvider?.displayName ?? health?.provider ?? ""}
-                    providerOptions={aiProviders.map(({ id, displayName, defaultModel, configured, enabled }) => ({ id, displayName, defaultModel, configured, enabled }))}
+                    providerOptions={aiProviders.map(({ id, displayName, defaultModel, configured, enabled }) => ({
+                      id,
+                      displayName,
+                      defaultModel,
+                      configured,
+                      enabled,
+                      models: providerModelsById[id] ?? (defaultModel ? [defaultModel] : [])
+                    }))}
                     providerMenuOpen={providerMenuOpen}
                     providerSwitchingId={Object.entries(aiProviderBusy).find(([, action]) => action === "activate")?.[0]}
+                    providerModelsLoadingId={providerModelsLoadingIds.has(modelPanelProviderId || aiActiveProviderId)
+                      ? (modelPanelProviderId || aiActiveProviderId)
+                      : undefined}
+                    skillOptions={skills}
+                    selectedSkillNames={activeSelectedSkillNames}
                     thinkingMode={thinkingMode}
                     permissionMode={currentMode}
                     permissionOptions={permissionOptions}
@@ -5294,7 +5578,12 @@ export default function App() {
                     }}
                     onKeyDown={handleComposerKeyDown}
                     onToggleModelMenu={() => {
-                      setModelMenuOpen((open) => !open);
+                      const next = !modelMenuOpen;
+                      setModelMenuOpen(next);
+                      if (next) {
+                        setModelPanelProviderId(aiActiveProviderId);
+                        if (activeAiProvider) void refreshProviderModel(activeAiProvider);
+                      }
                       setProviderMenuOpen(false);
                     }}
                     onSelectModel={(model) => {
@@ -5309,6 +5598,44 @@ export default function App() {
                       setProviderMenuOpen(false);
                       if (providerId !== aiActiveProviderId) void activateAiProvider(providerId);
                     }}
+                    modelPanelProviderId={modelPanelProviderId}
+                    onHighlightProvider={(providerId) => {
+                      setModelPanelProviderId(providerId);
+                      const provider = aiProviders.find((item) => item.id === providerId);
+                      if (provider) void refreshProviderModel(provider);
+                    }}
+                    onSelectProviderModel={(providerId, model) => {
+                      setModelMenuOpen(false);
+                      if (providerId && providerId !== aiActiveProviderId) {
+                        // 先切换接口（activateAiProvider 内部会清空 selectedModel 并异步刷新模型缓存），
+                        // 再把用户选中的模型写入；activate 是异步的，模型选择立即生效，activation 完成后
+                        // reloadRuntimeData 会用 healthData.model 覆盖 selectedModel —— 为避免被覆盖，
+                        // 在 activate 完成后再写一次。
+                        void activateAiProvider(providerId).then(() => {
+                          setSelectedModel(model);
+                        });
+                        // 立刻写一次让 UI 立刻反映
+                        setSelectedModel(model);
+                      } else {
+                        setSelectedModel(model);
+                      }
+                    }}
+                    onToggleSkill={(skillName) => {
+                      if (!activeSession) return;
+                      setComposerSkillNamesBySession((current) => {
+                        const selected = current[activeSession.id] ?? [];
+                        const next = selected.includes(skillName)
+                          ? selected.filter((name) => name !== skillName)
+                          : selected.length < 3
+                            ? [...selected, skillName]
+                            : selected;
+                        return { ...current, [activeSession.id]: next };
+                      });
+                    }}
+                    onClearSkills={() => {
+                      if (!activeSession) return;
+                      setComposerSkillNamesBySession((current) => ({ ...current, [activeSession.id]: [] }));
+                    }}
                     onThinkingModeChange={setThinkingMode}
                     onTogglePermissionMenu={() => setPermissionMenuOpen((open) => !open)}
                     onSelectPermission={(nextMode) => {
@@ -5317,6 +5644,8 @@ export default function App() {
                       setPermissionMenuOpen(false);
                     }}
                     onSend={handleSendButtonClick}
+                    onGuide={submitGuidance}
+                    onStop={stopActiveResponse}
                     onToggleManagedProcessPanel={() => {
                       const nextOpen = !managedProcessPanelOpen;
                       setManagedProcessPanelOpen(nextOpen);

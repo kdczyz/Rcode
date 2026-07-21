@@ -111,6 +111,15 @@ npm run mobile:build     # Android Web 资源构建
 npm run remote:test      # Cloudflare 远程服务测试
 ```
 
+## 🧠 双层记忆
+
+设置 → 记忆中可以分别配置两层上下文：
+
+- **短时记忆**：按 token 预算保留最近完整对话轮次，把较早内容压缩为本地摘要，并限制超长工具输出。
+- **长期记忆**：以项目路径隔离保存到本机 SQLite，按关键词相关性、重要度和时效召回；支持过期时间、去重和敏感凭据拦截。
+
+内置 `memory-management` Skill 提供统一适配约定。其他开源 Memory Skill 也可把持久化操作委托给 `memory_search`、`memory_store` 和 `memory_forget`，无需直接依赖 Rcode 的数据库结构。关闭“Skill 适配”后，这三个工具不会暴露给模型。
+
 ## ⚙ 长期进程会话
 
 开发服务器、文件监听器等不会自行退出的命令由 Rcode 托管，无需添加 `&` 或 `nohup`：

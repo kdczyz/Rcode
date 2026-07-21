@@ -41,6 +41,9 @@ function toolWorkflowEvent(toolCall: ToolCall): StreamEvent {
   if (name === "list_files" || name === "inspect_tree") return workflowEvent("inspecting", "正在查看项目文件");
   if (name === "search_text") return workflowEvent("inspecting", "正在搜索代码");
   if (name === "project_diagnostics") return workflowEvent("inspecting", "正在收集项目诊断");
+  if (name === "memory_search") return workflowEvent("inspecting", "正在检索长期记忆");
+  if (name === "memory_store") return workflowEvent("executing", "正在写入长期记忆");
+  if (name === "memory_forget") return workflowEvent("executing", "正在删除长期记忆");
   if (name === "generate_image") return workflowEvent("executing", "正在生成图片");
   if (name === "write_file" || name === "apply_patch") return workflowEvent("executing", "正在编辑文件");
   if (name === "web_fetch") return workflowEvent("inspecting", "正在获取网页");
@@ -163,7 +166,7 @@ function toStreamToolResult(result: ToolResult): ToolResult {
 async function* continueConversationStream(
   conversation: Conversation,
   mode: PermissionMode,
-  options: { providerId?: string; model?: string; thinkingMode?: ThinkingMode; projectPath?: string; requestId?: string; signal?: AbortSignal; messageInput?: string }
+  options: { providerId?: string; model?: string; thinkingMode?: ThinkingMode; skillNames?: string[]; projectPath?: string; requestId?: string; signal?: AbortSignal; messageInput?: string }
 ): AsyncGenerator<StreamEvent> {
   let step = 0;
   let billedPromptTokens = 0;
@@ -331,6 +334,9 @@ async function* processToolCallQueueStream(
   contentBuffer: string
 ): AsyncGenerator<StreamEvent, boolean> {
   while (conversation.toolCallQueue.length > 0) {
+    if (options.signal?.aborted) {
+      throw new DOMException("Operation was aborted", "AbortError");
+    }
     const toolCall = conversation.toolCallQueue[0];
     console.log(`[Agent] Executing tool: ${toolCall.name}`, JSON.stringify(toolCall.arguments).slice(0, 200));
     yield { type: "tool_call", toolCall };
@@ -460,6 +466,7 @@ export async function* runAgentStream(input: {
   providerId?: string;
   model?: string;
   thinkingMode?: ThinkingMode;
+  skillNames?: string[];
   projectPath?: string;
   signal?: AbortSignal;
 }): AsyncGenerator<StreamEvent> {
@@ -493,6 +500,7 @@ export async function* runAgentStream(input: {
       providerId: input.providerId,
       model: input.model,
       thinkingMode: input.thinkingMode,
+      skillNames: input.skillNames,
       projectPath: input.projectPath,
       requestId,
       messageInput: input.prompt,
@@ -501,6 +509,9 @@ export async function* runAgentStream(input: {
     await runHooks("Stop", { projectPath: input.projectPath, conversationId: conversation.id });
   } catch (error) {
     if (isAbortError(error)) {
+      // A steering interruption invalidates the model's remaining tool plan.
+      // Otherwise stale operations would run before the new guidance turn.
+      conversation.toolCallQueue = [];
       throw error;
     }
     yield workflowEvent("failed", "任务运行失败");
@@ -519,6 +530,7 @@ export async function* approveToolCallStream(input: {
   providerId?: string;
   model?: string;
   thinkingMode?: ThinkingMode;
+  skillNames?: string[];
   projectPath?: string;
   signal?: AbortSignal;
 }): AsyncGenerator<StreamEvent> {
@@ -566,6 +578,7 @@ export async function* approveToolCallStream(input: {
         providerId: input.providerId,
         model: input.model,
         thinkingMode: input.thinkingMode,
+        skillNames: input.skillNames,
         projectPath: approval.projectPath ?? input.projectPath,
         signal: input.signal
       });
@@ -634,6 +647,7 @@ export async function* approveToolCallStream(input: {
     providerId: input.providerId,
     model: input.model,
     thinkingMode: input.thinkingMode,
+    skillNames: input.skillNames,
     projectPath,
     signal: input.signal
   });

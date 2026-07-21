@@ -1,4 +1,4 @@
-import { Brain, Check, ChevronDown, FileText, Image, LoaderCircle, Paperclip, Plug, RefreshCw, Send, Square, TerminalSquare, X } from "lucide-react";
+import { Brain, Check, ChevronDown, CornerDownRight, FileText, Image, LoaderCircle, Paperclip, Plug, Puzzle, RefreshCw, Send, Square, TerminalSquare, X } from "lucide-react";
 import { ChangeEvent, ClipboardEvent, DragEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
 import type { ManagedProcessView } from "./ToolCallGroup";
 
@@ -28,6 +28,15 @@ export interface ComposerProviderOption {
   defaultModel: string;
   configured: boolean;
   enabled?: boolean;
+  models?: string[];
+}
+
+export interface ComposerSkillOption {
+  name: string;
+  description: string;
+  displayName?: string;
+  shortDescription?: string;
+  scope: "project" | "user" | "builtin";
 }
 
 interface ChatComposerProps {
@@ -40,6 +49,11 @@ interface ChatComposerProps {
   providerOptions: ComposerProviderOption[];
   providerMenuOpen: boolean;
   providerSwitchingId?: string;
+  providerModelsLoadingId?: string;
+  /** 合并面板内当前高亮（未提交）的接口 id */
+  modelPanelProviderId: string;
+  skillOptions: ComposerSkillOption[];
+  selectedSkillNames: string[];
   thinkingMode: ThinkingMode;
   permissionMode: PermissionMode;
   permissionOptions: PermissionOption[];
@@ -60,10 +74,18 @@ interface ChatComposerProps {
   onSelectModel: (model: string) => void;
   onToggleProviderMenu: () => void;
   onSelectProvider: (providerId: string) => void;
+  /** 在合并面板左列点击接口（只切高亮，不提交） */
+  onHighlightProvider: (providerId: string) => void;
+  /** 在合并面板右列点击模型（提交：必要时切接口 + 选模型） */
+  onSelectProviderModel: (providerId: string, model: string) => void;
+  onToggleSkill: (skillName: string) => void;
+  onClearSkills: () => void;
   onThinkingModeChange: (mode: ThinkingMode) => void;
   onTogglePermissionMenu: () => void;
   onSelectPermission: (mode: PermissionMode) => void;
   onSend: () => void;
+  onGuide: () => void;
+  onStop: () => void;
   onToggleManagedProcessPanel: () => void;
   onRefreshManagedProcesses: () => Promise<void>;
   onStopManagedProcess: (processId: string) => Promise<void>;
@@ -74,6 +96,12 @@ const thinkingOptions: Array<{ id: ThinkingMode; label: string; description: str
   { id: "balanced", label: "标准", description: "使用中等或模型默认推理，平衡质量与速度" },
   { id: "deep", label: "深度", description: "请求最高可用推理强度，可能增加耗时与 token" }
 ];
+
+const skillScopeLabels: Record<ComposerSkillOption["scope"], string> = {
+  project: "项目",
+  user: "用户",
+  builtin: "内置"
+};
 
 const maxAttachmentCount = 8;
 const maxAttachmentBytes = 8 * 1024 * 1024;
@@ -140,6 +168,7 @@ export function ChatComposer(props: ChatComposerProps) {
   const isPlanMode = props.permissionMode === "plan";
   const processPickerRef = useRef<HTMLDivElement>(null);
   const thinkingPickerRef = useRef<HTMLDivElement>(null);
+  const skillPickerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [stoppingProcessIds, setStoppingProcessIds] = useState<Set<string>>(() => new Set());
   const [processActionError, setProcessActionError] = useState("");
@@ -147,8 +176,32 @@ export function ChatComposer(props: ChatComposerProps) {
   const [attachmentError, setAttachmentError] = useState("");
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [thinkingMenuOpen, setThinkingMenuOpen] = useState(false);
+  const [skillMenuOpen, setSkillMenuOpen] = useState(false);
+  // 模型切换面板内的二级 Tab："provider"=接口列表 / "model"=当前接口模型列表
+  const [modelPanelTab, setModelPanelTab] = useState<"provider" | "model">("model");
+  // 面板每次打开时回到「模型」页
+  useEffect(() => {
+    if (props.modelMenuOpen) setModelPanelTab("model");
+  }, [props.modelMenuOpen]);
   const runningProcessCount = props.managedProcesses.filter((process) => process.status === "running").length;
   const selectedThinkingOption = thinkingOptions.find((option) => option.id === props.thinkingMode) ?? thinkingOptions[1];
+  const hasDraft = Boolean(props.prompt.trim() || props.attachments.length > 0);
+
+  useEffect(() => {
+    if (!skillMenuOpen) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!skillPickerRef.current?.contains(event.target as Node)) setSkillMenuOpen(false);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setSkillMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [skillMenuOpen]);
 
   useEffect(() => {
     if (!thinkingMenuOpen) return;
@@ -314,13 +367,31 @@ export function ChatComposer(props: ChatComposerProps) {
           onChange={(event: ChangeEvent<HTMLTextAreaElement>) => props.onPromptChange(event.target.value)}
           onKeyDown={props.onKeyDown}
           onPaste={handlePaste}
-          placeholder={isPlanMode ? "描述目标，我会先检查上下文并给出可执行计划" : "描述任务，或输入 / 查看可用命令"}
+          placeholder={props.isRunning ? "补充方向或约束，按 Enter 立即打断并引导" : isPlanMode ? "描述目标，我会先检查上下文并给出可执行计划" : "描述任务，或输入 / 查看可用命令"}
           rows={1}
         />
-        <button className={`sendButton ${props.isRunning ? "stopping" : ""}`} type="button" onClick={props.onSend} disabled={!props.isRunning && !props.prompt.trim() && props.attachments.length === 0} aria-label={props.isRunning ? "停止回复" : "发送"}>
-          {props.isRunning ? <Square size={15} /> : <Send size={17} />}
-        </button>
+        {props.isRunning ? (
+          <div className="composerRunActions" aria-label="当前任务控制">
+            <button className="stopResponseButton" type="button" onClick={props.onStop} aria-label="停止当前任务" title="停止当前任务">
+              <Square size={13} fill="currentColor" />
+            </button>
+            <button className="sendButton guidanceButton" type="button" onClick={props.onGuide} disabled={!hasDraft} aria-label="立即引导当前任务" title="中止当前一轮，并按新方向继续">
+              <CornerDownRight size={15} />
+              <span>引导</span>
+            </button>
+          </div>
+        ) : (
+          <button className="sendButton" type="button" onClick={props.onSend} disabled={!hasDraft} aria-label="发送">
+            <Send size={17} />
+          </button>
+        )}
       </div>
+      {props.isRunning && (
+        <div className="composerGuidanceHint" role="status">
+          <span className="guidancePulse" aria-hidden="true" />
+          新引导会立即终止当前一轮，已完成的操作会保留
+        </div>
+      )}
       <div className="composerFooter">
         <div className="composerControls">
           <input
@@ -338,58 +409,182 @@ export function ChatComposer(props: ChatComposerProps) {
             <Paperclip size={14} />
             <span>附件</span>
           </button>
-          <div className="providerPicker">
+          <div className="skillPicker" ref={skillPickerRef}>
             <button
-              className={`providerPickerButton ${props.providerMenuOpen ? "active" : ""}`}
+              className={`skillPickerButton ${skillMenuOpen || props.selectedSkillNames.length > 0 ? "active" : ""}`}
               type="button"
-              aria-expanded={props.providerMenuOpen}
+              aria-expanded={skillMenuOpen}
               aria-haspopup="listbox"
-              title={`当前接口：${props.providerName || "未选择"}`}
-              onClick={props.onToggleProviderMenu}
+              aria-label={`选择 Skill${props.selectedSkillNames.length > 0 ? `，已选 ${props.selectedSkillNames.length} 个` : ""}`}
+              title="选择下一次请求使用的 Skill"
+              onClick={() => {
+                setThinkingMenuOpen(false);
+                if (props.modelMenuOpen) props.onToggleModelMenu();
+                setSkillMenuOpen((open) => !open);
+              }}
             >
-              <Plug size={14} />
-              <span>{props.providerName || "接口"}</span>
+              <Puzzle size={14} />
+              <span>Skill</span>
+              {props.selectedSkillNames.length > 0 && <small>{props.selectedSkillNames.length}</small>}
               <ChevronDown size={12} />
             </button>
-            {props.providerMenuOpen && (
-              <div className="providerMenu" role="listbox" aria-label="选择 AI 接口">
+            {skillMenuOpen && (
+              <div className="skillMenu" role="listbox" aria-label="选择使用的 Skill" aria-multiselectable="true">
                 <header>
-                  <strong>AI 接口</strong>
-                  <span>切换后自动使用该接口的默认模型</span>
+                  <span>
+                    <strong>使用 Skill</strong>
+                    <small>最多选择 3 个，应用于当前会话的下一次请求</small>
+                  </span>
+                  {props.selectedSkillNames.length > 0 && (
+                    <button type="button" onClick={props.onClearSkills}>清空</button>
+                  )}
                 </header>
-                {props.providerOptions.map((provider) => {
-                  const isActive = provider.id === props.providerId;
-                  const isSwitching = provider.id === props.providerSwitchingId;
-                  const unavailable = provider.enabled === false || !provider.configured;
-                  return (
-                    <button
-                      className={isActive ? "active" : ""}
-                      key={provider.id}
-                      type="button"
-                      role="option"
-                      aria-selected={isActive}
-                      disabled={unavailable || Boolean(props.providerSwitchingId)}
-                      onClick={() => props.onSelectProvider(provider.id)}
-                    >
-                      <span className="providerMenuCopy">
-                        <strong>{provider.displayName}</strong>
-                        <small>{provider.defaultModel || "未设置默认模型"}</small>
-                      </span>
-                      <span className="providerMenuState">
-                        {isSwitching ? <LoaderCircle size={14} className="toolStatusSpinner" /> : isActive ? <Check size={15} /> : unavailable ? "未配置" : ""}
-                      </span>
-                    </button>
-                  );
-                })}
-                {props.providerOptions.length === 0 && <p>请先在设置中添加 AI 接口。</p>}
+                <div className="skillMenuList">
+                  {props.skillOptions.map((skill) => {
+                    const selected = props.selectedSkillNames.includes(skill.name);
+                    const selectionLimitReached = !selected && props.selectedSkillNames.length >= 3;
+                    return (
+                      <button
+                        className={selected ? "active" : ""}
+                        key={skill.name}
+                        type="button"
+                        role="option"
+                        aria-selected={selected}
+                        disabled={selectionLimitReached}
+                        onClick={() => props.onToggleSkill(skill.name)}
+                      >
+                        <span className="skillMenuMark"><Puzzle size={14} /></span>
+                        <span className="skillMenuCopy">
+                          <strong>{skill.displayName || skill.name}</strong>
+                          <small>{skill.shortDescription || skill.description}</small>
+                        </span>
+                        <span className="skillMenuScope">{skillScopeLabels[skill.scope]}</span>
+                        <span className="skillMenuCheck">{selected && <Check size={14} />}</span>
+                      </button>
+                    );
+                  })}
+                  {props.skillOptions.length === 0 && <p>当前项目没有可用 Skill。</p>}
+                </div>
+                <footer>未手动选择时，仍会根据任务内容自动匹配 Skill。</footer>
               </div>
             )}
           </div>
           <div className="modelPicker">
-            <button className="modelPickerButton" type="button" onClick={props.onToggleModelMenu}><span>{props.modelName}</span><ChevronDown size={14} /></button>
+            <button
+              className={`modelPickerButton ${props.modelMenuOpen ? "active" : ""}`}
+              type="button"
+              aria-expanded={props.modelMenuOpen}
+              aria-haspopup="dialog"
+              title={`当前接口：${props.providerName || "未选择"} · 模型：${props.modelName}`}
+              onClick={() => {
+                setSkillMenuOpen(false);
+                setThinkingMenuOpen(false);
+                props.onToggleModelMenu();
+              }}
+            >
+              <Plug size={13} />
+              <span>{props.modelName}</span>
+              <ChevronDown size={14} />
+            </button>
             {props.modelMenuOpen && (
-              <div className="modelMenu">
-                {models.map((model) => <button className={model === props.modelName ? "active" : ""} key={model} type="button" onClick={() => props.onSelectModel(model)}>{model}</button>)}
+              <div className="modelSwitchPanel modelSwitchPanelTabbed" role="dialog" aria-label="选择接口与模型">
+                <header className="modelSwitchTabs" role="tablist">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={modelPanelTab === "provider"}
+                    className={modelPanelTab === "provider" ? "active" : ""}
+                    onClick={() => setModelPanelTab("provider")}
+                  >
+                    接口
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={modelPanelTab === "model"}
+                    className={modelPanelTab === "model" ? "active" : ""}
+                    onClick={() => setModelPanelTab("model")}
+                  >
+                    模型
+                  </button>
+                </header>
+
+                {modelPanelTab === "provider" && (
+                  <div className="modelSwitchTabBody" role="tabpanel" aria-label="接口列表">
+                    {props.providerOptions.length === 0 && <p className="modelSwitchEmpty">请先在设置中添加 AI 接口。</p>}
+                    {props.providerOptions.map((provider) => {
+                      const isActive = provider.id === props.providerId;
+                      const isSwitching = provider.id === props.providerSwitchingId;
+                      const unavailable = provider.enabled === false || !provider.configured;
+                      return (
+                        <button
+                          className={isActive ? "active" : ""}
+                          key={provider.id}
+                          type="button"
+                          disabled={unavailable}
+                          onClick={() => {
+                            // 接口只在点击时生效；如果想换模型，跳到模型 Tab
+                            props.onHighlightProvider(provider.id);
+                            setModelPanelTab("model");
+                          }}
+                        >
+                          <span className="providerMenuCopy">
+                            <strong>{provider.displayName}</strong>
+                            <small>{provider.defaultModel || "未设置默认模型"}</small>
+                          </span>
+                          <span className="providerMenuState">
+                            {isSwitching ? <LoaderCircle size={14} className="toolStatusSpinner" /> : isActive ? <Check size={14} /> : unavailable ? "未配置" : ""}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {modelPanelTab === "model" && (
+                  <div className="modelSwitchTabBody" role="tabpanel" aria-label="模型列表">
+                    {(() => {
+                      const highlightedId = props.modelPanelProviderId || props.providerId;
+                      const highlightedProvider = props.providerOptions.find((p) => p.id === highlightedId);
+                      const isCurrentProvider = highlightedId === props.providerId;
+                      const isLoadingModels = highlightedId === props.providerModelsLoadingId;
+                      const modelsToShow: string[] = isCurrentProvider
+                        ? models
+                        : (highlightedProvider?.models && highlightedProvider.models.length > 0
+                            ? highlightedProvider.models
+                            : (highlightedProvider?.defaultModel ? [highlightedProvider.defaultModel] : []));
+                      if (!highlightedProvider) {
+                        return <p className="modelSwitchEmpty">请先在「接口」页选择一个接口。</p>;
+                      }
+                      return (
+                        <>
+                          <header className="modelSwitchTabContext">
+                            <span>{highlightedProvider.displayName}</span>
+                            {isLoadingModels && <LoaderCircle size={13} className="toolStatusSpinner" aria-label="正在刷新模型" />}
+                          </header>
+                          {modelsToShow.length === 0 ? (
+                            <p className="modelSwitchEmpty">该接口暂无可用模型。</p>
+                          ) : (
+                            modelsToShow.map((model: string) => {
+                              const isCurrentModel = isCurrentProvider && model === props.modelName;
+                              return (
+                                <button
+                                  className={isCurrentModel ? "active" : ""}
+                                  key={model}
+                                  type="button"
+                                  onClick={() => props.onSelectProviderModel(highlightedId, model)}
+                                >
+                                  <span>{model}</span>
+                                  {isCurrentModel && <Check size={14} />}
+                                </button>
+                              );
+                            })
+                          )}
+                        </>
+                      );
+                    })()}
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -399,8 +594,13 @@ export function ChatComposer(props: ChatComposerProps) {
               type="button"
               aria-expanded={thinkingMenuOpen}
               aria-haspopup="listbox"
-              title={selectedThinkingOption.description}
-              onClick={() => setThinkingMenuOpen((open) => !open)}
+              aria-label={`思考模式：${selectedThinkingOption.label}，用于下一次请求`}
+              title={`下次请求：${selectedThinkingOption.label}。${selectedThinkingOption.description}`}
+              onClick={() => {
+                setSkillMenuOpen(false);
+                if (props.modelMenuOpen) props.onToggleModelMenu();
+                setThinkingMenuOpen((open) => !open);
+              }}
             >
               <Brain size={14} />
               <span>{selectedThinkingOption.label}</span>
@@ -410,7 +610,7 @@ export function ChatComposer(props: ChatComposerProps) {
               <div className="thinkingMenu" role="listbox" aria-label="思考模式">
                 <header>
                   <strong>思考模式</strong>
-                  <span>按当前模型与接口转换为真实推理参数</span>
+                  <span>用于下一次请求，并按当前模型与接口转换为真实推理参数</span>
                 </header>
                 {thinkingOptions.map((item) => (
                   <button
@@ -428,7 +628,7 @@ export function ChatComposer(props: ChatComposerProps) {
                     {item.id === props.thinkingMode && <Check size={15} />}
                   </button>
                 ))}
-                <footer>回复统计会标明原生直连、中转转换或提示兼容。</footer>
+                <footer>历史回复保留当时模式；回复统计展示该次实际使用的配置。</footer>
               </div>
             )}
           </div>

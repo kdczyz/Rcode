@@ -15,6 +15,7 @@ import {
   listAuditEvents,
   listConversations,
   listMemories,
+  searchMemories,
   listLearningRecords,
   getLatestLearningRun,
   listMcpServers,
@@ -29,6 +30,7 @@ import {
   type AiProviderConfig,
   type McpServerConfig
 } from "./storage/database";
+import { getMemorySettings, saveMemorySettings } from "./agent/memory";
 import {
   activateAiProvider,
   fetchModelsForDraft,
@@ -85,6 +87,16 @@ function parseThinkingMode(value: unknown): ThinkingMode {
     return value;
   }
   return "balanced";
+}
+
+function parseSkillNames(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(
+    value
+      .filter((name): name is string => typeof name === "string")
+      .map((name) => name.trim())
+      .filter((name) => /^[a-zA-Z0-9_-]{1,100}$/.test(name))
+  )].slice(0, 3);
 }
 
 function parseModel(value: unknown): string | undefined {
@@ -290,6 +302,14 @@ app.post("/api/ai/providers/:id/test", requireLocalToken, async (request, respon
   }
 });
 
+app.get("/api/ai/providers/:id/models", requireLocalToken, async (request, response) => {
+  try {
+    response.json(await fetchProviderModels(String(request.params.id)));
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : "models fetch failed" });
+  }
+});
+
 app.get("/api/ai/providers/:id/balance", requireLocalToken, async (request, response) => {
   try {
     response.json(await fetchProviderBalance(String(request.params.id)));
@@ -386,7 +406,21 @@ app.post("/api/mcp/servers/:id/runtime-token", requireLocalToken, (request, resp
 
 app.get("/api/memory", requireLocalToken, (request, response) => {
   const projectPath = parseProjectPath(request.query.projectPath) ?? process.cwd();
-  response.json({ memories: listMemories(projectPath, 50) });
+  const query = typeof request.query.q === "string" ? request.query.q.trim() : "";
+  const settings = getMemorySettings();
+  response.json({
+    memories: query
+      ? searchMemories(projectPath, query, 50, settings.longTerm.minImportance)
+      : listMemories(projectPath, 50)
+  });
+});
+
+app.get("/api/memory/settings", requireLocalToken, (_request, response) => {
+  response.json({ settings: getMemorySettings() });
+});
+
+app.put("/api/memory/settings", requireLocalToken, (request, response) => {
+  response.json({ settings: saveMemorySettings(request.body) });
 });
 
 app.post("/api/memory", requireLocalToken, (request, response) => {
@@ -398,11 +432,20 @@ app.post("/api/memory", requireLocalToken, (request, response) => {
     return;
   }
   const importance = typeof request.body.importance === "number" ? request.body.importance : 1;
-  response.json({ id: saveMemory(projectPath, kind, content, importance), memories: listMemories(projectPath, 50) });
+  try {
+    const expiresAt = typeof request.body.expiresAt === "string" ? request.body.expiresAt : undefined;
+    response.json({
+      id: saveMemory(projectPath, kind, content, importance, { source: "manual", expiresAt }),
+      memories: listMemories(projectPath, 50)
+    });
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : "memory could not be saved" });
+  }
 });
 
 app.delete("/api/memory/:id", requireLocalToken, (request, response) => {
-  deleteMemory(String(request.params.id));
+  const projectPath = parseProjectPath(request.query.projectPath);
+  deleteMemory(String(request.params.id), projectPath);
   response.json({ ok: true });
 });
 
@@ -577,6 +620,7 @@ app.post("/api/agent/run", requireLocalToken, async (request, response) => {
       providerId: parseProviderId(request.body.providerId),
       model: parseModel(request.body.model),
       thinkingMode: parseThinkingMode(request.body.thinkingMode),
+      skillNames: parseSkillNames(request.body.skillNames),
       projectPath: parseProjectPath(request.body.projectPath),
       signal: abortController.signal
     })) {
@@ -615,6 +659,7 @@ app.post("/api/agent/approve", requireLocalToken, async (request, response) => {
       providerId: parseProviderId(request.body.providerId),
       model: parseModel(request.body.model),
       thinkingMode: parseThinkingMode(request.body.thinkingMode),
+      skillNames: parseSkillNames(request.body.skillNames),
       projectPath: parseProjectPath(request.body.projectPath),
       signal: abortController.signal
     })) {

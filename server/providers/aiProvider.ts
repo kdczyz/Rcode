@@ -2,7 +2,8 @@ import { getToolDefinitions } from "../runtime/tools";
 import type { AgentMessage, AppliedReasoningConfig, ContextSnapshot, PermissionMode, ReasoningDialect, ThinkingMode, ToolCall, ToolResult, AgentToolName, ToolRisk } from "../shared/types";
 import { getRuntimeConfig } from "../runtime/config";
 import { nanoid } from "nanoid";
-import { buildProjectContextBundle, compactMessagesWithSnapshot } from "../agent/contextManager";
+import { buildProjectContextBundle, compactMessagesWithSegments } from "../agent/contextManager";
+import { getMemorySettings } from "../agent/memory";
 import type { ProviderUsagePayload } from "./providerUsage";
 import { resolveAiProviderForExecution } from "./aiProviderRegistry";
 
@@ -648,6 +649,7 @@ function buildSystemPrompt(modelName: string, providerDisplayName: string, mode:
   "- git_status/git_diff/git_branch/git_stage/git_commit: Inspect and manage local git workflow with approval for mutating actions.",
   "- web_fetch: Fetch documentation or API references.",
   "- generate_image: Generate an image with the current provider's automatically detected image model.",
+  "- delegate_agents: Delegate independent research, review, debugging, and test-analysis tasks to isolated subagents.",
   "",
   "## Workflow Rules",
   "- ALWAYS explain what you are about to do in 1-2 sentences BEFORE calling tools.",
@@ -664,6 +666,7 @@ function buildSystemPrompt(modelName: string, providerDisplayName: string, mode:
   "- Respond in the same language the user uses.",
   "- When the user asks to create, draw, render, or generate an image, call generate_image automatically instead of sending an image model to Chat Completions.",
   "- Treat a clear image-generation request as authorization for that image call. Do not call generate_image for image-related explanations, code, or analysis unless an actual generated image is requested.",
+  "- Use delegate_agents when multiple independent scopes can be investigated concurrently. Give each subagent a self-contained task and synthesize their reports instead of copying them verbatim.",
   "",
   getWorkflowInstruction(mode)
   ].join("\n");
@@ -754,7 +757,9 @@ async function toProviderMessages(
   modelName?: string,
   providerDisplayName?: string,
   mode: PermissionMode = "workspace_write",
-  reasoningConfig?: ReasoningRequestConfig
+  reasoningConfig?: ReasoningRequestConfig,
+  skillNames: string[] = [],
+  systemInstructions?: string
 ) {
   const projectInstruction = projectPath
     ? mode === "full_access"
@@ -764,10 +769,19 @@ async function toProviderMessages(
   const latestUserPrompt = [...messages].reverse().find((message) =>
     message.role === "user" && !message.content.startsWith("Visual result returned by tool ")
   )?.content ?? "";
-  const projectContext = await buildProjectContextBundle(projectPath, latestUserPrompt);
-  const totalBudgetTokens = 16_000;
+  const projectContext = await buildProjectContextBundle(projectPath, latestUserPrompt, skillNames);
+  const memorySettings = getMemorySettings();
+  const totalBudgetTokens = memorySettings.shortTerm.contextBudgetTokens;
   const contextOverheadTokens = Math.ceil(projectContext.content.length / 4) + 1_200;
-  const compacted = compactMessagesWithSnapshot(messages, Math.max(4_000, totalBudgetTokens - contextOverheadTokens));
+  const compacted = await compactMessagesWithSegments(messages, Math.max(4_000, totalBudgetTokens - contextOverheadTokens), {
+    enabled: memorySettings.shortTerm.enabled,
+    summaryTokenLimit: memorySettings.shortTerm.summaryTokenLimit,
+    toolOutputTokenLimit: memorySettings.shortTerm.toolOutputTokenLimit,
+    mode: memorySettings.compaction.mode,
+    detail: memorySettings.compaction.detail,
+    pruning: memorySettings.compaction.pruning,
+    workspaceRoot: projectPath
+  });
   const providerMessages: Array<Record<string, unknown>> = [
     {
       role: "system",
@@ -775,6 +789,7 @@ async function toProviderMessages(
         buildSystemPrompt(modelName ?? "unknown", providerDisplayName ?? "unknown", mode),
         getThinkingInstruction(thinkingMode),
         projectInstruction,
+        systemInstructions ? `\n## Delegated Role\n${systemInstructions}` : "",
         projectContext.content ? `\n## Project Context\n${projectContext.content}` : ""
       ].filter(Boolean).join("\n")
     },
@@ -822,11 +837,17 @@ async function toProviderMessages(
   return { messages: providerMessages, snapshot };
 }
 
-async function getToolsForMode(projectPath: string | undefined, mode: PermissionMode = "workspace_write") {
-  const tools = await getToolDefinitions(projectPath);
-  if (mode !== "plan") return tools;
-  const readOnlyTools = new Set(["read_file", "list_files", "search_text", "inspect_tree", "git_status", "git_diff"]);
-  return tools.filter((tool) => readOnlyTools.has(tool.function.name));
+async function getToolsForMode(projectPath: string | undefined, mode: PermissionMode = "workspace_write", allowedTools?: string[]) {
+  let tools = await getToolDefinitions(projectPath);
+  if (mode === "plan") {
+    const readOnlyTools = new Set(["read_file", "list_files", "search_text", "inspect_tree", "project_diagnostics", "git_status", "git_diff", "delegate_agents"]);
+    tools = tools.filter((tool) => readOnlyTools.has(tool.function.name));
+  }
+  if (allowedTools) {
+    const allowed = new Set(allowedTools);
+    tools = tools.filter((tool) => allowed.has(tool.function.name));
+  }
+  return tools;
 }
 
 function parseToolArguments(raw: string): Record<string, unknown> {
@@ -995,7 +1016,7 @@ export async function extractLearningCandidates(
 export async function callAi(
   messages: AgentMessage[],
   toolResults: ToolResult[] = [],
-  options: { providerId?: string; model?: string; thinkingMode?: ThinkingMode; projectPath?: string; mode?: PermissionMode; signal?: AbortSignal } = {}
+  options: { providerId?: string; model?: string; thinkingMode?: ThinkingMode; skillNames?: string[]; projectPath?: string; mode?: PermissionMode; signal?: AbortSignal; allowedTools?: string[]; systemInstructions?: string } = {}
 ): Promise<AiTurn> {
   const config = getConfig(options.model, options.providerId);
 
@@ -1010,8 +1031,8 @@ export async function callAi(
   const endpoint = `${config.baseUrl.replace(/\/$/, "")}${config.chatPath}`;
   const requestBody: Record<string, unknown> = {
     model: config.model,
-    messages: (await toProviderMessages(messages, toolResults, options.thinkingMode, options.projectPath, config.model, config.providerDisplayName, options.mode, reasoning)).messages,
-    tools: await getToolsForMode(options.projectPath, options.mode),
+    messages: (await toProviderMessages(messages, toolResults, options.thinkingMode, options.projectPath, config.model, config.providerDisplayName, options.mode, reasoning, options.skillNames, options.systemInstructions)).messages,
+    tools: await getToolsForMode(options.projectPath, options.mode, options.allowedTools),
     tool_choice: "auto",
     temperature: config.temperature,
     max_tokens: config.maxTokens,
@@ -1074,7 +1095,7 @@ export async function callAi(
 /** Streaming AI call: yields text deltas token-by-token, returns tool calls at the end. */
 export async function* callAiStream(
   messages: AgentMessage[],
-  options: { providerId?: string; model?: string; thinkingMode?: ThinkingMode; projectPath?: string; mode?: PermissionMode; sessionId?: string; signal?: AbortSignal } = {}
+  options: { providerId?: string; model?: string; thinkingMode?: ThinkingMode; skillNames?: string[]; projectPath?: string; mode?: PermissionMode; sessionId?: string; signal?: AbortSignal; allowedTools?: string[]; systemInstructions?: string } = {}
 ): AsyncGenerator<
   | { type: "text_delta"; content: string }
   | { type: "usage"; usage: AiUsage; model: string; provider: string; requestId: string }
@@ -1092,9 +1113,9 @@ export async function* callAiStream(
 
   const selectedThinkingMode = options.thinkingMode ?? "balanced";
   const reasoning = buildReasoningRequestConfig(config.baseUrl, config.model, selectedThinkingMode, config.reasoningDialect);
-  const providerContext = await toProviderMessages(messages, [], options.thinkingMode, options.projectPath, config.model, config.providerDisplayName, options.mode, reasoning);
+  const providerContext = await toProviderMessages(messages, [], options.thinkingMode, options.projectPath, config.model, config.providerDisplayName, options.mode, reasoning, options.skillNames, options.systemInstructions);
   yield { type: "context_snapshot", snapshot: providerContext.snapshot };
-  const tools = await getToolsForMode(options.projectPath, options.mode);
+  const tools = await getToolsForMode(options.projectPath, options.mode, options.allowedTools);
   const requestBody: Record<string, unknown> = {
     model: config.model,
     messages: providerContext.messages,
