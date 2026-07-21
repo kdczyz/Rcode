@@ -1,0 +1,186 @@
+import type {
+  ToolHostContext,
+  ToolProviderKind,
+  ToolProviderPolicy
+} from '../../ports/tool-host.js'
+import type { LocalTool } from './local-tool-host.js'
+import { isToolAdvertisedInSandbox } from './sandbox-policy.js'
+
+export type CapabilityToolRecord = {
+  provider: ToolProviderPolicy
+  tool: LocalTool
+}
+
+export type CapabilityToolProvider = ToolProviderPolicy & {
+  tools: readonly LocalTool[]
+}
+
+export type CapabilityToolSpec = {
+  name: string
+  description: string
+  inputSchema: Record<string, unknown>
+  toolKind?: 'tool_call' | 'command_execution' | 'file_change'
+  providerId: string
+  providerKind: ToolProviderKind
+}
+
+const PLAN_MODE_ALLOWED_TOOL_NAMES = new Set([
+  'read',
+  'grep',
+  'find',
+  'ls',
+  'repo_map',
+  'create_plan',
+  'user_input',
+  'request_user_input'
+])
+
+const MANAGED_SKILL_BLOCKED_TOOL_NAMES: Readonly<Record<string, ReadonlySet<string>>> = {
+  'ppt-master': new Set(['bash', 'background_shell'])
+}
+
+export class CapabilityRegistry {
+  private readonly providers = new Map<string, CapabilityToolProvider>()
+  private readonly tools = new Map<string, CapabilityToolRecord>()
+
+  static fromLocalTools(tools: readonly LocalTool[]): CapabilityRegistry {
+    return new CapabilityRegistry([
+      {
+        id: 'builtin',
+        kind: 'built-in',
+        enabled: true,
+        available: true,
+        tools
+      }
+    ])
+  }
+
+  constructor(providers: readonly CapabilityToolProvider[] = []) {
+    this.replaceProviders(providers)
+  }
+
+  registerProvider(provider: CapabilityToolProvider): () => void {
+    if (this.providers.has(provider.id)) {
+      throw new Error(`duplicate tool provider: ${provider.id}`)
+    }
+    this.providers.set(provider.id, provider)
+    for (const tool of provider.tools) {
+      if (this.tools.has(tool.name)) {
+        throw new Error(`duplicate tool name: ${tool.name}`)
+      }
+      this.tools.set(tool.name, { provider: providerPolicy(provider), tool })
+    }
+    return () => this.unregisterProvider(provider.id)
+  }
+
+  replaceProvider(provider: CapabilityToolProvider): void {
+    const providers = [...this.providers.values()].filter((candidate) => candidate.id !== provider.id)
+    this.replaceProviders([...providers, provider])
+  }
+
+  unregisterProvider(providerId: string): boolean {
+    if (!this.providers.has(providerId)) return false
+    this.replaceProviders([...this.providers.values()].filter((provider) => provider.id !== providerId))
+    return true
+  }
+
+  replaceProviders(providers: readonly CapabilityToolProvider[]): void {
+    const nextProviders = new Map<string, CapabilityToolProvider>()
+    const nextTools = new Map<string, CapabilityToolRecord>()
+    for (const provider of providers) {
+      if (nextProviders.has(provider.id)) {
+        throw new Error(`duplicate tool provider: ${provider.id}`)
+      }
+      nextProviders.set(provider.id, provider)
+      for (const tool of provider.tools) {
+        if (nextTools.has(tool.name)) {
+          throw new Error(`duplicate tool name: ${tool.name}`)
+        }
+        nextTools.set(tool.name, { provider: providerPolicy(provider), tool })
+      }
+    }
+    this.providers.clear()
+    this.tools.clear()
+    for (const [id, provider] of nextProviders) this.providers.set(id, provider)
+    for (const [name, record] of nextTools) this.tools.set(name, record)
+  }
+
+  listTools(context?: ToolHostContext): CapabilityToolSpec[] {
+    const specs: CapabilityToolSpec[] = []
+    for (const record of this.tools.values()) {
+      if (!this.canUseProvider(record.provider, context)) continue
+      if (!this.canUseTool(record.tool.name, context)) continue
+      if (!isToolAdvertisedInSandbox(record.tool, context)) continue
+      if (record.tool.shouldAdvertise) {
+        if (!context || !record.tool.shouldAdvertise(context)) continue
+      }
+      specs.push({
+        name: record.tool.name,
+        description: record.tool.description,
+        inputSchema: record.tool.inputSchema,
+        toolKind: record.tool.toolKind,
+        providerId: record.provider.id,
+        providerKind: record.provider.kind
+      })
+    }
+    return specs
+  }
+
+  resolveTool(toolName: string, context: ToolHostContext, providerId?: string): CapabilityToolRecord {
+    const record = this.tools.get(toolName)
+    if (!record) {
+      throw new Error(`unknown tool: ${toolName}`)
+    }
+    if (providerId && providerId !== record.provider.id) {
+      throw new Error(`tool ${toolName} is not provided by ${providerId}`)
+    }
+    if (!this.canUseProvider(record.provider, context)) {
+      throw new Error(`tool ${toolName} is not advertised by provider ${record.provider.id}`)
+    }
+    if (!this.canUseTool(toolName, context)) {
+      throw new Error(`tool ${toolName} is not advertised by active tool policy`)
+    }
+    if (record.tool.shouldAdvertise && !record.tool.shouldAdvertise(context)) {
+      throw new Error(`tool ${toolName} is not advertised in this turn context`)
+    }
+    return record
+  }
+
+  diagnostics(): ToolProviderPolicy[] {
+    return [...this.providers.values()].map(providerPolicy)
+  }
+
+  private canUseProvider(provider: ToolProviderPolicy, context?: ToolHostContext): boolean {
+    if (!provider.enabled || !provider.available) return false
+    if (context?.blockedProviderIds?.includes(provider.id)) return false
+    const allowed = context?.allowedProviderIds
+    if (allowed && !allowed.includes(provider.id)) return false
+    return true
+  }
+
+  private canUseTool(toolName: string, context?: ToolHostContext): boolean {
+    if (isPlanModeContext(context) && !PLAN_MODE_ALLOWED_TOOL_NAMES.has(toolName)) {
+      return false
+    }
+    if (context?.blockedToolNames?.includes(toolName)) return false
+    for (const skillId of context?.activeSkillIds ?? []) {
+      if (MANAGED_SKILL_BLOCKED_TOOL_NAMES[skillId]?.has(toolName)) return false
+    }
+    const allowed = context?.allowedToolNames
+    return !allowed || allowed.includes(toolName)
+  }
+}
+
+function isPlanModeContext(context: ToolHostContext | undefined): boolean {
+  return context?.threadMode === 'plan' || Boolean(context?.guiPlan)
+}
+
+function providerPolicy(provider: ToolProviderPolicy): ToolProviderPolicy {
+  return {
+    id: provider.id,
+    kind: provider.kind,
+    enabled: provider.enabled,
+    available: provider.available,
+    ...(provider.reason ? { reason: provider.reason } : {})
+  }
+}

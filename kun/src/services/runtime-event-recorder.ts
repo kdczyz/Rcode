@@ -1,0 +1,153 @@
+import {
+  RuntimeEvent as RuntimeEventSchema,
+  type RuntimeEvent
+} from '../contracts/events.js'
+import type { EventBus } from '../ports/event-bus.js'
+import type { SessionStore } from '../ports/session-store.js'
+import type { ThreadLifecycleFence, ThreadLifecycleLease } from './thread-lifecycle-fence.js'
+
+type RuntimeEventWithoutStamp<Event extends RuntimeEvent> = Omit<Event, 'seq' | 'timestamp'> &
+  Partial<Pick<Event, 'seq' | 'timestamp'>>
+
+export type RuntimeEventDraft = RuntimeEvent extends infer Event
+  ? Event extends RuntimeEvent
+    ? RuntimeEventWithoutStamp<Event>
+    : never
+  : never
+
+export type RuntimeEventRecorderOptions = {
+  eventBus: EventBus
+  sessionStore: SessionStore
+  allocateSeq: (threadId: string) => number
+  nowIso: () => string
+  observers?: RuntimeEventObserver[]
+  /** Optional per-thread deletion fence used by serve persistence. */
+  lifecycleFence?: ThreadLifecycleFence
+}
+
+export type RuntimeEventObserver = {
+  record(event: RuntimeEvent): Promise<void> | void
+  clearThread?(threadId: string): void
+}
+
+/**
+ * Application-level event boundary.
+ *
+ * Services and loops produce semantic event drafts; this recorder
+ * stamps ordering/time, validates the public contract, persists the
+ * event for SSE replay, and then fans out to live subscribers.
+ *
+ * Persist-before-publish is load-bearing: the SSE route replays the
+ * persisted log before relaying live bus events, so an event that is
+ * published first and persisted later can fall between a subscriber's
+ * backlog read and its bus subscription and be lost forever.
+ */
+export class RuntimeEventRecorder {
+  private readonly options: RuntimeEventRecorderOptions
+  private readonly lastIssuedSeq = new Map<string, number>()
+  private readonly commitQueues = new Map<string, Promise<unknown>>()
+
+  constructor(options: RuntimeEventRecorderOptions) {
+    this.options = options
+  }
+
+  async record(draft: RuntimeEventDraft): Promise<RuntimeEvent> {
+    // Capture a generation lease before queueing. A record already waiting
+    // behind another event must stay stale even if the same id is later
+    // recreated after deletion.
+    const lease = this.options.lifecycleFence?.acquire(draft.threadId) ?? undefined
+    if (this.options.lifecycleFence && !lease) {
+      return this.makeEvent(draft)
+    }
+    try {
+      return await this.enqueue(draft.threadId, async () => this.recordCommitted(draft, lease))
+    } finally {
+      lease?.release()
+    }
+  }
+
+  private async recordCommitted(
+    draft: RuntimeEventDraft,
+    lease?: ThreadLifecycleLease
+  ): Promise<RuntimeEvent> {
+    const event = await this.makeEvent(draft)
+    // Do not persist (or publish) a draft from an expired generation. It is
+    // still returned for caller compatibility; lifecycle events are commands,
+    // not a durable acknowledgement.
+    if (lease && !lease.isCurrent()) return event
+    await this.options.sessionStore.appendEvent(event.threadId, event)
+    // `appendEvent` can have started before a close. The deletion path drains
+    // that write before unlinking files; this second check is what prevents an
+    // already-committed old event from escaping through live SSE afterwards.
+    if (lease && !lease.isCurrent()) return event
+    this.options.eventBus.publish(event)
+    await this.notifyObservers(event, lease)
+    return event
+  }
+
+  private async makeEvent(draft: RuntimeEventDraft): Promise<RuntimeEvent> {
+    const seq = draft.seq ?? (await this.nextSeq(draft.threadId))
+    this.noteIssuedSeq(draft.threadId, seq)
+    return RuntimeEventSchema.parse({
+      ...draft,
+      seq,
+      timestamp: draft.timestamp ?? this.options.nowIso()
+    })
+  }
+
+  private async enqueue<T>(threadId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.commitQueues.get(threadId) ?? Promise.resolve()
+    const run = previous.catch(() => undefined).then(operation)
+    const guard = run.then(() => undefined, () => undefined)
+    this.commitQueues.set(threadId, guard)
+    try {
+      return await run
+    } finally {
+      if (this.commitQueues.get(threadId) === guard) this.commitQueues.delete(threadId)
+    }
+  }
+
+  /**
+   * Issues the next per-thread seq. The persisted high-water mark is
+   * read once per thread and cached; afterwards issuance is synchronous,
+   * so concurrent record() calls can no longer race the store read and
+   * stamp the same seq twice (which made since_seq replay skip events).
+   */
+  private async nextSeq(threadId: string): Promise<number> {
+    let floor = this.lastIssuedSeq.get(threadId)
+    if (floor === undefined) {
+      const persisted = await this.options.sessionStore.highestSeq(threadId).catch(() => 0)
+      // A concurrent first record() may have populated the cache while
+      // we awaited the store; never move the floor backwards.
+      floor = Math.max(persisted, this.lastIssuedSeq.get(threadId) ?? 0)
+    }
+    const allocated = this.options.allocateSeq(threadId)
+    const seq = Math.max(allocated, floor + 1)
+    this.noteIssuedSeq(threadId, seq)
+    return seq
+  }
+
+  private noteIssuedSeq(threadId: string, seq: number): void {
+    const current = this.lastIssuedSeq.get(threadId) ?? 0
+    if (seq > current) this.lastIssuedSeq.set(threadId, seq)
+  }
+
+  clearThread(threadId: string): void {
+    this.lastIssuedSeq.delete(threadId)
+    for (const observer of this.options.observers ?? []) {
+      observer.clearThread?.(threadId)
+    }
+  }
+
+  private async notifyObservers(event: RuntimeEvent, lease?: ThreadLifecycleLease): Promise<void> {
+    for (const observer of this.options.observers ?? []) {
+      if (lease && !lease.isCurrent()) return
+      try {
+        await observer.record(event)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        console.warn(`[kun] runtime event observer failed: ${message}`)
+      }
+    }
+  }
+}

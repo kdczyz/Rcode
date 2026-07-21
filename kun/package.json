@@ -1,0 +1,96 @@
+{
+  "name": "kun",
+  "version": "0.1.0",
+  "description": "Kun local HTTP/SSE agent runtime",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "type": "module",
+  "private": true,
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./contracts": {
+      "types": "./dist/contracts/index.d.ts",
+      "import": "./dist/contracts/index.js"
+    },
+    "./domain": {
+      "types": "./dist/domain/index.d.ts",
+      "import": "./dist/domain/index.js"
+    },
+    "./ports": {
+      "types": "./dist/ports/index.d.ts",
+      "import": "./dist/ports/index.js"
+    },
+    "./adapters": {
+      "types": "./dist/adapters/index.d.ts",
+      "import": "./dist/adapters/index.js"
+    },
+    "./loop": {
+      "types": "./dist/loop/index.d.ts",
+      "import": "./dist/loop/index.js"
+    },
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "import": "./dist/server/index.js"
+    },
+    "./cache": {
+      "types": "./dist/cache/index.d.ts",
+      "import": "./dist/cache/index.js"
+    },
+    "./telemetry": {
+      "types": "./dist/telemetry/index.d.ts",
+      "import": "./dist/telemetry/index.js"
+    },
+    "./services": {
+      "types": "./dist/services/index.d.ts",
+      "import": "./dist/services/index.js"
+    },
+    "./hooks": {
+      "types": "./dist/hooks/index.d.ts",
+      "import": "./dist/hooks/index.js"
+    }
+  },
+  "bin": {
+    "kun": "./dist/cli/serve-entry.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "transcript:diff": "node ./scripts/transcript-diff.mjs",
+    "benchmark:replay": "npm run build && node ./dist/cli/replay-entry.js",
+    "serve": "node ./dist/cli/serve-entry.js",
+    "dev": "tsc -p tsconfig.build.json --watch"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.193",
+    "@computer-use/nut-js": "^4.2.0",
+    "@kun/extension-api": "file:../packages/extension-api",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@xmldom/xmldom": "^0.9.10",
+    "ajv": "^8.20.0",
+    "better-sqlite3": "^12.10.0",
+    "create-kun-extension": "file:../packages/create-kun-extension",
+    "diff": "^8.0.4",
+    "jimp": "^1.6.0",
+    "ipaddr.js": "^2.4.0",
+    "proxy-agent": "^8.0.2",
+    "safe-regex2": "5.1.1",
+    "semver": "^7.8.5",
+    "undici": "^7.28.0",
+    "yauzl": "^3.4.0",
+    "yazl": "^3.3.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/semver": "^7.7.1",
+    "@types/yauzl": "^3.4.0",
+    "@types/yazl": "^3.3.1",
+    "typescript": "^5.8.2",
+    "vitest": "^4.1.7"
+  }
+}
