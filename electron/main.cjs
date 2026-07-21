@@ -10,6 +10,13 @@ const { fileURLToPath } = require("node:url");
 const isDev = !app.isPackaged;
 const startUrl = process.env.ELECTRON_START_URL || `file://${path.join(__dirname, "../dist/index.html")}`;
 
+// WorkBuddy sandbox environment blocks Chromium sandbox initialization.
+// Disable it in dev mode so the client can start inside sandboxed terminals.
+if (isDev) {
+  app.commandLine.appendSwitch("--no-sandbox");
+  app.commandLine.appendSwitch("--disable-setuid-sandbox");
+}
+
 let serverProcess = null;
 const localApiToken = process.env.AGENT_LOCAL_TOKEN || crypto.randomBytes(32).toString("base64url");
 let volatileAuthToken;

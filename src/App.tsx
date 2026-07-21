@@ -1,16 +1,20 @@
 import {
   Archive,
   Brain,
+  Bug,
   Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   Copy,
   CornerDownRight,
+  FileCode,
   FileText,
+  FolderSearch,
   History,
   MessageSquarePlus,
   MoreHorizontal,
+  Palette,
   Pencil,
   Plus,
   Puzzle,
@@ -1555,7 +1559,7 @@ export default function App() {
   const [composerSkillNamesBySession, setComposerSkillNamesBySession] = useState<Record<string, string[]>>({});
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
     const saved = localStorage.getItem("agent.themePreference");
-    return saved === "dark" || saved === "light" || saved === "system" ? saved : "system";
+    return saved === "dark" || saved === "light" || saved === "system" ? saved : "light";
   });
   const [systemTheme, setSystemTheme] = useState<"dark" | "light">(() =>
     window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"
@@ -5121,6 +5125,62 @@ export default function App() {
                   <div className="messageList" aria-live="polite" ref={messageListRef}>
                     {(() => {
                       const renderItems = getMessageRenderItems(visibleMessages);
+
+                      if (renderItems.length === 0 && pendingApprovals.length === 0 && !isActiveSessionRunning) {
+                        const quickActions = [
+                          {
+                            icon: FolderSearch,
+                            title: "梳理项目结构",
+                            description: "快速了解项目目录和关键文件",
+                            prompt: "请梳理当前项目的结构，列出关键目录和文件的作用。"
+                          },
+                          {
+                            icon: Bug,
+                            title: "帮我找 bug",
+                            description: "分析问题原因并建议修复",
+                            prompt: "请分析当前项目中可能存在的问题，并建议修复方案。"
+                          },
+                          {
+                            icon: FileCode,
+                            title: "生成实现方案",
+                            description: "把需求拆解为可执行步骤",
+                            prompt: "请为当前项目生成一个实现方案，把需求拆解为可执行的步骤。"
+                          },
+                          {
+                            icon: Palette,
+                            title: "优化当前 UI",
+                            description: "建议设计和交互改进",
+                            prompt: "请审查当前项目的 UI 代码，建议设计和交互上的改进。"
+                          }
+                        ];
+
+                        return (
+                          <div className="chatEmptyState">
+                            <div className="chatEmptyHero">
+                              <h1>开始新的对话</h1>
+                              <p>选择一个任务，或直接输入问题</p>
+                            </div>
+                            <div className="chatQuickActions">
+                              {quickActions.map((action) => (
+                                <button
+                                  className="chatQuickActionCard"
+                                  key={action.title}
+                                  type="button"
+                                  onClick={() => void runAgent(action.prompt)}
+                                >
+                                  <span className="chatQuickActionIcon" aria-hidden="true">
+                                    <action.icon size={22} strokeWidth={1.8} />
+                                  </span>
+                                  <span className="chatQuickActionText">
+                                    <strong>{action.title}</strong>
+                                    <small>{action.description}</small>
+                                  </span>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      }
 
                       const renderToolCallGroup = (
                         toolMessages: ChatMessage[],

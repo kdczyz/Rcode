@@ -15,24 +15,19 @@
   --duration-slow: 360ms;
   --duration-lazy: 480ms;
 
-  /* Glass system tokens */
-  --glass-blur: 40px;
-  --glass-blur-heavy: 64px;
-  --glass-saturate: 180%;
-  --glass-border: 1px solid rgba(255, 255, 255, 0.08);
-  --glass-shine: linear-gradient(
-    135deg,
-    rgba(255, 255, 255, 0.12) 0%,
-    rgba(255, 255, 255, 0.04) 40%,
-    transparent 60%
-  );
-  --glass-shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.08);
-  --glass-shadow-md: 0 8px 32px rgba(0, 0, 0, 0.18), 0 2px 8px rgba(0, 0, 0, 0.10);
-  --glass-shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.25), 0 4px 16px rgba(0, 0, 0, 0.14);
-  --glass-radius-sm: 10px;
-  --glass-radius-md: 14px;
-  --glass-radius-lg: 20px;
-  --glass-radius-xl: 28px;
+  /* Surface tokens — flattened design (no glass blur / shine) */
+  --glass-blur: 0;
+  --glass-blur-heavy: 0;
+  --glass-saturate: 100%;
+  --glass-border: 1px solid rgba(255, 255, 255, 0.10);
+  --glass-shine: none;
+  --glass-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.08);
+  --glass-shadow-md: 0 1px 3px rgba(0, 0, 0, 0.10), 0 1px 2px rgba(0, 0, 0, 0.06);
+  --glass-shadow-lg: 0 2px 10px rgba(0, 0, 0, 0.12), 0 1px 3px rgba(0, 0, 0, 0.06);
+  --glass-radius-sm: 8px;
+  --glass-radius-md: 10px;
+  --glass-radius-lg: 12px;
+  --glass-radius-xl: 14px;
 
   --font-ui:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB",
@@ -128,7 +123,7 @@ button {
    DARK THEME — Liquid Glass
    ================================================================ */
 .desktopShell {
-  --sidebar-width: 318px;
+  --sidebar-width: 272px;
   --sidebar-collapsed-titlebar-width: 134px;
 
   /* Surface palette: 4 opaque layers with clear visual separation */
@@ -175,48 +170,46 @@ button {
   place-items: center;
   padding: 34px;
   color: var(--text);
-  /* Subtle gradient background for glass refraction */
-  background:
-    radial-gradient(ellipse 80% 60% at 20% 10%, rgba(88, 68, 140, 0.08), transparent),
-    radial-gradient(ellipse 60% 50% at 80% 80%, rgba(40, 100, 160, 0.06), transparent),
-    var(--page);
+  /* Flattened: solid page background, no gradient refraction */
+  background: var(--page);
 }
 
 /* ================================================================
-   LIGHT THEME — Liquid Glass
+   LIGHT THEME — DeepSeek-GUI Minimal
    ================================================================ */
 .desktopShell[data-theme="light"] {
-  --page: #eeeef4;
-  --surface: #f6f6fa;
+  --page: #f7f7f8;
+  --surface: #ffffff;
   --surface-1: #ffffff;
-  --surface-2: #e8e6f0;
-  --surface-3: #d8d6e2;
-  --topbar-surface: #f0eef6;
-  --sidebar-surface: #eae8f2;
-  --composer-surface: #f4f2fa;
-  --text: #1c1c20;
+  --surface-2: #f0f0f3;
+  --surface-3: #e8e8ec;
+  --topbar-surface: #ffffff;
+  --sidebar-surface: #f7f7f8;
+  --composer-surface: #ffffff;
+  --text: #1a1a1e;
   --muted: #6e6a72;
   --faint: #9e9aa2;
-  --border: rgba(0, 0, 0, 0.08);
-  --border-soft: rgba(0, 0, 0, 0.05);
-  --accent: #2a2a30;
+  --border: rgba(0, 0, 0, 0.06);
+  --border-soft: rgba(0, 0, 0, 0.04);
+  --glass-border: 1px solid rgba(0, 0, 0, 0.06);
+  --accent: #1a1a1e;
   --accent-text: #ffffff;
-  --selected: #2a2a30;
-  --selected-text: #ffffff;
-  --selected-muted: rgba(255, 255, 255, 0.68);
-  --selected-hover: #363640;
+  --selected: rgba(0, 0, 0, 0.05);
+  --selected-text: #1a1a1e;
+  --selected-muted: rgba(26, 26, 30, 0.55);
+  --selected-hover: rgba(0, 0, 0, 0.08);
   --scroll-thumb: rgba(0, 0, 0, 0.16);
   --scroll-thumb-hover: rgba(0, 0, 0, 0.26);
   --scroll-track: rgba(0, 0, 0, 0.04);
   --danger: #d44030;
   --warning: #9a6e00;
   --info: #1870d8;
+  --glass-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --glass-shadow-md: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --glass-shadow-lg: 0 4px 16px rgba(0, 0, 0, 0.08), 0 1px 4px rgba(0, 0, 0, 0.04);
 
   color-scheme: light;
-  background:
-    radial-gradient(ellipse 80% 60% at 20% 10%, rgba(180, 160, 240, 0.08), transparent),
-    radial-gradient(ellipse 60% 50% at 80% 80%, rgba(120, 180, 240, 0.06), transparent),
-    var(--page);
+  background: var(--page);
 }
 
 /* ================================================================
@@ -265,9 +258,9 @@ button {
   height: min(820px, calc(100vh - 32px));
   min-height: 0;
   border: var(--glass-border);
-  border-radius: var(--glass-radius-xl);
+  border-radius: var(--glass-radius-lg);
   background: var(--surface);
-  box-shadow: var(--glass-shadow-lg), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  box-shadow: var(--glass-shadow-md);
 }
 
 .desktopShell[data-client="electron"] {
@@ -621,9 +614,7 @@ main {
   border-color: rgba(255, 255, 255, 0.16);
   color: var(--selected-text);
   background: var(--selected);
-  box-shadow:
-    var(--glass-shadow-sm),
-    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  box-shadow: var(--glass-shadow-sm);
 }
 
 .navItem.active small {
@@ -1133,9 +1124,7 @@ main {
 .sessionRow.active {
   color: var(--selected-text);
   background: var(--selected);
-  box-shadow:
-    var(--glass-shadow-sm),
-    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  box-shadow: var(--glass-shadow-sm);
 }
 
 .sessionRow.active time {
@@ -2075,8 +2064,7 @@ h2 {
   display: flex;
   justify-content: flex-end;
   border-radius: 13px;
-  background: color-mix(in srgb, var(--surface) 44%, transparent);
-  backdrop-filter: blur(3px);
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
 }
 
 .skillDetailPanel {
@@ -2601,9 +2589,7 @@ h2 {
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.02)),
     var(--surface-1);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.12),
-    0 16px 40px rgba(0, 0, 0, 0.12);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.12);
 }
 
 .usageActivityHeader {
@@ -2742,10 +2728,7 @@ h2 {
   border: var(--glass-border);
   border-radius: var(--glass-radius-md);
   padding: 14px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.1)),
-    var(--surface-2);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.24);
+  background: var(--surface-2);
 }
 
 .usageMetric span,
@@ -2824,6 +2807,107 @@ h2 {
 
 .newChatButton:active {
   transform: translateY(0) scale(0.97);
+}
+
+/* === Chat Empty State — DeepSeek-GUI minimal === */
+.chatEmptyState {
+  display: flex;
+  flex: 1 0 auto;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 40px;
+  width: 100%;
+  min-height: 0;
+  padding: 40px 24px;
+  text-align: center;
+}
+
+.chatEmptyHero h1 {
+  margin: 0 0 8px;
+  color: var(--text);
+  font-size: 32px;
+  font-weight: var(--weight-semibold);
+  letter-spacing: -0.02em;
+}
+
+.chatEmptyHero p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 15px;
+}
+
+.chatQuickActions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  width: min(560px, 100%);
+}
+
+.chatQuickActionCard {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 72px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 16px;
+  color: var(--text);
+  background: var(--surface-1);
+  text-align: left;
+  cursor: pointer;
+  transition: all var(--duration-fast) var(--ease-smooth);
+}
+
+.chatQuickActionCard:hover {
+  border-color: var(--border);
+  background: var(--surface-2);
+  box-shadow: var(--glass-shadow-sm);
+  transform: translateY(-1px);
+}
+
+.chatQuickActionCard:active {
+  transform: translateY(0) scale(0.98);
+}
+
+.chatQuickActionIcon {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
+  place-items: center;
+  border-radius: 10px;
+  color: var(--muted);
+  background: var(--surface-2);
+}
+
+.chatQuickActionCard:hover .chatQuickActionIcon {
+  color: var(--text);
+  background: var(--surface-3);
+}
+
+.chatQuickActionText {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.chatQuickActionText strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: var(--weight-semibold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chatQuickActionText small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* === Message list === */
@@ -3025,10 +3109,10 @@ h2 {
   display: grid;
   gap: 10px;
   border: var(--glass-border);
-  border-radius: var(--glass-radius-md);
-  padding: 12px;
+  border-radius: 20px;
+  padding: 14px 16px;
   background: var(--composer-surface);
-  box-shadow: var(--glass-shadow-md), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.10), 0 1px 4px rgba(0, 0, 0, 0.06);
 }
 
 .queuePanel {
@@ -5428,10 +5512,8 @@ strong.streaming {
   border: 1px solid color-mix(in srgb, var(--border) 58%, transparent);
   border-radius: 13px;
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.018)),
     #2b2b2c;
   color: #f2f2f0;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 .messageCodeHeader {
@@ -6389,10 +6471,7 @@ strong.streaming {
   padding: 14px 16px;
   border: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
   border-radius: 14px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.42), rgba(255, 255, 255, 0.18)),
-    color-mix(in srgb, var(--surface-2) 62%, var(--surface-1));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.42);
+  background: color-mix(in srgb, var(--surface-2) 62%, var(--surface-1));
 }
 
 .aiProviderSummary span,
@@ -6476,17 +6555,12 @@ strong.streaming {
   border-color: color-mix(in srgb, var(--border) 62%, transparent);
   border-radius: 14px;
   padding: 12px 12px 12px 16px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.30), rgba(255, 255, 255, 0.10)),
-    color-mix(in srgb, var(--surface-2) 48%, var(--surface-1));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.34);
+  background: color-mix(in srgb, var(--surface-2) 48%, var(--surface-1));
 }
 
 .aiProviderRow.aiProviderActive {
   border-color: color-mix(in srgb, var(--accent) 18%, var(--border));
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.36), rgba(255, 255, 255, 0.12)),
-    color-mix(in srgb, var(--surface-2) 58%, var(--surface-1));
+  background: color-mix(in srgb, var(--surface-2) 58%, var(--surface-1));
 }
 
 .aiProviderRow.aiProviderActive::before {
@@ -6502,9 +6576,7 @@ strong.streaming {
 
 .aiProviderRow.aiProviderSelected {
   border-color: color-mix(in srgb, var(--info) 48%, var(--border));
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.34),
-    0 0 0 3px color-mix(in srgb, var(--info) 11%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--info) 11%, transparent);
 }
 
 .aiProviderSelectCell {
@@ -9685,11 +9757,10 @@ strong.streaming {
   border: 1px solid var(--border);
   border-radius: 12px;
   color: var(--text);
-  background: color-mix(in srgb, var(--surface-1) 96%, transparent);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, .28), 0 1px 0 rgba(255, 255, 255, .04) inset;
+  background: var(--surface-1);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .22), 0 1px 2px rgba(0, 0, 0, .10);
   transform: translateX(-50%);
   animation: managedProcessPopoverIn 140ms ease-out both;
-  backdrop-filter: blur(18px);
 }
 @keyframes managedProcessPopoverIn { from { opacity: 0; } to { opacity: 1; } }
 .managedProcessPopoverHeader {
@@ -10303,8 +10374,7 @@ strong.streaming {
   display: grid;
   place-items: center;
   padding: 28px;
-  background: rgba(5, 7, 10, 0.76);
-  backdrop-filter: blur(12px);
+  background: rgba(5, 7, 10, 0.92);
   animation: fadeIn 160ms ease-out;
 }
 
